@@ -1022,6 +1022,30 @@ static int ib_uverbs_close(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+static void ib_uverbs_show_fdinfo(struct seq_file *m, struct file *filp)
+{
+	struct ib_uverbs_file *file = filp->private_data;
+	struct ib_ucontext *uctx;
+	int srcu_key;
+
+	if (!file)
+		return;
+
+	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+	uctx = ib_uverbs_get_ucontext_file(file);
+	if (IS_ERR(uctx))
+		goto out_unlock;
+
+	mutex_lock(&file->disassociation_lock);
+
+	seq_printf(m, "ctxn:\t%u\n", uctx->res.id);
+
+	mutex_unlock(&file->disassociation_lock);
+
+out_unlock:
+	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+}
+
 static const struct file_operations uverbs_fops = {
 	.owner	 = THIS_MODULE,
 	.write	 = ib_uverbs_write,
@@ -1029,6 +1053,7 @@ static const struct file_operations uverbs_fops = {
 	.release = ib_uverbs_close,
 	.unlocked_ioctl = ib_uverbs_ioctl,
 	.compat_ioctl = compat_ptr_ioctl,
+	.show_fdinfo = ib_uverbs_show_fdinfo,
 };
 
 static const struct file_operations uverbs_mmap_fops = {
@@ -1039,6 +1064,7 @@ static const struct file_operations uverbs_mmap_fops = {
 	.release = ib_uverbs_close,
 	.unlocked_ioctl = ib_uverbs_ioctl,
 	.compat_ioctl = compat_ptr_ioctl,
+	.show_fdinfo = ib_uverbs_show_fdinfo,
 };
 
 static int ib_uverbs_get_nl_info(struct ib_device *ibdev, void *client_data,
