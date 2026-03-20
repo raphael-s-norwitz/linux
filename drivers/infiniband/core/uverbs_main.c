@@ -312,6 +312,19 @@ out_unlock:
 	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
 }
 
+static void ib_uverbs_show_comp_event_fdinfo(struct seq_file *m,
+					     struct file *filp)
+{
+	struct ib_uverbs_completion_event_file *comp_ev_file =
+		filp->private_data;
+	struct ib_uverbs_file *uctx_file = comp_ev_file->uobj.ufile;
+
+	if (!uctx_file)
+		return;
+
+	ib_uverbs_fd_show_fdinfo(m, uctx_file);
+}
+
 static void ib_uverbs_show_async_event_fdinfo(struct seq_file *m,
 					      struct file *filp)
 {
@@ -330,6 +343,7 @@ const struct file_operations uverbs_event_fops = {
 	.poll    = ib_uverbs_comp_event_poll,
 	.release = uverbs_uobject_fd_release,
 	.fasync  = ib_uverbs_comp_event_fasync,
+	.show_fdinfo = ib_uverbs_show_comp_event_fdinfo,
 };
 
 const struct file_operations uverbs_async_event_fops = {
