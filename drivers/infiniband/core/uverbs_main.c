@@ -291,6 +291,39 @@ static int ib_uverbs_comp_event_fasync(int fd, struct file *filp, int on)
 	return fasync_helper(fd, filp, on, &comp_ev_file->ev_queue.async_queue);
 }
 
+static void ib_uverbs_fd_show_fdinfo(struct seq_file *m,
+				     struct ib_uverbs_file *file)
+{
+	struct ib_ucontext *uctx;
+	int srcu_key;
+
+	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+	uctx = ib_uverbs_get_ucontext_file(file);
+	if (IS_ERR(uctx))
+		goto out_unlock;
+
+	mutex_lock(&file->disassociation_lock);
+
+	seq_printf(m, "ctxn:\t%u\n", uctx->res.id);
+
+	mutex_unlock(&file->disassociation_lock);
+
+out_unlock:
+	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+}
+
+static void ib_uverbs_show_async_event_fdinfo(struct seq_file *m,
+					      struct file *filp)
+{
+	struct ib_uverbs_async_event_file *async_file = filp->private_data;
+	struct ib_uverbs_file *uctx_file = async_file->uobj.ufile;
+
+	if (!uctx_file)
+		return;
+
+	ib_uverbs_fd_show_fdinfo(m, uctx_file);
+}
+
 const struct file_operations uverbs_event_fops = {
 	.owner	 = THIS_MODULE,
 	.read	 = ib_uverbs_comp_event_read,
@@ -305,6 +338,7 @@ const struct file_operations uverbs_async_event_fops = {
 	.poll    = ib_uverbs_async_event_poll,
 	.release = uverbs_uobject_fd_release,
 	.fasync  = ib_uverbs_async_event_fasync,
+	.show_fdinfo = ib_uverbs_show_async_event_fdinfo,
 };
 
 void ib_uverbs_comp_handler(struct ib_cq *cq, void *cq_context)
@@ -1025,25 +1059,11 @@ static int ib_uverbs_close(struct inode *inode, struct file *filp)
 static void ib_uverbs_show_fdinfo(struct seq_file *m, struct file *filp)
 {
 	struct ib_uverbs_file *file = filp->private_data;
-	struct ib_ucontext *uctx;
-	int srcu_key;
 
 	if (!file)
 		return;
 
-	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
-	uctx = ib_uverbs_get_ucontext_file(file);
-	if (IS_ERR(uctx))
-		goto out_unlock;
-
-	mutex_lock(&file->disassociation_lock);
-
-	seq_printf(m, "ctxn:\t%u\n", uctx->res.id);
-
-	mutex_unlock(&file->disassociation_lock);
-
-out_unlock:
-	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+	ib_uverbs_fd_show_fdinfo(m, file);
 }
 
 static const struct file_operations uverbs_fops = {
