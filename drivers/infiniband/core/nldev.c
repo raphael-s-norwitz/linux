@@ -454,7 +454,8 @@ static int fill_res_info(struct sk_buff *msg, struct ib_device *device,
 	};
 
 	struct nlattr *table_attr;
-	int ret, i, curr, max;
+	u64 curr, max;
+	int ret, i;
 
 	if (fill_nldev_handle(msg, device))
 		return -EMSGSIZE;
