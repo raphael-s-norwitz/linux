@@ -18,7 +18,7 @@ static int irdma_query_device(struct ib_device *ibdev,
 	struct irdma_hw_attrs *hw_attrs = &rf->sc_dev.hw_attrs;
 	int err;
 
-	err = ib_is_udata_in_empty(udata);
+	err = ib_no_udata_io(udata);
 	if (err)
 		return err;
 
@@ -75,7 +75,7 @@ static int irdma_query_device(struct ib_device *ibdev,
 	if (hw_attrs->uk_attrs.hw_rev >= IRDMA_GEN_3)
 		props->device_cap_flags |= IB_DEVICE_MEM_WINDOW_TYPE_2B;
 
-	return ib_respond_empty_udata(udata);
+	return 0;
 }
 
 /**

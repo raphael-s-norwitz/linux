@@ -278,7 +278,7 @@ int usnic_ib_query_device(struct ib_device *ibdev,
 	int err;
 
 	usnic_dbg("\n");
-	err = ib_is_udata_in_empty(uhw);
+	err = ib_no_udata_io(uhw);
 	if (err)
 		return err;
 
@@ -323,7 +323,7 @@ int usnic_ib_query_device(struct ib_device *ibdev,
 	 * max_qp_wr, max_sge, max_sge_rd, max_cqe */
 	mutex_unlock(&us_ibdev->usdev_lock);
 
-	return ib_respond_empty_udata(uhw);
+	return 0;
 }
 
 int usnic_ib_query_port(struct ib_device *ibdev, u32 port,

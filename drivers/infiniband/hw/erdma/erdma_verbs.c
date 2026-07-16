@@ -320,7 +320,7 @@ int erdma_query_device(struct ib_device *ibdev, struct ib_device_attr *attr,
 	struct erdma_dev *dev = to_edev(ibdev);
 	int err;
 
-	err = ib_is_udata_in_empty(udata);
+	err = ib_no_udata_io(udata);
 	if (err)
 		return err;
 
@@ -361,7 +361,7 @@ int erdma_query_device(struct ib_device *ibdev, struct ib_device_attr *attr,
 		addrconf_addr_eui48((u8 *)&attr->sys_image_guid,
 				    dev->netdev->dev_addr);
 
-	return ib_respond_empty_udata(udata);
+	return 0;
 }
 
 int erdma_query_gid(struct ib_device *ibdev, u32 port, int idx,

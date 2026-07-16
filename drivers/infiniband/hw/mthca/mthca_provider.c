@@ -58,7 +58,7 @@ static int mthca_query_device(struct ib_device *ibdev, struct ib_device_attr *pr
 	int err;
 	struct mthca_dev *mdev = to_mdev(ibdev);
 
-	err = ib_is_udata_in_empty(uhw);
+	err = ib_no_udata_io(uhw);
 	if (err)
 		return err;
 
@@ -112,7 +112,6 @@ static int mthca_query_device(struct ib_device *ibdev, struct ib_device_attr *pr
 	props->max_total_mcast_qp_attach = props->max_mcast_qp_attach *
 					   props->max_mcast_grp;
 
-	err = ib_respond_empty_udata(uhw);
  out:
 	kfree(in_mad);
 	kfree(out_mad);
