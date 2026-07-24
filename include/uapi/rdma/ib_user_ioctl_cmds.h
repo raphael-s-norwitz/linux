@@ -58,6 +58,17 @@ enum uverbs_default_objects {
 	UVERBS_OBJECT_DMAH,
 	UVERBS_OBJECT_DMABUF,
 	UVERBS_OBJECT_COMP_CNTR,
+	/*
+	 * Pseudo-object that aggregates the per-resource
+	 * UVERBS_METHOD_RESTORE_<TYPE> methods used by CRIU restore. No
+	 * instances of OBJECT_RESTORE are allowed; like
+	 * UVERBS_OBJECT_DEVICE it exists only as a method-namespace
+	 * holder. The methods themselves install new uobjects of the
+	 * appropriate concrete type (PD / CQ / QP / ...) at
+	 * caller-chosen ufile handles. Gated per-driver via
+	 * ib_device_ops.ucontext_is_restore_mode.
+	 */
+	UVERBS_OBJECT_RESTORE,
 };
 
 enum {
@@ -77,6 +88,28 @@ enum uverbs_methods_device {
 	UVERBS_METHOD_QUERY_GID_ENTRY,
 	UVERBS_METHOD_QUERY_PORT_SPEED,
 	UVERBS_METHOD_QUERY_COMP_CNTR_CAPS,
+};
+
+/*
+ * Methods under UVERBS_OBJECT_RESTORE. Each installs a new uobject of
+ * the named concrete class at a caller-chosen ufile handle (the
+ * RESTORE_<TYPE>_HANDLE attr). The handler dispatches through the
+ * driver's ib_device_ops.restore_<type> callback after first checking
+ * ib_device_ops.ucontext_is_restore_mode on the caller's ucontext;
+ * absence of either callback yields -EOPNOTSUPP / -EPERM respectively.
+ */
+enum uverbs_methods_restore {
+	UVERBS_METHOD_RESTORE_PD,
+};
+
+enum uverbs_attrs_restore_pd {
+	/*
+	 * Mandatory u32 input. The target ufile handle the restored PD
+	 * uobject must occupy. Reserved via xa_insert(); if the handle
+	 * is already taken in the calling ufile's idr the method
+	 * returns -EBUSY.
+	 */
+	UVERBS_ATTR_RESTORE_PD_HANDLE,
 };
 
 enum uverbs_attrs_invoke_write_cmd_attr_ids {

@@ -303,6 +303,20 @@ static int rxe_dealloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 	return 0;
 }
 
+/*
+ * CRIU-restore variant of rxe_alloc_pd. rxe has no hw-side id whose
+ * value must be preserved across restore, so the @target_handle hint
+ * is intentionally ignored here: the generic dispatcher has already
+ * reserved the requested ufile handle via
+ * rdma_alloc_begin_uobject_at_handle(); rxe's job is just to make the
+ * pd hw-usable, which is the same work rxe_alloc_pd() does.
+ */
+static int rxe_restore_pd(struct ib_pd *ibpd, u32 target_handle,
+			  struct ib_udata *udata)
+{
+	return rxe_alloc_pd(ibpd, udata);
+}
+
 /* ah */
 static int rxe_create_ah(struct ib_ah *ibah,
 			 struct rdma_ah_init_attr *init_attr,
@@ -1539,6 +1553,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.req_notify_cq = rxe_req_notify_cq,
 	.rereg_user_mr = rxe_rereg_user_mr,
 	.resize_user_cq = rxe_resize_cq,
+	.restore_pd = rxe_restore_pd,
 	.ucontext_is_restore_mode = rxe_ucontext_is_restore_mode,
 
 	INIT_RDMA_OBJ_SIZE(ib_ah, rxe_ah, ibah),
