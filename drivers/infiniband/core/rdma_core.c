@@ -562,6 +562,99 @@ struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_api_object *obj,
 }
 EXPORT_SYMBOL_NS_GPL(rdma_alloc_begin_uobject, "rdma_core");
 
+/**
+ * rdma_alloc_begin_uobject_at_handle - allocate a new IDR-class uobject and
+ * pin it at a caller-chosen handle (xarray slot in ufile->idr).
+ *
+ * Mirrors rdma_alloc_begin_uobject() / alloc_begin_idr_uobject() but, rather
+ * than letting xa_alloc() assign the next free id, atomically reserves
+ * @target_handle via xa_insert(). On success the returned uobj has
+ * uobj->id == @target_handle and is in the same write-locked /
+ * usecnt == -1 state as a normal alloc_begin; the caller must follow up
+ * with rdma_alloc_commit_uobject() (which xa_store()s the real uobj over
+ * the placeholder NULL) or rdma_alloc_abort_uobject() (which xa_erase()s
+ * the slot) just like the normal allocation path.
+ *
+ * Intended for the narrow "restore-with-preserved-handle" use case
+ * (mlx5 vfmig dynamic UAR restore), where the destination ucontext must
+ * reconstruct uobjects at the exact same ufile->idr handles the source
+ * ucontext exposed to libibverbs userspace, so that opaque handles
+ * captured in the userspace dump remain valid against the destination's
+ * ufile->idr after restore.
+ *
+ * Restrictions:
+ *   - Only IDR-class objects (uverbs_idr_class) are supported.  FD-class
+ *     objects allocate a real fd whose number is owned by the kernel
+ *     fd-allocator; that's not a knob the caller can pin.  Returns
+ *     -EOPNOTSUPP for non-IDR object types.
+ *   - Returns -EBUSY if @target_handle is already occupied in the
+ *     ufile's idr (concurrent uobj alloc, or duplicate restore on the
+ *     same ucontext).
+ *
+ * Lifetime / locking: identical to rdma_alloc_begin_uobject().
+ * hw_destroy_rwsem is held for read across the entire create window;
+ * commit / abort drops it.
+ */
+struct ib_uobject *
+rdma_alloc_begin_uobject_at_handle(struct uverbs_attr_bundle *attrs,
+				   u16 object_id, u32 target_handle)
+{
+	struct ib_uverbs_file *ufile = attrs->ufile;
+	const struct uverbs_api_object *obj;
+	struct ib_uobject *uobj;
+	int ret;
+
+	obj = uapi_get_object(ufile->device->uapi, object_id);
+	if (IS_ERR(obj))
+		return ERR_CAST(obj);
+
+	/*
+	 * Handle pinning is only meaningful for IDR-class objects: their
+	 * "handle" is just a u32 index in ufile->idr that we own. FD-class
+	 * objects' handle is a real kernel fd, which the caller has no way
+	 * to pin (and which the framework allocates via get_unused_fd_flags).
+	 */
+	if (obj->type_class != &uverbs_idr_class)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	if (!down_read_trylock(&ufile->hw_destroy_rwsem))
+		return ERR_PTR(-EIO);
+
+	uobj = alloc_uobj(attrs, obj);
+	if (IS_ERR(uobj)) {
+		ret = PTR_ERR(uobj);
+		goto err_rwsem;
+	}
+
+	/*
+	 * Atomic "insert only if empty". -EBUSY here means somebody else
+	 * already owns this handle in the ufile's idr (e.g. concurrent
+	 * uobj alloc on this fd, or a second restore call on the same
+	 * ucontext). Bubble that up; the restore path treats it as a
+	 * snapshot collision.
+	 */
+	ret = xa_insert(&ufile->idr, target_handle, NULL, GFP_KERNEL);
+	if (ret)
+		goto err_uobj;
+	uobj->id = target_handle;
+
+	ret = ib_rdmacg_try_charge(&uobj->cg_obj, uobj->context->device,
+				   RDMACG_RESOURCE_HCA_OBJECT);
+	if (ret)
+		goto err_xa;
+
+	return uobj;
+
+err_xa:
+	xa_erase(&ufile->idr, target_handle);
+err_uobj:
+	uverbs_uobject_put(uobj);
+err_rwsem:
+	up_read(&ufile->hw_destroy_rwsem);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_NS_GPL(rdma_alloc_begin_uobject_at_handle, "rdma_core");
+
 static void alloc_abort_idr_uobject(struct ib_uobject *uobj)
 {
 	ib_rdmacg_uncharge(&uobj->cg_obj, uobj->context->device,
