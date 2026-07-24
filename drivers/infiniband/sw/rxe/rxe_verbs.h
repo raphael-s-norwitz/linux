@@ -35,6 +35,15 @@ static inline int psn_compare(u32 psn_a, u32 psn_b)
 struct rxe_ucontext {
 	struct ib_ucontext ibuc;
 	struct rxe_pool_elem	elem;
+	/*
+	 * Sticky CRIU-restore-mode bit, latched in rxe_alloc_ucontext()
+	 * when userspace passes RXE_ALLOC_UCTX_RESTORE_MODE in the
+	 * GET_CONTEXT udata and reported by rxe_ucontext_is_restore_mode()
+	 * to the generic UVERBS_METHOD_RESTORE_<TYPE> dispatchers. Never
+	 * cleared for the lifetime of the ucontext. See
+	 * include/rdma/ib_verbs.h:ib_device_ops.ucontext_is_restore_mode.
+	 */
+	bool restore_mode;
 };
 
 struct rxe_pd {

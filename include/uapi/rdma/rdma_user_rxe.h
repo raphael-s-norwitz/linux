@@ -44,6 +44,26 @@ enum {
 	RXE_NETWORK_TYPE_IPV6 = 2,
 };
 
+/*
+ * Flags accepted by struct rxe_alloc_ucontext_req. Older librxe
+ * userspace passes inlen=0 to GET_CONTEXT, in which case the kernel
+ * sees req = {0} and behaviour is unchanged.
+ *
+ * RXE_ALLOC_UCTX_RESTORE_MODE: open the ucontext in CRIU-restore
+ * mode. The kernel latches a sticky bit on the resulting rxe_ucontext
+ * that the per-driver ib_device_ops.ucontext_is_restore_mode predicate
+ * reports to the generic UVERBS_METHOD_RESTORE_<TYPE> dispatchers.
+ * See tools/testing/criu_rdma/design/uobject_restore.md.
+ */
+enum {
+	RXE_ALLOC_UCTX_RESTORE_MODE = 1u << 0,
+};
+
+struct rxe_alloc_ucontext_req {
+	__u32	flags;
+	__u32	reserved;
+};
+
 union rxe_gid {
 	__u8	raw[16];
 	struct {
