@@ -2632,6 +2632,27 @@ struct ib_device_ops {
 	int (*alloc_ucontext)(struct ib_ucontext *context,
 			      struct ib_udata *udata);
 	void (*dealloc_ucontext)(struct ib_ucontext *context);
+	/*
+	 * Sticky, hw-agnostic predicate consulted by the generic
+	 * UVERBS_METHOD_RESTORE_<TYPE> dispatchers. Returns true iff
+	 * @context was opened in CRIU-restore mode and is therefore
+	 * permitted to install uobjects at caller-chosen ufile handles
+	 * via the per-resource RESTORE_* methods.
+	 *
+	 * Drivers that do not implement CRIU-restore leave this NULL.
+	 * The generic dispatch treats missing-callback as "no ucontext
+	 * on this device may restore", so adding RESTORE_* support is
+	 * strictly opt-in.
+	 *
+	 * Implementations must report a flag they latched at
+	 * alloc_ucontext() time and MUST NOT clear for the lifetime of
+	 * the ucontext: in particular it must remain TRUE across any
+	 * driver-local single-shot "restore in progress" state (e.g.
+	 * mlx5's vfmig_restore_pending, which is cleared by
+	 * MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT and so cannot serve as
+	 * the gate for RESTORE_PD/CQ/QP that run after it).
+	 */
+	bool (*ucontext_is_restore_mode)(struct ib_ucontext *context);
 	int (*mmap)(struct ib_ucontext *context, struct vm_area_struct *vma);
 	/*
 	 * This will be called once refcount of an entry in mmap_xa reaches
