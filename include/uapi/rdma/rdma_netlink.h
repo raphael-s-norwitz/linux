@@ -612,6 +612,21 @@ enum rdma_nldev_attr {
 	 */
 	RDMA_NLDEV_ATTR_RES_SUMMARY_ENTRY_MAX,		/* u64 */
 
+	/* Per-uobject ufile handle (== ib_uobject->id from the owning
+	 * ucontext's ufile uobjects xarray). Emitted alongside the existing
+	 * restrack-id attribute (PDN/CQN/LQPN/MRN/SRQN) for every fill_res_*
+	 * helper whose resource was created from user space and thus has a
+	 * ib_uobject backing it. Lets a userspace consumer (notably CRIU)
+	 * join the NLDEV per-class resource view to the uverbs ufile uobject
+	 * view returned by UVERBS_METHOD_INFO_HANDLES without an extra
+	 * device-side cross-reference step. Kernel-only restrack entries
+	 * (those with !res->user) MUST NOT carry this attribute -- it has no
+	 * meaning outside a ufile.
+	 *
+	 * See tools/testing/criu_rdma/design/uobject_restore.md §7.5.1.
+	 */
+	RDMA_NLDEV_ATTR_RES_HANDLE,		/* u32 */
+
 	/*
 	 * Always the end
 	 */
