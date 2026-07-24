@@ -2669,6 +2669,20 @@ struct ib_device_ops {
 	void (*disassociate_ucontext)(struct ib_ucontext *ibcontext);
 	int (*alloc_pd)(struct ib_pd *pd, struct ib_udata *udata);
 	int (*dealloc_pd)(struct ib_pd *pd, struct ib_udata *udata);
+	/*
+	 * CRIU-restore variant of alloc_pd. The generic
+	 * UVERBS_METHOD_RESTORE_PD dispatcher has already gated on
+	 * ucontext_is_restore_mode() and reserved a ufile handle via
+	 * rdma_alloc_begin_uobject_at_handle(); the driver's job here is
+	 * just to make the @pd hw-usable. @target_handle is supplied as a
+	 * hint for drivers (e.g. mlx5) that can pre-allocate hw ids
+	 * matching the source side; drivers (e.g. rxe) with no such
+	 * concept may ignore it and behave identically to alloc_pd.
+	 * Returns 0 on success, -errno on failure (failure aborts the
+	 * uobject install).
+	 */
+	int (*restore_pd)(struct ib_pd *pd, u32 target_handle,
+			  struct ib_udata *udata);
 	int (*create_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,
 			 struct ib_udata *udata);
 	int (*create_user_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,
