@@ -221,13 +221,40 @@ static int rxe_alloc_ucontext(struct ib_ucontext *ibuc, struct ib_udata *udata)
 {
 	struct rxe_dev *rxe = to_rdev(ibuc->device);
 	struct rxe_ucontext *uc = to_ruc(ibuc);
+	struct rxe_alloc_ucontext_req req = {};
 	int err;
+
+	/*
+	 * Older librxe userspace passes inlen=0 (no req) and gets default
+	 * behaviour. Newer userspace may opt into CRIU-restore mode via
+	 * RXE_ALLOC_UCTX_RESTORE_MODE, which latches uc->restore_mode so
+	 * rxe_ucontext_is_restore_mode() reports true to the generic
+	 * UVERBS_METHOD_RESTORE_<TYPE> dispatchers.
+	 */
+	if (udata && udata->inlen) {
+		err = ib_copy_from_udata(&req, udata,
+					 min_t(size_t, udata->inlen,
+					       sizeof(req)));
+		if (err)
+			return err;
+		if (req.flags & ~RXE_ALLOC_UCTX_RESTORE_MODE)
+			return -EOPNOTSUPP;
+		if (req.reserved)
+			return -EINVAL;
+		if (req.flags & RXE_ALLOC_UCTX_RESTORE_MODE)
+			uc->restore_mode = true;
+	}
 
 	err = rxe_add_to_pool(&rxe->uc_pool, uc);
 	if (err)
 		rxe_err_dev(rxe, "unable to create uc\n");
 
 	return err;
+}
+
+static bool rxe_ucontext_is_restore_mode(struct ib_ucontext *ibuc)
+{
+	return to_ruc(ibuc)->restore_mode;
 }
 
 static void rxe_dealloc_ucontext(struct ib_ucontext *ibuc)
@@ -1512,6 +1539,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.req_notify_cq = rxe_req_notify_cq,
 	.rereg_user_mr = rxe_rereg_user_mr,
 	.resize_user_cq = rxe_resize_cq,
+	.ucontext_is_restore_mode = rxe_ucontext_is_restore_mode,
 
 	INIT_RDMA_OBJ_SIZE(ib_ah, rxe_ah, ibah),
 	INIT_RDMA_OBJ_SIZE(ib_cq, rxe_cq, ibcq),
