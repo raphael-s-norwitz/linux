@@ -113,6 +113,9 @@ void rdma_lookup_put_uobject(struct ib_uobject *uobj,
 			     enum rdma_lookup_mode mode);
 struct ib_uobject *rdma_alloc_begin_uobject(const struct uverbs_api_object *obj,
 					    struct uverbs_attr_bundle *attrs);
+struct ib_uobject *
+rdma_alloc_begin_uobject_at_handle(struct uverbs_attr_bundle *attrs,
+				   u16 object_id, u32 target_handle);
 void rdma_alloc_abort_uobject(struct ib_uobject *uobj,
 			      struct uverbs_attr_bundle *attrs,
 			      bool hw_obj_valid);
