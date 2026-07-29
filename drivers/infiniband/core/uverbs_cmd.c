@@ -732,6 +732,8 @@ static int ib_uverbs_reg_mr(struct uverbs_attr_bundle *attrs)
 	mr->dm	    = NULL;
 	mr->sig_attrs = NULL;
 	mr->uobject = uobj;
+	mr->user_addr = cmd.start;
+	mr->access_flags = cmd.access_flags;
 	atomic_inc(&pd->usecnt);
 	mr->iova = cmd.hca_va;
 	mr->length = cmd.length;
@@ -839,6 +841,17 @@ static int ib_uverbs_rereg_mr(struct uverbs_attr_bundle *attrs)
 		new_mr->pd = new_pd;
 		new_mr->type = IB_MR_TYPE_USER;
 		new_mr->uobject = uobj;
+		/*
+		 * Carry the core-owned bookkeeping (user_addr,
+		 * access_flags) forward to the replacement MR so a later
+		 * QUERY_MR sees the post-rereg view. REREG_TRANS supplies
+		 * a new user_addr; REREG_ACCESS supplies new access flags;
+		 * everything else inherits from the original MR.
+		 */
+		new_mr->user_addr = (cmd.flags & IB_MR_REREG_TRANS) ?
+				    cmd.start : mr->user_addr;
+		new_mr->access_flags = (cmd.flags & IB_MR_REREG_ACCESS) ?
+				       cmd.access_flags : mr->access_flags;
 		atomic_inc(&new_pd->usecnt);
 		new_uobj->object = new_mr;
 		lkey = new_mr->lkey;
@@ -868,7 +881,10 @@ static int ib_uverbs_rereg_mr(struct uverbs_attr_bundle *attrs)
 		if (cmd.flags & IB_MR_REREG_TRANS) {
 			mr->iova = cmd.hca_va;
 			mr->length = cmd.length;
+			mr->user_addr = cmd.start;
 		}
+		if (cmd.flags & IB_MR_REREG_ACCESS)
+			mr->access_flags = cmd.access_flags;
 		lkey = mr->lkey;
 		rkey = mr->rkey;
 	}

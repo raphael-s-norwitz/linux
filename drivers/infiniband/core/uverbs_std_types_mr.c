@@ -133,6 +133,8 @@ static int UVERBS_HANDLER(UVERBS_METHOD_DM_MR_REG)(
 	mr->type    = IB_MR_TYPE_DM;
 	mr->dm      = dm;
 	mr->uobject = uobj;
+	mr->access_flags = attr.access_flags;
+	/* DM MRs have no user VA -- mr->user_addr stays 0. */
 	atomic_inc(&pd->usecnt);
 	atomic_inc(&dm->usecnt);
 
@@ -179,6 +181,24 @@ static int UVERBS_HANDLER(UVERBS_METHOD_QUERY_MR)(
 
 	ret = uverbs_copy_to(attrs, UVERBS_ATTR_QUERY_MR_RESP_IOVA,
 			     &mr->iova, sizeof(mr->iova));
+
+	if (IS_UVERBS_COPY_ERR(ret))
+		return ret;
+
+	/*
+	 * Core-owned bookkeeping populated by the REG_MR / RESTORE_MR
+	 * generic handlers. These attrs are UA_OPTIONAL so existing
+	 * userspace callers that only requested the four legacy outs
+	 * above stay byte-compatible (uverbs_copy_to silently no-ops
+	 * when the caller did not provide the OUT slot).
+	 */
+	ret = uverbs_copy_to(attrs, UVERBS_ATTR_QUERY_MR_RESP_USER_ADDR,
+			     &mr->user_addr, sizeof(mr->user_addr));
+	if (IS_UVERBS_COPY_ERR(ret))
+		return ret;
+
+	ret = uverbs_copy_to(attrs, UVERBS_ATTR_QUERY_MR_RESP_ACCESS_FLAGS,
+			     &mr->access_flags, sizeof(mr->access_flags));
 
 	return IS_UVERBS_COPY_ERR(ret) ? ret : 0;
 }
@@ -247,6 +267,8 @@ static int UVERBS_HANDLER(UVERBS_METHOD_REG_DMABUF_MR)(
 	mr->pd = pd;
 	mr->type = IB_MR_TYPE_USER;
 	mr->uobject = uobj;
+	mr->access_flags = access_flags;
+	/* DMABUF MRs don't carry a user VA -- mr->user_addr stays 0. */
 	atomic_inc(&pd->usecnt);
 
 	rdma_restrack_new(&mr->res, RDMA_RESTRACK_MR);
@@ -374,6 +396,17 @@ static int UVERBS_HANDLER(UVERBS_METHOD_REG_MR)(
 	mr->pd = pd;
 	mr->type = IB_MR_TYPE_USER;
 	mr->uobject = uobj;
+	mr->access_flags = access_flags;
+	/*
+	 * user_addr is the user VA the caller registered against
+	 * (REG_MR_ADDR). DMABUF MRs don't have one -- the fd-pinned
+	 * pages live in their own VA space -- so we leave user_addr
+	 * at 0 in that lane. QUERY_MR's RESP_USER_ADDR == 0 must be
+	 * read by userspace as "MR has no user VA," not "MR registered
+	 * at NULL."
+	 */
+	if (!has_fd)
+		mr->user_addr = addr;
 	atomic_inc(&pd->usecnt);
 	if (dmah) {
 		mr->dmah = dmah;
@@ -430,6 +463,12 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_QUERY_MR_RESP_IOVA,
 			    UVERBS_ATTR_TYPE(u64),
+			    UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_QUERY_MR_RESP_USER_ADDR,
+			    UVERBS_ATTR_TYPE(u64),
+			    UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_QUERY_MR_RESP_ACCESS_FLAGS,
+			    UVERBS_ATTR_TYPE(u32),
 			    UA_OPTIONAL));
 
 DECLARE_UVERBS_NAMED_METHOD(

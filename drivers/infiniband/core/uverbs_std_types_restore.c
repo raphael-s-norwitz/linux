@@ -202,6 +202,8 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_MR)(
 	mr->uobject = uobj;
 	mr->iova = iova;
 	mr->length = length;
+	mr->user_addr = addr;
+	mr->access_flags = access_flags;
 	atomic_inc(&pd->usecnt);
 
 	rdma_restrack_new(&mr->res, RDMA_RESTRACK_MR);

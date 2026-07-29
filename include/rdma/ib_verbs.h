@@ -2042,6 +2042,19 @@ struct ib_mr {
 		u32 handle;
 	} frmr;
 	/*
+	 * Core-owned, set by the REG_MR / RESTORE_MR generic handlers
+	 * after the driver returns. Drivers MUST NOT write here; reads
+	 * are fine. user_addr is the user VA passed to reg_user_mr (the
+	 * 'addr' UAPI field) and is 0 for non-user MRs (DMABUF, DM,
+	 * FR, etc.). access_flags is the IB_ACCESS_* mask the MR was
+	 * registered/restored with. Both are surfaced via
+	 * UVERBS_METHOD_QUERY_MR so CRIU can re-feed them to
+	 * UVERBS_METHOD_RESTORE_MR on the destination without needing
+	 * to peek into driver-private MR structs.
+	 */
+	u64		   user_addr;
+	u32		   access_flags;
+	/*
 	 * Implementation details of the RDMA core, don't use in drivers:
 	 */
 	struct rdma_restrack_entry res;
