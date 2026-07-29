@@ -150,6 +150,62 @@ err_cnt:
 	return err;
 }
 
+/*
+ * Hint-aware variant of __rxe_add_to_pool that reserves a specific
+ * @index instead of letting the cyclic allocator pick. Used by the
+ * uverbs RESTORE_* family on rxe so that CRIU can re-attach an
+ * adopted resource at the same pool slot it held on the source --
+ * which is the property the per-class verb (e.g. rxe_restore_mr)
+ * relies on to honour the wire-visible lkey/rkey identity hint.
+ *
+ * Failure modes:
+ *   -EINVAL  -- @index is outside [pool->limit.min, pool->limit.max].
+ *   -ENOSPC  -- pool already at max_elem (matches __rxe_add_to_pool).
+ *   -EBUSY   -- the slot is already occupied; the dispatcher surfaces
+ *               this as a per-verb collision to userspace (e.g. CRIU
+ *               sees -EBUSY out of RESTORE_MR's xa_insert path).
+ *
+ * Co-existence with the cyclic allocator on the same pool: subsequent
+ * __rxe_add_to_pool calls keep using xa_alloc_cyclic, which checks
+ * each candidate slot via xa_alloc and skips taken indices. The
+ * hint-installed elem is just another taken slot from its point of
+ * view. pool->next may lag behind hint-installed indices; that just
+ * means the next cyclic alloc walks past a few extra taken slots
+ * before finding free space, which is functionally fine.
+ */
+int __rxe_add_to_pool_at_index(struct rxe_pool *pool,
+			       struct rxe_pool_elem *elem,
+			       u32 index, bool sleepable)
+{
+	gfp_t gfp_flags;
+	int err;
+
+	if (index < pool->limit.min || index > pool->limit.max)
+		return -EINVAL;
+
+	if (atomic_inc_return(&pool->num_elem) > pool->max_elem) {
+		atomic_dec(&pool->num_elem);
+		return -ENOSPC;
+	}
+
+	elem->pool = pool;
+	elem->obj = (u8 *)elem - pool->elem_offset;
+	kref_init(&elem->ref_cnt);
+	init_completion(&elem->complete);
+
+	gfp_flags = sleepable ? GFP_KERNEL : GFP_ATOMIC;
+	if (sleepable)
+		might_sleep();
+
+	err = xa_insert(&pool->xa, index, NULL, gfp_flags);
+	if (err) {
+		atomic_dec(&pool->num_elem);
+		return err;
+	}
+	elem->index = index;
+	return 0;
+}
+
 void *rxe_pool_get_index(struct rxe_pool *pool, u32 index)
 {
 	struct rxe_pool_elem *elem;

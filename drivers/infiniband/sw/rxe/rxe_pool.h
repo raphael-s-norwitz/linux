@@ -61,6 +61,17 @@ int __rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_elem *elem,
 #define rxe_add_to_pool_ah(pool, obj, sleepable) __rxe_add_to_pool(pool, \
 				&(obj)->elem, sleepable)
 
+/* Hint-aware variant: reserve a specific @index instead of cyclic
+ * allocation. See __rxe_add_to_pool_at_index() in rxe_pool.c for the
+ * full failure-mode contract. Used by the rxe RESTORE_* verb family
+ * to honour the wire-visible identity hint coming from CRIU.
+ */
+int __rxe_add_to_pool_at_index(struct rxe_pool *pool,
+			       struct rxe_pool_elem *elem,
+			       u32 index, bool sleepable);
+#define rxe_add_to_pool_at_index(pool, obj, index) \
+	__rxe_add_to_pool_at_index(pool, &(obj)->elem, index, true)
+
 /* lookup an indexed object from index. takes a reference on object */
 void *rxe_pool_get_index(struct rxe_pool *pool, u32 index);
 

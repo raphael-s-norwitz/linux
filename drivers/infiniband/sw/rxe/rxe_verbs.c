@@ -1354,24 +1354,37 @@ err_free:
  * CRIU-restore variant of rxe_reg_user_mr. The generic dispatcher
  * has already gated on ucontext_is_restore_mode(), resolved the
  * parent @pd, reserved @target_handle in the ufile idr, and
- * validated @access_flags. rxe's job is to pin the user pages at
- * (@start, @length) into the destination process's mm and install
- * a usable struct ib_mr.
+ * validated @access_flags. rxe's job is to install the MR pool elem
+ * at the slot demanded by @lkey_hint / @rkey_hint, pin the user
+ * pages at (@addr, @length) into the destination process's mm, and
+ * stamp the hint key onto the struct ib_mr so the wire-visible
+ * lkey/rkey is byte-identical to the source.
  *
- * rxe cannot honour the @lkey_hint / @rkey_hint identity hints: the
- * 24-bit key index is tied to the slot rxe_add_to_pool() chooses in
- * the rxe_mr_pool xarray, and the 8-bit nonce comes from a per-rxe
- * rolling counter inside rxe_get_next_key(). This is a property of
- * rxe's allocator -- not specific to CRIU restore -- so the hints
- * are intentionally ignored here. The generic dispatcher returns
- * the actual installed lkey/rkey to userspace via RESP_LKEY/_RKEY
- * so the caller can detect the no-honour case.
+ * Identity-hint contract on rxe. lkey and rkey share the same 32-bit
+ * layout: bits 31:8 are the rxe_mr_pool elem index, bits 7:0 are an
+ * 8-bit nonce. CRIU passes the source MR's lkey/rkey verbatim;
+ * the dispatcher only enforces lkey_hint == rkey_hint here (in
+ * keeping with rxe_mr_init's own invariant that ibmr.lkey ==
+ * ibmr.rkey on first install). The pool primitive used is
+ * __rxe_add_to_pool_at_index, which xa_inserts a placeholder at the
+ * requested index and returns -EBUSY on collision (CRIU's expected
+ * shape for "this restore's hint conflicts with an existing
+ * uobject"). The nonce comes straight from the hint's low byte.
  *
- * @iova / @target_handle are likewise unused by rxe at this layer:
- * the dispatcher copies @iova into ibmr->iova post-success, and the
- * ufile-handle slot has already been reserved at the dispatch
- * level. @udata is reserved for future driver-private UHW payloads
- * (none defined for rxe today).
+ * Why we don't preserve rxe_mr_init's freshness invariant for the
+ * nonce on restore: the nonce is per-MR-create entropy against
+ * key reuse for objects whose lkey/rkey was *previously* in flight
+ * on this rxe instance. A CRIU-restored MR is a brand-new instance
+ * on this rxe (this process's prior uverbsfd was closed before
+ * restore), so reusing the source's nonce introduces no fresh
+ * collision risk. The contract matters at registration: from this
+ * point on, the pool's xa_alloc_cyclic guarantees uniqueness on
+ * subsequent fresh allocations the normal way.
+ *
+ * @target_handle is unused at this layer -- the dispatcher already
+ * reserved the ufile slot. @iova is copied into ibmr->iova by the
+ * dispatcher post-success. @udata is reserved for future
+ * driver-private UHW payloads (none defined for rxe today).
  *
  * IB_ACCESS_ON_DEMAND is out of scope for v0 CRIU restore.
  */
@@ -1383,20 +1396,34 @@ static struct ib_mr *rxe_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	struct rxe_dev *rxe = to_rdev(ibpd->device);
 	struct rxe_pd *pd = to_rpd(ibpd);
 	struct rxe_mr *mr;
+	u32 index_hint;
 	int err, cleanup_err;
 
 	if (access & IB_ACCESS_ON_DEMAND)
 		return ERR_PTR(-EOPNOTSUPP);
 	if (access & ~RXE_ACCESS_SUPPORTED_MR)
 		return ERR_PTR(-EOPNOTSUPP);
+	if (lkey_hint != rkey_hint)
+		return ERR_PTR(-EINVAL);
+
+	index_hint = lkey_hint >> 8;
 
 	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
-	err = rxe_add_to_pool(&rxe->mr_pool, mr);
+	err = rxe_add_to_pool_at_index(&rxe->mr_pool, mr, index_hint);
 	if (err) {
-		rxe_dbg_pd(pd, "unable to create mr\n");
+		/*
+		 * -EBUSY here means "another MR (live or recently parked)
+		 * already occupies index_hint." The dispatcher surfaces it
+		 * to userspace as the per-verb collision shape -- exactly
+		 * what CRIU wants to see when its bookkeeping disagrees
+		 * with the kernel about ufile state.
+		 */
+		rxe_dbg_pd(pd,
+			   "pool install at index 0x%x failed, err = %d\n",
+			   index_hint, err);
 		goto err_free;
 	}
 
@@ -1410,6 +1437,18 @@ static struct ib_mr *rxe_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 			   err);
 		goto err_cleanup;
 	}
+
+	/*
+	 * rxe_mr_init (called from rxe_mr_init_user) wrote a randomly
+	 * keyed lkey/rkey using rxe_get_next_key(-1). Overwrite with
+	 * the hint so the wire-visible identity matches the source.
+	 * Safe because mr is unreachable from any lookup until
+	 * rxe_finalize() stores the pool elem.
+	 */
+	mr->lkey = lkey_hint;
+	mr->ibmr.lkey = lkey_hint;
+	mr->rkey = rkey_hint;
+	mr->ibmr.rkey = rkey_hint;
 
 	rxe_finalize(mr);
 	return &mr->ibmr;
