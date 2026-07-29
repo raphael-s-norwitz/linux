@@ -419,6 +419,23 @@ enum uverbs_attrs_query_mr_cmd_attr_ids {
 	UVERBS_ATTR_QUERY_MR_RESP_RKEY,
 	UVERBS_ATTR_QUERY_MR_RESP_LENGTH,
 	UVERBS_ATTR_QUERY_MR_RESP_IOVA,
+	/*
+	 * The user VA the MR was registered against (the 'addr' arg to
+	 * reg_user_mr). 0 for non-user MRs (DMABUF, DM, FR, etc.).
+	 * Returns -ENODATA via attribute absence in the response bundle
+	 * when the kernel does not have the value; userspace MUST treat
+	 * a missing attribute as "unknown" rather than 0.
+	 *
+	 * Security boundary: the MR handle lookup is gated by the
+	 * standard uverbs IDR machinery, which requires the caller to
+	 * own the ufile that owns the MR. This is strictly tighter than
+	 * NLDEV's CAP_NET_ADMIN gate, which is the reason we chose the
+	 * uverbs ioctl over an NLDEV TLV -- CRIU is the only known
+	 * consumer and CRIU already has the holder's uverbsfd open at
+	 * dump time.
+	 */
+	UVERBS_ATTR_QUERY_MR_RESP_USER_ADDR,
+	UVERBS_ATTR_QUERY_MR_RESP_ACCESS_FLAGS,
 };
 
 enum uverbs_attrs_reg_dmabuf_mr_cmd_attr_ids {
