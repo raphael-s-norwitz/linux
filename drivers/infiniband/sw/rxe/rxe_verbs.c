@@ -1350,6 +1350,80 @@ err_free:
 	return ERR_PTR(err);
 }
 
+/*
+ * CRIU-restore variant of rxe_reg_user_mr. The generic dispatcher
+ * has already gated on ucontext_is_restore_mode(), resolved the
+ * parent @pd, reserved @target_handle in the ufile idr, and
+ * validated @access_flags. rxe's job is to pin the user pages at
+ * (@start, @length) into the destination process's mm and install
+ * a usable struct ib_mr.
+ *
+ * rxe cannot honour the @lkey_hint / @rkey_hint identity hints: the
+ * 24-bit key index is tied to the slot rxe_add_to_pool() chooses in
+ * the rxe_mr_pool xarray, and the 8-bit nonce comes from a per-rxe
+ * rolling counter inside rxe_get_next_key(). This is a property of
+ * rxe's allocator -- not specific to CRIU restore -- so the hints
+ * are intentionally ignored here. The generic dispatcher returns
+ * the actual installed lkey/rkey to userspace via RESP_LKEY/_RKEY
+ * so the caller can detect the no-honour case.
+ *
+ * @iova / @target_handle are likewise unused by rxe at this layer:
+ * the dispatcher copies @iova into ibmr->iova post-success, and the
+ * ufile-handle slot has already been reserved at the dispatch
+ * level. @udata is reserved for future driver-private UHW payloads
+ * (none defined for rxe today).
+ *
+ * IB_ACCESS_ON_DEMAND is out of scope for v0 CRIU restore.
+ */
+static struct ib_mr *rxe_restore_mr(struct ib_pd *ibpd, u32 target_handle,
+				    u64 addr, u64 length, u64 iova,
+				    int access, u32 lkey_hint, u32 rkey_hint,
+				    struct ib_udata *udata)
+{
+	struct rxe_dev *rxe = to_rdev(ibpd->device);
+	struct rxe_pd *pd = to_rpd(ibpd);
+	struct rxe_mr *mr;
+	int err, cleanup_err;
+
+	if (access & IB_ACCESS_ON_DEMAND)
+		return ERR_PTR(-EOPNOTSUPP);
+	if (access & ~RXE_ACCESS_SUPPORTED_MR)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+	if (!mr)
+		return ERR_PTR(-ENOMEM);
+
+	err = rxe_add_to_pool(&rxe->mr_pool, mr);
+	if (err) {
+		rxe_dbg_pd(pd, "unable to create mr\n");
+		goto err_free;
+	}
+
+	rxe_get(pd);
+	mr->ibmr.pd = ibpd;
+	mr->ibmr.device = ibpd->device;
+
+	err = rxe_mr_init_user(rxe, addr, length, access, mr);
+	if (err) {
+		rxe_dbg_mr(mr, "rxe_mr_init_user failed, err = %d\n",
+			   err);
+		goto err_cleanup;
+	}
+
+	rxe_finalize(mr);
+	return &mr->ibmr;
+
+err_cleanup:
+	cleanup_err = rxe_cleanup(mr);
+	if (cleanup_err)
+		rxe_err_mr(mr, "cleanup failed, err = %d\n",
+			   cleanup_err);
+err_free:
+	kfree(mr);
+	return ERR_PTR(err);
+}
+
 static struct ib_mr *rxe_rereg_user_mr(struct ib_mr *ibmr, int flags,
 				       u64 start, u64 length, u64 iova,
 				       int access, struct ib_pd *ibpd,
@@ -1553,6 +1627,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.req_notify_cq = rxe_req_notify_cq,
 	.rereg_user_mr = rxe_rereg_user_mr,
 	.resize_user_cq = rxe_resize_cq,
+	.restore_mr = rxe_restore_mr,
 	.restore_pd = rxe_restore_pd,
 	.ucontext_is_restore_mode = rxe_ucontext_is_restore_mode,
 
