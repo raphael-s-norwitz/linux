@@ -2683,6 +2683,40 @@ struct ib_device_ops {
 	 */
 	int (*restore_pd)(struct ib_pd *pd, u32 target_handle,
 			  struct ib_udata *udata);
+	/*
+	 * CRIU-restore variant of reg_user_mr. The generic
+	 * UVERBS_METHOD_RESTORE_MR dispatcher has already:
+	 *   - gated on ucontext_is_restore_mode(),
+	 *   - resolved the parent @pd from the caller-supplied PD
+	 *     ufile handle (refcount auto-bumped via the IDR attr),
+	 *   - reserved @target_handle in the ufile idr via
+	 *     rdma_alloc_begin_uobject_at_handle().
+	 *
+	 * The driver's job is to return a usable struct ib_mr whose
+	 * lkey/rkey reflect what was actually installed. @lkey_hint /
+	 * @rkey_hint are wire-visible identity hints carried in the
+	 * core UVERBS_ATTR_RESTORE_MR_LKEY_HINT/_RKEY_HINT attrs.
+	 * Drivers that can preserve the source's keys (e.g. mlx5,
+	 * which has FW mkey-index continuity across LOAD_VHCA_STATE)
+	 * MUST honour them. Drivers that cannot (e.g. rxe, whose key
+	 * bits are tied to its internal pool slot allocator) MAY
+	 * ignore them and return fresh keys via the returned
+	 * ib_mr->lkey / ib_mr->rkey; the generic dispatcher echoes
+	 * those back to userspace.
+	 *
+	 * Driver-private FW state (e.g. mlx5's source mkey_index)
+	 * travels through @udata via UVERBS_ATTR_UHW(). The driver
+	 * validates internal consistency between the UHW payload and
+	 * the generic hints.
+	 *
+	 * Returns a valid struct ib_mr * on success, ERR_PTR on
+	 * failure (failure aborts the uobject install).
+	 */
+	struct ib_mr *(*restore_mr)(struct ib_pd *pd, u32 target_handle,
+				    u64 addr, u64 length, u64 iova,
+				    int access_flags,
+				    u32 lkey_hint, u32 rkey_hint,
+				    struct ib_udata *udata);
 	int (*create_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,
 			 struct ib_udata *udata);
 	int (*create_user_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,

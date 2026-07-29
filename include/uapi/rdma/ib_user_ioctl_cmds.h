@@ -100,6 +100,7 @@ enum uverbs_methods_device {
  */
 enum uverbs_methods_restore {
 	UVERBS_METHOD_RESTORE_PD,
+	UVERBS_METHOD_RESTORE_MR,
 };
 
 enum uverbs_attrs_restore_pd {
@@ -110,6 +111,61 @@ enum uverbs_attrs_restore_pd {
 	 * returns -EBUSY.
 	 */
 	UVERBS_ATTR_RESTORE_PD_HANDLE,
+};
+
+/*
+ * UVERBS_METHOD_RESTORE_MR attributes.
+ *
+ * The wire-visible identity (lkey, rkey) is carried in the
+ * UVERBS_ATTR_RESTORE_MR_LKEY_HINT / _RKEY_HINT core attrs. These
+ * are *hints*: drivers that can preserve the source's keys (mlx5)
+ * consume them; drivers that cannot (rxe -- key bits are tied to
+ * the rxe_pool slot allocator) ignore them and return their own
+ * fresh keys via RESP_LKEY/_RKEY. The actual lkey/rkey the kernel
+ * installed is *always* returned via RESP_LKEY/_RKEY, regardless
+ * of whether the driver honoured the hint, so generic userspace
+ * (CRIU plugin, INFO_HANDLES consumers) can compare without
+ * needing per-driver decoders.
+ *
+ * Driver-private state (e.g. mlx5's FW mkey index, separately
+ * carried in struct mlx5_ib_restore_mr_req) travels through
+ * UVERBS_ATTR_UHW(). The driver is responsible for validating the
+ * consistency between its UHW payload and the generic lkey/rkey
+ * hints (e.g. mlx5 enforces (lkey_hint >> 8) == (rkey_hint >> 8)
+ * == mkey_index for the v0 basic-user-MR case).
+ */
+enum uverbs_attrs_restore_mr {
+	/*
+	 * Mandatory u32 input. Target ufile handle the restored MR
+	 * uobject must occupy. -EBUSY on collision; same semantics as
+	 * UVERBS_ATTR_RESTORE_PD_HANDLE.
+	 */
+	UVERBS_ATTR_RESTORE_MR_HANDLE,
+	/*
+	 * Mandatory IDR input. Parent PD's ufile handle. Dispatcher
+	 * resolves it to the live ib_pd; the new MR's usecnt edge is
+	 * installed against this PD.
+	 */
+	UVERBS_ATTR_RESTORE_MR_PD_HANDLE,
+	/* Mandatory u64 inputs: user virtual address + length + iova. */
+	UVERBS_ATTR_RESTORE_MR_ADDR,
+	UVERBS_ATTR_RESTORE_MR_LENGTH,
+	UVERBS_ATTR_RESTORE_MR_IOVA,
+	/* Mandatory enum ib_access_flags input. */
+	UVERBS_ATTR_RESTORE_MR_ACCESS_FLAGS,
+	/*
+	 * Mandatory u32 inputs. Wire-visible identity hints; driver
+	 * may honour or ignore.
+	 */
+	UVERBS_ATTR_RESTORE_MR_LKEY_HINT,
+	UVERBS_ATTR_RESTORE_MR_RKEY_HINT,
+	/*
+	 * Mandatory u32 outputs. Actual lkey/rkey the kernel installed.
+	 * Equals the hints on a driver that honours them (mlx5 v0);
+	 * differs on a driver that ignored them (rxe).
+	 */
+	UVERBS_ATTR_RESTORE_MR_RESP_LKEY,
+	UVERBS_ATTR_RESTORE_MR_RESP_RKEY,
 };
 
 enum uverbs_attrs_invoke_write_cmd_attr_ids {
