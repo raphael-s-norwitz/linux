@@ -92,6 +92,27 @@ int rxe_cq_post(struct rxe_cq *cq, struct rxe_cqe *cqe, int solicited)
 	return 0;
 }
 
+/*
+ * CRIU restore: seed a freshly-created CQ ring's cursors to the source-side
+ * indices. The user CQ ring is QUEUE_TYPE_TO_CLIENT, so rxe owns the
+ * producer (its private @index copy, mirrored to buf->producer_index) and
+ * the client owns the consumer (buf->consumer_index) -- the opposite
+ * ownership to the SQ/RQ. This is why rxe_qp_seed_ring() cannot be reused:
+ * it sets q->index = consumer (correct for FROM_CLIENT), which here would
+ * make the next rxe_cq_post() write at the consumer slot and rewind
+ * producer_index, clobbering the restored ring. Indices are masked to slot
+ * width to match the wire bookkeeping.
+ */
+void rxe_cq_seed_ring(struct rxe_queue *q, u32 producer, u32 consumer)
+{
+	producer &= q->index_mask;
+	consumer &= q->index_mask;
+
+	q->buf->producer_index = producer;
+	q->buf->consumer_index = consumer;
+	q->index = producer;
+}
+
 void rxe_cq_cleanup(struct rxe_pool_elem *elem)
 {
 	struct rxe_cq *cq = container_of(elem, typeof(*cq), elem);
