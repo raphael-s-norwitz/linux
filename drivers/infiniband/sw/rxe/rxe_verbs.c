@@ -12,6 +12,9 @@
 #include "rxe_queue.h"
 #include "rxe_hw_counters.h"
 
+/* Driver-private RXE_IB_OBJECT_MIGRATE uverbs object (rxe_migrate.c). */
+extern const struct uapi_definition rxe_migrate_defs[];
+
 static int post_one_recv(struct rxe_rq *rq, const struct ib_recv_wr *ibwr);
 
 /* dev */
@@ -1848,6 +1851,8 @@ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name,
 
 	dev->uverbs_cmd_mask |= BIT_ULL(IB_USER_VERBS_CMD_POST_SEND) |
 				BIT_ULL(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ);
+
+	dev->driver_def = rxe_migrate_defs;
 
 	ib_set_device_ops(dev, &rxe_dev_ops);
 	err = ib_device_set_netdev(&rxe->ib_dev, ndev, 1);
