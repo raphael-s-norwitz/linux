@@ -1154,6 +1154,79 @@ err_out:
 	return err;
 }
 
+/*
+ * CRIU-restore variant of rxe_create_cq. The generic
+ * UVERBS_METHOD_RESTORE_CQ dispatcher has already gated on
+ * ucontext_is_restore_mode(), reserved @target_handle in the ufile
+ * idr via rdma_alloc_begin_uobject_at_handle(), and rejected any
+ * comp_channel reference (v0 has no RESTORE_COMP_CHANNEL).
+ *
+ * rxe has no wire-spec cqn whose value must be preserved across
+ * restore: a CQ is purely a poll target on this device, with no
+ * RDMA-protocol identity (cf. rxe MRs, whose lkey/rkey ARE wire
+ * visible -- see rxe_restore_mr's index-honouring contract). The
+ * rxe_pool elem index is internal restrack metadata only, so we
+ * deliberately ignore @target_handle here for hw-id purposes and
+ * behave identically to rxe_create_cq: cyclic pool slot allocation
+ * + queue init.
+ *
+ * @udata is reserved for future driver-private UHW payloads (none
+ * defined for rxe today). @attr carries the legacy ib_cq_init_attr
+ * triple; rxe rejects non-zero attr->flags (no rxe-side support
+ * for IB_UVERBS_CQ_FLAGS_*) the same as rxe_create_cq.
+ */
+static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
+			  const struct ib_cq_init_attr *attr,
+			  struct ib_udata *udata)
+{
+	struct ib_device *dev = ibcq->device;
+	struct rxe_dev *rxe = to_rdev(dev);
+	struct rxe_cq *cq = to_rcq(ibcq);
+	struct rxe_create_cq_resp __user *uresp = NULL;
+	int err, cleanup_err;
+
+	if (udata) {
+		if (udata->outlen < sizeof(*uresp)) {
+			err = -EINVAL;
+			rxe_dbg_dev(rxe, "malformed udata, err = %d\n", err);
+			goto err_out;
+		}
+		uresp = udata->outbuf;
+	}
+
+	if (attr->flags) {
+		err = -EOPNOTSUPP;
+		rxe_dbg_dev(rxe, "bad attr->flags, err = %d\n", err);
+		goto err_out;
+	}
+
+	if (attr->cqe > rxe->attr.max_cqe)
+		return -EINVAL;
+
+	err = rxe_add_to_pool(&rxe->cq_pool, cq);
+	if (err) {
+		rxe_dbg_dev(rxe, "unable to restore cq, err = %d\n", err);
+		goto err_out;
+	}
+
+	err = rxe_cq_from_init(rxe, cq, attr->cqe, attr->comp_vector, udata,
+			       uresp, 0);
+	if (err) {
+		rxe_dbg_cq(cq, "restore cq failed, err = %d\n", err);
+		goto err_cleanup;
+	}
+
+	return 0;
+
+err_cleanup:
+	cleanup_err = rxe_cleanup(cq);
+	if (cleanup_err)
+		rxe_err_cq(cq, "cleanup failed, err = %d\n", cleanup_err);
+err_out:
+	rxe_err_dev(rxe, "returned err = %d\n", err);
+	return err;
+}
+
 static int rxe_resize_cq(struct ib_cq *ibcq, unsigned int cqe,
 			 struct ib_udata *udata)
 {
@@ -1666,6 +1739,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.req_notify_cq = rxe_req_notify_cq,
 	.rereg_user_mr = rxe_rereg_user_mr,
 	.resize_user_cq = rxe_resize_cq,
+	.restore_cq = rxe_restore_cq,
 	.restore_mr = rxe_restore_mr,
 	.restore_pd = rxe_restore_pd,
 	.ucontext_is_restore_mode = rxe_ucontext_is_restore_mode,

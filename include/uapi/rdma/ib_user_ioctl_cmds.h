@@ -101,6 +101,7 @@ enum uverbs_methods_device {
 enum uverbs_methods_restore {
 	UVERBS_METHOD_RESTORE_PD,
 	UVERBS_METHOD_RESTORE_MR,
+	UVERBS_METHOD_RESTORE_CQ,
 };
 
 enum uverbs_attrs_restore_pd {
@@ -166,6 +167,92 @@ enum uverbs_attrs_restore_mr {
 	 */
 	UVERBS_ATTR_RESTORE_MR_RESP_LKEY,
 	UVERBS_ATTR_RESTORE_MR_RESP_RKEY,
+};
+
+/*
+ * UVERBS_METHOD_RESTORE_CQ attributes.
+ *
+ * RESTORE_CQ deliberately omits a "cqn_hint" core attr. Unlike MR's
+ * lkey/rkey -- which are wire-visible RDMA-spec identifiers carried
+ * in every read/write opcode and therefore MUST survive restore --
+ * the CQ identifier is not part of any wire-protocol header. Drivers
+ * with FW-side cqn (mlx5_vfmig) carry the source's cqn through their
+ * private UHW payload (see struct mlx5_ib_restore_cq_req, lands in
+ * S5 B1) and the driver enforces continuity internally. Drivers
+ * with no cqn concept (rxe) simply allocate a fresh pool slot the
+ * same way rxe_create_cq() does. K8a's NLDEV RES_HANDLE for the
+ * restored CQ matches RESTORE_CQ_HANDLE -- the ufile handle which
+ * the dispatcher reserves via rdma_alloc_begin_uobject_at_handle()
+ * -- so user-visible identity (RES_HANDLE) is preserved out of band.
+ *
+ * COMP_CHANNEL is declared UA_OPTIONAL for forward compat with a
+ * future UVERBS_METHOD_RESTORE_COMP_CHANNEL, but the v0 dispatcher
+ * hard-rejects with -EOPNOTSUPP if any caller actually passes one.
+ * v0 callers (CRIU plugin) must not pass a CC reference; CQs that
+ * were bound to a comp_channel on the source side cannot be
+ * restored end-to-end until RESTORE_COMP_CHANNEL lands.
+ *
+ * EVENT_FD is also UA_OPTIONAL. The dispatcher routes through
+ * ib_uverbs_get_async_event(), which falls back to the ufile's
+ * default_async_file when the attr is absent (the v0 path: CRIU
+ * plugin does not pass an event_fd because RESTORE_ASYNC_EVENT has
+ * not landed yet). When RESTORE_ASYNC_EVENT does land in S8, the
+ * attr will resolve to the restored async-event uobject without any
+ * UAPI bump.
+ */
+enum uverbs_attrs_restore_cq {
+	/*
+	 * Mandatory u32 input. Target ufile handle the restored CQ
+	 * uobject must occupy. -EBUSY on collision; same semantics as
+	 * UVERBS_ATTR_RESTORE_PD_HANDLE / _MR_HANDLE.
+	 */
+	UVERBS_ATTR_RESTORE_CQ_HANDLE,
+	/*
+	 * Mandatory u32 input. The CQ size requested by userspace
+	 * (the @cqe arg to ibv_create_cq on the source side). The
+	 * driver may round up; the actual installed size is returned
+	 * via UVERBS_ATTR_RESTORE_CQ_RESP_CQE.
+	 */
+	UVERBS_ATTR_RESTORE_CQ_CQE,
+	/*
+	 * Mandatory u64 input. The user-supplied tag the source
+	 * passed as ibv_create_cq()'s cq_context parameter. Stored
+	 * verbatim in struct ib_uobject::user_handle so libibverbs
+	 * sees the same value via cq->cq_context post-restore.
+	 */
+	UVERBS_ATTR_RESTORE_CQ_USER_HANDLE,
+	/*
+	 * Mandatory u32 input. The completion vector (~ EQ index for
+	 * mlx5; not strictly meaningful for rxe) the source CQ was
+	 * bound to. Must be < num_comp_vectors of the restore-side
+	 * device.
+	 */
+	UVERBS_ATTR_RESTORE_CQ_COMP_VECTOR,
+	/*
+	 * Optional FLAGS_IN. ib_uverbs_ex_create_cq_flags subset:
+	 * IB_UVERBS_CQ_FLAGS_TIMESTAMP_COMPLETION,
+	 * IB_UVERBS_CQ_FLAGS_IGNORE_OVERRUN. Absent -> 0.
+	 */
+	UVERBS_ATTR_RESTORE_CQ_FLAGS,
+	/*
+	 * Optional FD reference into UVERBS_OBJECT_COMP_CHANNEL.
+	 * Forward-compat slot for RESTORE_COMP_CHANNEL; v0 dispatcher
+	 * rejects -EOPNOTSUPP if any caller supplies one.
+	 */
+	UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL,
+	/*
+	 * Optional FD reference into UVERBS_OBJECT_ASYNC_EVENT.
+	 * Resolves via ib_uverbs_get_async_event(); absent ->
+	 * ufile->default_async_file (the v0 CRIU plugin path).
+	 */
+	UVERBS_ATTR_RESTORE_CQ_EVENT_FD,
+	/*
+	 * Mandatory u32 output. The actual cqe count the kernel
+	 * installed -- equals UVERBS_ATTR_RESTORE_CQ_CQE for drivers
+	 * that don't round up, may be larger otherwise. Mirrors
+	 * UVERBS_ATTR_CREATE_CQ_RESP_CQE on the create-side path.
+	 */
+	UVERBS_ATTR_RESTORE_CQ_RESP_CQE,
 };
 
 enum uverbs_attrs_invoke_write_cmd_attr_ids {
