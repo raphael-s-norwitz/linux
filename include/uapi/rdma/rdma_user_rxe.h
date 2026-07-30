@@ -251,11 +251,14 @@ struct rxe_restore_cq_req {
  * The dump-side counterpart to struct rxe_restore_cq_req: @vm_pgoff is
  * the CQ ring's mmap byte offset (cq->queue->ip->info.offset) that the
  * dumper replays into RESTORE_CQ, and @cqe is the user-visible entry
- * count. @producer / @consumer are the ring cursors, reported as
- * read-only telemetry. @cqe_image_bytes is the length of the optional
- * in-flight CQE image carried in RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE;
- * it is 0 (image unfilled) until the in-flight CQ slice. @reserved must
- * be 0 and is available for future fields.
+ * count. @producer / @consumer are the live ring cursors
+ * (QUEUE_TYPE_TO_CLIENT: producer == q->index, consumer ==
+ * buf->consumer_index), replayed into rxe_restore_cq_req so the restored
+ * ring's unreaped completions are visible to ibv_poll_cq.
+ * @cqe_image_bytes is the byte length of the in-flight [consumer,
+ * producer) CQE image emitted in the optional
+ * RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE attr (0 for a drained CQ).
+ * @reserved must be 0 and is available for future fields.
  */
 struct rxe_query_cq_resp {
 	__aligned_u64 vm_pgoff;
