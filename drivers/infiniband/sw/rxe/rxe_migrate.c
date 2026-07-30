@@ -24,12 +24,53 @@
 #define UVERBS_MODULE_NAME rdma_rxe
 #include <rdma/uverbs_named_ioctl.h>
 
+/*
+ * Emit one optional CQE ring image attr, shipping only the in-flight
+ * [consumer, producer) subspan rather than the whole ring. @producer /
+ * @consumer are the caller's coherent cursor snapshot; the emitted image
+ * agrees byte-for-byte with the cursors carried in the resp blob. A level
+ * ring (or a dumper that didn't ask for the attr) is a no-op; a
+ * provided-but-too-small buffer is a hard error. Linearizing the live
+ * subspan keeps a default ib_send_bw ring under the u16 uverbs attr
+ * length that a whole-ring blit would overflow.
+ */
+static int rxe_query_emit_ring(struct uverbs_attr_bundle *attrs, u16 attr_id,
+			       const struct rxe_queue *q,
+			       u32 producer, u32 consumer)
+{
+	u32 count = (producer - consumer) & q->index_mask;
+	size_t bytes = (size_t)count << q->log2_elem_size;
+	int user_len, ret;
+	void *tmp;
+
+	if (!uverbs_attr_is_valid(attrs, attr_id) || bytes == 0)
+		return 0;
+
+	user_len = uverbs_attr_get_len(attrs, attr_id);
+	if (user_len < 0)
+		return 0;
+	if ((u32)user_len < bytes)
+		return -ENOSPC;
+
+	tmp = kvmalloc(bytes, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+
+	ret = queue_inflight_capture(q, producer, consumer, tmp, bytes);
+	if (ret >= 0)
+		ret = uverbs_copy_to(attrs, attr_id, tmp, bytes);
+
+	kvfree(tmp);
+	return ret;
+}
+
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 	struct uverbs_attr_bundle *attrs)
 {
 	struct rxe_query_cq_resp blob = {};
 	struct rxe_cq *cq;
 	struct ib_cq *ibcq;
+	int err;
 
 	ibcq = uverbs_attr_get_obj(attrs, RXE_IB_ATTR_QUERY_CQ_HANDLE);
 	if (IS_ERR(ibcq))
@@ -45,12 +86,13 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 	blob.cqe      = ibcq->cqe;
 
 	/*
-	 * Snapshot the producer/consumer cursors as read-only telemetry.
-	 * cq_lock is an irqsave spinlock and the copy_to_user below can
-	 * sleep, so take it only long enough to read the two cursors
-	 * coherently, then drop it. In the real CRIU flow the dumpee is
-	 * stopped and its feeding QPs are frozen, so the ring is quiescent;
-	 * the lock just closes a cross-context producer race.
+	 * Snapshot the producer/consumer cursors coherently. cq_lock is an
+	 * irqsave spinlock and the copy_to_user / image emit below fault to
+	 * userspace and can sleep, so take it only long enough to read the
+	 * two cursors, then drop it. In the real CRIU flow the dumpee is
+	 * stopped and its feeding QPs are frozen, so the ring is quiescent
+	 * and the post-drop image read is stable; the lock just closes a
+	 * cross-context producer race.
 	 */
 	spin_lock_irq(&cq->cq_lock);
 	blob.producer = queue_get_producer(cq->queue, cq->queue->type);
@@ -58,14 +100,21 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 	spin_unlock_irq(&cq->cq_lock);
 
 	/*
-	 * cqe_image_bytes stays 0 and RESP_CQE_IMAGE is left unfilled: the
-	 * in-flight [consumer, producer) CQE-image round-trip is the CQ
-	 * follow-up slice (the analogue of the QP SQ/RQ in-flight subspan).
-	 * A drained CQ carries no unreaped completions, so vm_pgoff + cqe
-	 * suffice to restore it.
+	 * cqe_image_bytes is the in-flight [consumer, producer) subspan
+	 * (unreaped completions), not the whole ring: the whole ring
+	 * overflows the u16 uverbs attr length for any non-trivial CQ.
 	 */
-	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
-			      &blob, sizeof(blob));
+	blob.cqe_image_bytes = ((blob.producer - blob.consumer) &
+				cq->queue->index_mask)
+			       << cq->queue->log2_elem_size;
+
+	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_BLOB,
+			     &blob, sizeof(blob));
+	if (err)
+		return err;
+
+	return rxe_query_emit_ring(attrs, RXE_IB_ATTR_QUERY_CQ_RESP_CQE_IMAGE,
+				   cq->queue, blob.producer, blob.consumer);
 }
 
 DECLARE_UVERBS_NAMED_METHOD(

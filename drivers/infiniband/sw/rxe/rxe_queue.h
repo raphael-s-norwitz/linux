@@ -98,6 +98,44 @@ static inline u32 queue_next_index(struct rxe_queue *q, int index)
 	return (index + 1) & q->index_mask;
 }
 
+/*
+ * CRIU in-flight ring capture. Linearize the [consumer, producer) span --
+ * the unreaped completions (TO_CLIENT CQ) or posted-but-unprocessed WQEs
+ * (FROM_CLIENT SQ/RQ) -- into @dst in logical order, one @elem_size slot
+ * per entry, following the ring wrap. The count is the caller's snapshot
+ * (@producer, @consumer), so the emitted image agrees byte-for-byte with
+ * the cursors shipped alongside it. A level ring (producer == consumer)
+ * writes nothing.
+ *
+ * Only the live subspan is shipped, never the whole ring: a default
+ * ib_send_bw CQ/QP ring (e.g. rx_depth 512 -> 1024 * 128B = 128 KiB)
+ * overflows the u16 uverbs attr length, whereas the handful of genuinely
+ * in-flight entries fit comfortably. Returns the byte length written
+ * (count << log2_elem_size) or -ENOSPC if that span exceeds @dst_cap.
+ */
+static inline int queue_inflight_capture(const struct rxe_queue *q,
+					 u32 producer, u32 consumer,
+					 void *dst, size_t dst_cap)
+{
+	u32 count = (producer - consumer) & q->index_mask;
+	size_t elem = (size_t)1 << q->log2_elem_size;
+	size_t bytes = (size_t)count << q->log2_elem_size;
+	u32 i;
+
+	if (bytes > dst_cap)
+		return -ENOSPC;
+
+	for (i = 0; i < count; i++) {
+		u32 slot = (consumer + i) & q->index_mask;
+
+		memcpy((u8 *)dst + (size_t)i * elem,
+		       q->buf->data + ((size_t)slot << q->log2_elem_size),
+		       elem);
+	}
+
+	return (int)bytes;
+}
+
 static inline u32 queue_get_producer(const struct rxe_queue *q,
 				     enum queue_type type)
 {
