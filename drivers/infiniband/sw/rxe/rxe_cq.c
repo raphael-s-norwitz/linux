@@ -10,7 +10,8 @@
 
 int rxe_cq_from_init(struct rxe_dev *rxe, struct rxe_cq *cq, int cqe,
 		     int comp_vector, struct ib_udata *udata,
-		     struct rxe_create_cq_resp __user *uresp)
+		     struct rxe_create_cq_resp __user *uresp,
+		     u64 forced_vm_pgoff)
 {
 	int err;
 	enum queue_type type;
@@ -24,7 +25,8 @@ int rxe_cq_from_init(struct rxe_dev *rxe, struct rxe_cq *cq, int cqe,
 	}
 
 	err = do_mmap_info(rxe, uresp ? &uresp->mi : NULL, udata,
-			   cq->queue->buf, cq->queue->buf_size, &cq->queue->ip);
+			   cq->queue->buf, cq->queue->buf_size, &cq->queue->ip,
+			   forced_vm_pgoff);
 	if (err)
 		return err;
 

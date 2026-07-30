@@ -78,7 +78,8 @@ struct rxe_queue {
 
 int do_mmap_info(struct rxe_dev *rxe, struct mminfo __user *outbuf,
 		 struct ib_udata *udata, struct rxe_queue_buf *buf,
-		 size_t buf_size, struct rxe_mmap_info **ip_p);
+		 size_t buf_size, struct rxe_mmap_info **ip_p,
+		 u64 forced_offset);
 
 void rxe_queue_reset(struct rxe_queue *q);
 
