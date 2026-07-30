@@ -1170,10 +1170,23 @@ err_out:
  * behave identically to rxe_create_cq: cyclic pool slot allocation
  * + queue init.
  *
- * @udata is reserved for future driver-private UHW payloads (none
- * defined for rxe today). @attr carries the legacy ib_cq_init_attr
- * triple; rxe rejects non-zero attr->flags (no rxe-side support
- * for IB_UVERBS_CQ_FLAGS_*) the same as rxe_create_cq.
+ * @udata->outbuf carries struct rxe_create_cq_resp for mminfo
+ * publication (same as rxe_create_cq). @udata->inbuf optionally
+ * carries struct rxe_restore_cq_req: when present and req.vm_pgoff
+ * is non-zero, rxe binds the new CQ's mmap region at that exact
+ * source-side vm_pgoff so userspace (CRIU's pie restorer) can
+ * mmap() the dumped-VMA-pgoff against this restored CQ. This is
+ * the kernel half of the "honor source identity or fail" contract
+ * (mirrors RESTORE_PD's pdn handling); rxe rejects -EEXIST if a
+ * sibling pending mmap has already claimed the offset. When the
+ * UHW_IN attr is absent, we fall back to the monotonic counter --
+ * legal for CRIU plugins that don't (yet) plumb pgoff replay, and
+ * for unit-test probes that round-trip through the kernel without
+ * a userspace mmap step.
+ *
+ * @attr carries the legacy ib_cq_init_attr triple; rxe rejects
+ * non-zero attr->flags (no rxe-side support for IB_UVERBS_CQ_FLAGS_*)
+ * the same as rxe_create_cq.
  */
 static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 			  const struct ib_cq_init_attr *attr,
@@ -1183,15 +1196,66 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	struct rxe_dev *rxe = to_rdev(dev);
 	struct rxe_cq *cq = to_rcq(ibcq);
 	struct rxe_create_cq_resp __user *uresp = NULL;
+	struct rxe_restore_cq_req req = {};
+	u64 forced_vm_pgoff = 0;
 	int err, cleanup_err;
 
 	if (udata) {
 		if (udata->outlen < sizeof(*uresp)) {
 			err = -EINVAL;
-			rxe_dbg_dev(rxe, "malformed udata, err = %d\n", err);
+			rxe_dbg_dev(rxe, "malformed udata outbuf, err = %d\n", err);
 			goto err_out;
 		}
 		uresp = udata->outbuf;
+
+		/*
+		 * UHW_IN is optional.
+		 *   inlen == 0      -- legacy / pgoff-agnostic restore;
+		 *                      forced_vm_pgoff stays 0.
+		 *   inlen >= 8B+1   -- userspace shipped a real
+		 *                      rxe_restore_cq_req (the struct is
+		 *                      sized strictly larger than __u64
+		 *                      to escape the inline-attr trap;
+		 *                      see the size note in
+		 *                      include/uapi/rdma/rdma_user_rxe.h).
+		 *                      Copy the prefix we understand
+		 *                      (sizeof(req) here, capped to
+		 *                      what userspace shipped) and
+		 *                      validate forward-compat reserved
+		 *                      bits are zero. Tolerate trailing
+		 *                      bytes silently for ABI evolution.
+		 *   0 < inlen <= 8B -- malformed: would land in the
+		 *                      inline-attr path and the kernel
+		 *                      would read attr->data verbatim
+		 *                      as the payload (almost certainly
+		 *                      a userspace pointer, never the
+		 *                      pgoff the caller meant). Reject
+		 *                      to surface the bug loudly.
+		 */
+		if (udata->inlen > sizeof(__u64)) {
+			size_t n = min_t(size_t, udata->inlen, sizeof(req));
+
+			err = ib_copy_from_udata(&req, udata, n);
+			if (err) {
+				rxe_dbg_dev(rxe,
+					    "bad restore cq req, err = %d\n",
+					    err);
+				goto err_out;
+			}
+			if (req.reserved) {
+				err = -EINVAL;
+				rxe_dbg_dev(rxe,
+					    "restore cq req reserved must be 0\n");
+				goto err_out;
+			}
+			forced_vm_pgoff = req.vm_pgoff;
+		} else if (udata->inlen != 0) {
+			err = -EINVAL;
+			rxe_dbg_dev(rxe,
+				    "restore cq req inbuf must exceed inline-attr threshold (got %zu, need > %zu)\n",
+				    udata->inlen, sizeof(__u64));
+			goto err_out;
+		}
 	}
 
 	if (attr->flags) {
@@ -1210,11 +1274,25 @@ static int rxe_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	}
 
 	err = rxe_cq_from_init(rxe, cq, attr->cqe, attr->comp_vector, udata,
-			       uresp, 0);
+			       uresp, forced_vm_pgoff);
 	if (err) {
 		rxe_dbg_cq(cq, "restore cq failed, err = %d\n", err);
 		goto err_cleanup;
 	}
+
+	/*
+	 * CRIU: the restored CQ is created empty; its pending CQEs and
+	 * producer/consumer are expected to arrive via the dumped CQ VMA being
+	 * written back into the mmap aliased at forced_vm_pgoff. Log the depth,
+	 * whether a source pgoff was plumbed (0 => the mmap cannot alias the
+	 * source page, so poll_cq won't see restored completions), and the
+	 * fresh ring cursors as a baseline. Cold path, dynamic-debug gated.
+	 */
+	rxe_dbg_cq(cq,
+		   "restore cq: cqe=%d forced_vm_pgoff=0x%llx q(prod=%u cons=%u)\n",
+		   attr->cqe, (unsigned long long)forced_vm_pgoff,
+		   cq->queue ? queue_get_producer(cq->queue, QUEUE_TYPE_TO_ULP) : 0,
+		   cq->queue ? queue_get_consumer(cq->queue, QUEUE_TYPE_TO_ULP) : 0);
 
 	return 0;
 
