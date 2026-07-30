@@ -2730,6 +2730,38 @@ struct ib_device_ops {
 				    int access_flags,
 				    u32 lkey_hint, u32 rkey_hint,
 				    struct ib_udata *udata);
+	/*
+	 * CRIU-restore variant of create_cq. The generic
+	 * UVERBS_METHOD_RESTORE_CQ dispatcher has already:
+	 *   - gated on ucontext_is_restore_mode(),
+	 *   - rejected any UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL ref
+	 *     (v0 has no RESTORE_COMP_CHANNEL),
+	 *   - reserved @target_handle in the ufile idr via
+	 *     rdma_alloc_begin_uobject_at_handle(),
+	 *   - allocated the struct ib_cq via rdma_zalloc_drv_obj()
+	 *     and wired up @cq->{device,uobject,comp_handler,
+	 *     event_handler,cq_context (NULL for v0),usecnt}.
+	 *
+	 * The driver's job is to make the CQ hw-usable: install any
+	 * pool/FW-id state (FW cqn for mlx5; rxe_pool elem for rxe),
+	 * size the cq buffer, and stamp @cq->cqe with the actual
+	 * installed cqe count. @attr carries the legacy
+	 * ib_cq_init_attr triple (cqe / comp_vector / flags) the
+	 * source-side ibv_create_cq() supplied.
+	 *
+	 * Driver-private FW state (e.g. mlx5's source FW cqn, in
+	 * struct mlx5_ib_restore_cq_req) travels through @udata via
+	 * UVERBS_ATTR_UHW(). Drivers that need cqn continuity (mlx5)
+	 * MUST validate the UHW payload and adopt the source cqn.
+	 * Drivers with no wire-spec cqn (rxe) ignore @target_handle
+	 * for hw purposes and behave identically to create_cq.
+	 *
+	 * Returns 0 on success, -errno on failure (failure aborts
+	 * the uobject install).
+	 */
+	int (*restore_cq)(struct ib_cq *cq, u32 target_handle,
+			  const struct ib_cq_init_attr *attr,
+			  struct ib_udata *udata);
 	int (*create_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,
 			 struct ib_udata *udata);
 	int (*create_user_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,
