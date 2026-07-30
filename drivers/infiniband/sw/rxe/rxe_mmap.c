@@ -92,7 +92,12 @@ done:
 }
 
 /*
- * Allocate information for rxe_mmap
+ * Allocate information for rxe_mmap.
+ *
+ * On success the new rxe_mmap_info is fully initialized and already
+ * linked into rxe->pending_mmaps (under pending_lock), so callers no
+ * longer register it themselves. do_mmap_info() unlinks it again if
+ * the subsequent copy_to_user() of the mminfo fails.
  */
 struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *rxe, u32 size,
 					   struct ib_udata *udata, void *obj)
@@ -108,6 +113,14 @@ struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *rxe, u32 size,
 
 	size = PAGE_ALIGN(size);
 
+	INIT_LIST_HEAD(&ip->pending_mmaps);
+	ip->info.size = size;
+	ip->context =
+		container_of(udata, struct uverbs_attr_bundle, driver_udata)
+			->context;
+	ip->obj = obj;
+	kref_init(&ip->ref);
+
 	spin_lock_bh(&rxe->mmap_offset_lock);
 
 	if (rxe->mmap_offset == 0)
@@ -118,13 +131,9 @@ struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *rxe, u32 size,
 
 	spin_unlock_bh(&rxe->mmap_offset_lock);
 
-	INIT_LIST_HEAD(&ip->pending_mmaps);
-	ip->info.size = size;
-	ip->context =
-		container_of(udata, struct uverbs_attr_bundle, driver_udata)
-			->context;
-	ip->obj = obj;
-	kref_init(&ip->ref);
+	spin_lock_bh(&rxe->pending_lock);
+	list_add(&ip->pending_mmaps, &rxe->pending_mmaps);
+	spin_unlock_bh(&rxe->pending_lock);
 
 	return ip;
 }
