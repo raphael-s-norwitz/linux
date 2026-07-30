@@ -136,6 +136,45 @@ static inline int queue_inflight_capture(const struct rxe_queue *q,
 	return (int)bytes;
 }
 
+/*
+ * CRIU in-flight ring restore. Scatter @src (logical-order in-flight
+ * entries produced by queue_inflight_capture) back into the freshly
+ * created ring, landing entry i at slot (consumer + i) & index_mask so
+ * absolute slot placement matches the source. The cursors userspace
+ * cached are restored verbatim by CRIU, so the entries must sit at the
+ * exact same slots the source held them; re-basing to slot 0 would
+ * desync the resumed client's consumer index. The caller seeds the
+ * cursors separately (rxe_cq_seed_ring).
+ *
+ * @bytes must be a whole number of slots and describe exactly the
+ * [consumer, producer) count; a geometry mismatch is rejected rather
+ * than silently corrupting the ring. Returns 0 or -EINVAL.
+ */
+static inline int queue_inflight_restore(struct rxe_queue *q,
+					 u32 producer, u32 consumer,
+					 const void *src, size_t bytes)
+{
+	size_t elem = (size_t)1 << q->log2_elem_size;
+	u32 count = (producer - consumer) & q->index_mask;
+	u32 i;
+
+	if (bytes & (elem - 1))
+		return -EINVAL;
+	if (bytes >> q->log2_elem_size != count)
+		return -EINVAL;
+	if (count > q->index_mask)
+		return -EINVAL;
+
+	for (i = 0; i < count; i++) {
+		u32 slot = (consumer + i) & q->index_mask;
+
+		memcpy(q->buf->data + ((size_t)slot << q->log2_elem_size),
+		       (const u8 *)src + (size_t)i * elem, elem);
+	}
+
+	return 0;
+}
+
 static inline u32 queue_get_producer(const struct rxe_queue *q,
 				     enum queue_type type)
 {
