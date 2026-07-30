@@ -23,21 +23,27 @@ int do_mmap_info(struct rxe_dev *rxe, struct mminfo __user *outbuf,
 			goto err1;
 		}
 
+		/*
+		 * rxe_create_mmap_info() has already linked ip into
+		 * rxe->pending_mmaps. If the userspace copy of mminfo
+		 * fails, unlink it again before freeing -- otherwise an
+		 * mmap() racing the failed create call would find a
+		 * dangling entry.
+		 */
 		if (copy_to_user(outbuf, &ip->info, sizeof(ip->info))) {
 			err = -EFAULT;
-			goto err2;
+			goto err_undo;
 		}
-
-		spin_lock_bh(&rxe->pending_lock);
-		list_add(&ip->pending_mmaps, &rxe->pending_mmaps);
-		spin_unlock_bh(&rxe->pending_lock);
 	}
 
 	*ip_p = ip;
 
 	return 0;
 
-err2:
+err_undo:
+	spin_lock_bh(&rxe->pending_lock);
+	list_del(&ip->pending_mmaps);
+	spin_unlock_bh(&rxe->pending_lock);
 	kfree(ip);
 err1:
 	return err;
