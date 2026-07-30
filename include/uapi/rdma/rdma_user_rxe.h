@@ -212,6 +212,39 @@ struct rxe_resize_cq_resp {
 	struct mminfo mi;
 };
 
+/*
+ * Driver-private payload for UVERBS_METHOD_RESTORE_CQ on rxe.
+ *
+ * Passed via the UVERBS_ATTR_UHW_IN tail of the restore-cq method.
+ * When @vm_pgoff is non-zero, rxe binds the new CQ's mmap region at
+ * exactly that source-side offset so userspace can mmap() the
+ * dumped-VMA-pgoff against the destination CQ. When absent (UHW_IN
+ * not provided) or zero, rxe falls back to its monotonic counter --
+ * identical to the rxe_create_cq path.
+ *
+ * The dumper captures the source-side rxe_create_cq_resp::mi.offset
+ * and replays it here on the destination. rxe rejects -EEXIST if a
+ * sibling CQ on the destination has already claimed the same offset
+ * (e.g. two concurrent restores of CQs that legitimately collided
+ * across hosts, or a buggy dumper). On success, the destination's
+ * rxe_create_cq_resp::mi.offset returned via UHW_OUT equals
+ * @vm_pgoff.
+ *
+ * Size note: must stay strictly larger than sizeof(__u64) (== 8B).
+ * The uverbs ioctl bundle treats UHW_IN attrs with len <= 8 as
+ * inline (the kernel reuses the bundle's data slot itself as the
+ * inbuf), which clobbers @vm_pgoff with whatever value userspace
+ * happened to put in struct ib_uverbs_attr::data (a pointer to
+ * this struct, in the natural calling convention). The reserved
+ * tail forces sizeof(struct rxe_restore_cq_req) > 8 so the
+ * dispatcher takes the pointer path and copy_from_user reads the
+ * real userspace buffer. Future fields can claim @reserved[].
+ */
+struct rxe_restore_cq_req {
+	__aligned_u64 vm_pgoff;
+	__aligned_u64 reserved;
+};
+
 struct rxe_create_qp_resp {
 	struct mminfo rq_mi;
 	struct mminfo sq_mi;
