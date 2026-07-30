@@ -20,7 +20,8 @@ struct rxe_av *rxe_get_av(struct rxe_pkt_info *pkt, struct rxe_ah **ahp);
 /* rxe_cq.c */
 int rxe_cq_from_init(struct rxe_dev *rxe, struct rxe_cq *cq, int cqe,
 		     int comp_vector, struct ib_udata *udata,
-		     struct rxe_create_cq_resp __user *uresp);
+		     struct rxe_create_cq_resp __user *uresp,
+		     u64 forced_vm_pgoff);
 
 int rxe_cq_resize_queue(struct rxe_cq *cq, int new_cqe,
 			struct rxe_resize_cq_resp __user *uresp,
@@ -49,7 +50,8 @@ struct rxe_mmap_info {
 void rxe_mmap_release(struct kref *ref);
 
 struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *dev, u32 size,
-					   struct ib_udata *udata, void *obj);
+					   struct ib_udata *udata, void *obj,
+					   u64 forced_offset);
 
 int rxe_mmap(struct ib_ucontext *context, struct vm_area_struct *vma);
 

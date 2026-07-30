@@ -94,15 +94,26 @@ done:
 /*
  * Allocate information for rxe_mmap.
  *
- * On success the new rxe_mmap_info is fully initialized and already
- * linked into rxe->pending_mmaps (under pending_lock), so callers no
- * longer register it themselves. do_mmap_info() unlinks it again if
- * the subsequent copy_to_user() of the mminfo fails.
+ * @forced_offset: if non-zero, bind the new mmap region at exactly
+ * this vm_pgoff value instead of allocating a fresh one from the
+ * monotonic counter. Used by the CRIU-restore path
+ * (UVERBS_METHOD_RESTORE_CQ + struct rxe_restore_cq_req) so the
+ * destination's mminfo.offset equals the source-side value the
+ * pie restorer is mmap()ing against. Returns -EEXIST if a sibling
+ * pending mmap already holds that offset.
+ *
+ * The collision check, offset claim, and pending_mmaps insertion
+ * all happen under pending_lock to keep two concurrent forced-
+ * offset allocators from both observing an empty list before
+ * either of them adds. Lock order: pending_lock -> mmap_offset_lock
+ * (mmap_offset_lock is leaf).
  */
 struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *rxe, u32 size,
-					   struct ib_udata *udata, void *obj)
+					   struct ib_udata *udata, void *obj,
+					   u64 forced_offset)
 {
 	struct rxe_mmap_info *ip;
+	struct rxe_mmap_info *cur;
 
 	if (!udata)
 		return ERR_PTR(-EINVAL);
@@ -121,18 +132,45 @@ struct rxe_mmap_info *rxe_create_mmap_info(struct rxe_dev *rxe, u32 size,
 	ip->obj = obj;
 	kref_init(&ip->ref);
 
+	spin_lock_bh(&rxe->pending_lock);
 	spin_lock_bh(&rxe->mmap_offset_lock);
 
 	if (rxe->mmap_offset == 0)
 		rxe->mmap_offset = ALIGN(PAGE_SIZE, SHMLBA);
 
-	ip->info.offset = rxe->mmap_offset;
-	rxe->mmap_offset += ALIGN(size, SHMLBA);
+	if (forced_offset) {
+		list_for_each_entry(cur, &rxe->pending_mmaps, pending_mmaps) {
+			if (cur->info.offset == forced_offset) {
+				spin_unlock_bh(&rxe->mmap_offset_lock);
+				spin_unlock_bh(&rxe->pending_lock);
+				kfree(ip);
+				return ERR_PTR(-EEXIST);
+			}
+		}
+		ip->info.offset = forced_offset;
+	} else {
+		ip->info.offset = rxe->mmap_offset;
+	}
+
+	/*
+	 * Ratchet mmap_offset past the claimed range. Subsequent
+	 * legacy create_cq paths land past forced_offset's end; a
+	 * subsequent forced caller with a larger pgoff just bumps
+	 * further; a forced caller with a smaller pgoff bumps not at
+	 * all (its range was already covered, so it must collide with
+	 * something already in pending or already long-since freed).
+	 */
+	{
+		u64 next = ip->info.offset + ALIGN(size, SHMLBA);
+
+		if (next > rxe->mmap_offset)
+			rxe->mmap_offset = next;
+	}
 
 	spin_unlock_bh(&rxe->mmap_offset_lock);
 
-	spin_lock_bh(&rxe->pending_lock);
 	list_add(&ip->pending_mmaps, &rxe->pending_mmaps);
+
 	spin_unlock_bh(&rxe->pending_lock);
 
 	return ip;

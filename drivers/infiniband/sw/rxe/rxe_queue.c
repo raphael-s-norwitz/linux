@@ -11,24 +11,27 @@
 
 int do_mmap_info(struct rxe_dev *rxe, struct mminfo __user *outbuf,
 		 struct ib_udata *udata, struct rxe_queue_buf *buf,
-		 size_t buf_size, struct rxe_mmap_info **ip_p)
+		 size_t buf_size, struct rxe_mmap_info **ip_p,
+		 u64 forced_offset)
 {
 	int err;
 	struct rxe_mmap_info *ip = NULL;
 
 	if (outbuf) {
-		ip = rxe_create_mmap_info(rxe, buf_size, udata, buf);
+		ip = rxe_create_mmap_info(rxe, buf_size, udata, buf,
+					  forced_offset);
 		if (IS_ERR(ip)) {
 			err = PTR_ERR(ip);
 			goto err1;
 		}
 
 		/*
-		 * rxe_create_mmap_info() has already linked ip into
-		 * rxe->pending_mmaps. If the userspace copy of mminfo
-		 * fails, unlink it again before freeing -- otherwise an
-		 * mmap() racing the failed create call would find a
-		 * dangling entry.
+		 * rxe_create_mmap_info() has already inserted ip into
+		 * rxe->pending_mmaps under pending_lock so concurrent
+		 * forced-offset callers see our claim. If the userspace
+		 * copy of mminfo fails, undo the insertion before
+		 * freeing -- otherwise an mmap() racing the failed
+		 * create call would find a dangling entry.
 		 */
 		if (copy_to_user(outbuf, &ip->info, sizeof(ip->info))) {
 			err = -EFAULT;
@@ -166,7 +169,7 @@ int rxe_queue_resize(struct rxe_queue *q, unsigned int *num_elem_p,
 		return -ENOMEM;
 
 	err = do_mmap_info(new_q->rxe, outbuf, udata, new_q->buf,
-			   new_q->buf_size, &new_q->ip);
+			   new_q->buf_size, &new_q->ip, 0);
 	if (err) {
 		vfree(new_q->buf);
 		kfree(new_q);

@@ -1137,7 +1137,7 @@ static int rxe_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 	}
 
 	err = rxe_cq_from_init(rxe, cq, attr->cqe, attr->comp_vector, udata,
-			       uresp);
+			       uresp, 0);
 	if (err) {
 		rxe_dbg_cq(cq, "create cq failed, err = %d\n", err);
 		goto err_cleanup;
