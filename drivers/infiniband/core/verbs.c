@@ -1166,7 +1166,7 @@ EXPORT_SYMBOL(ib_destroy_srq_user);
 
 /* Queue pairs */
 
-static void __ib_qp_event_handler(struct ib_event *event, void *context)
+static void ib_qp_event_handler(struct ib_event *event, void *context)
 {
 	struct ib_qp *qp = event->element.qp;
 
@@ -1295,7 +1295,7 @@ static struct ib_qp *create_qp(struct ib_device *dev, struct ib_pd *pd,
 	qp->qp_type = attr->qp_type;
 	qp->rwq_ind_tbl = attr->rwq_ind_tbl;
 	qp->srq = attr->srq;
-	qp->event_handler = __ib_qp_event_handler;
+	qp->event_handler = ib_qp_event_handler;
 	qp->registered_event_handler = attr->event_handler;
 	qp->port = attr->port_num;
 	qp->qp_context = attr->qp_context;
