@@ -545,7 +545,7 @@ static inline enum comp_state complete_wqe(struct rxe_qp *qp,
 }
 
 /* drain incoming response packet queue */
-static void drain_resp_pkts(struct rxe_qp *qp)
+void rxe_drain_resp_pkts(struct rxe_qp *qp)
 {
 	struct sk_buff *skb;
 
@@ -655,7 +655,7 @@ int rxe_completer(struct rxe_qp *qp)
 			  qp_state(qp) == IB_QPS_RESET) {
 		bool notify = qp->valid && (qp_state(qp) == IB_QPS_ERR);
 
-		drain_resp_pkts(qp);
+		rxe_drain_resp_pkts(qp);
 		flush_send_queue(qp, notify);
 		spin_unlock_irqrestore(&qp->state_lock, flags);
 		goto exit;
