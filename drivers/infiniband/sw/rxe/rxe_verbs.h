@@ -298,6 +298,15 @@ struct rxe_qp {
 
 	spinlock_t		state_lock; /* guard requester and completer */
 
+	/*
+	 * CRIU (S6a): datapath parked via rxe_qp_pause(). Guarded by
+	 * state_lock. Makes pause/resume idempotent so a redundant thaw
+	 * cannot rxe_enable_task() a task that is already live -- which
+	 * would clobber a pending send_task work item to IDLE and leak a
+	 * task reservation (num_sched > num_done).
+	 */
+	bool			dp_frozen;
+
 	struct execute_work	cleanup_work;
 };
 
