@@ -75,11 +75,10 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_DATAPATH)(
 	if (!qp->is_user)
 		return -ENXIO;
 
-	/* Thaw (freeze=0) lands with rxe_qp_resume in the next commit. */
-	if (!freeze)
-		return -EOPNOTSUPP;
-
-	rxe_qp_pause(qp);
+	if (freeze)
+		rxe_qp_pause(qp);
+	else
+		rxe_qp_resume(qp);
 
 	return 0;
 }

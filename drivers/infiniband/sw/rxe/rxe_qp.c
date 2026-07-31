@@ -737,12 +737,12 @@ static void rxe_qp_reset(struct rxe_qp *qp)
 }
 
 /*
- * CRIU dump (S6a): non-destructively freeze a QP's datapath so a
- * consistent PSN/cursor snapshot can be taken. Unlike rxe_qp_reset /
- * rxe_qp_error this touches NO IBTA state -- it only drains and parks
- * the requester/completer (send_task) and responder (recv_task) work
- * so no packet/WQE processing advances the PSNs mid-snapshot. Mirrors
- * mlx5's SAVE_VHCA_STATE freeze; the QP stays in whatever state it was
+ * CRIU dump: non-destructively freeze a QP's datapath so a consistent
+ * PSN/cursor snapshot can be taken. Unlike rxe_qp_reset / rxe_qp_error
+ * this touches NO IBTA state -- it only drains and parks the
+ * requester/completer (send_task) and responder (recv_task) work so no
+ * packet/WQE processing advances the PSNs mid-snapshot. Mirrors mlx5's
+ * SAVE_VHCA_STATE freeze; the QP stays in whatever state it was
  * (typically RTS) and ibv_query_qp still reports that state.
  *
  * rxe_disable_task drains any in-flight run and blocks until the task
@@ -791,6 +791,79 @@ void rxe_qp_pause(struct rxe_qp *qp)
 	rxe_drain_resp_pkts(qp);
 
 	rxe_dbg_qp(qp, "freeze: parked, state=%d\n", qp_state(qp));
+}
+
+/*
+ * CRIU (S6a): undo rxe_qp_pause; re-arm the datapath tasks and replay
+ * any work the freeze stalled.
+ *
+ * A freeze is indistinguishable from a network stall, so on thaw the
+ * requester must resume any outstanding SQ work exactly as the retransmit
+ * timer would have. Kick send_task when the QP is RTS with unconsumed SQ
+ * WQEs, after arming a retry (need_retry): mirrors rnr_nak_timer() -- set
+ * need_retry + clear wait_for_rnr_timer under state_lock so the
+ * rxe_requester gate (need_retry && !wait_for_rnr_timer) fires
+ * immediately and req_retry() resumes the first unacked WQE from
+ * qp->comp.psn (the peer drops duplicate PSNs).
+ *
+ * Also drain the responder: an inbound packet that arrived while the QP
+ * was frozen (e.g. a peer thawed first) is queued on qp->req_pkts with
+ * recv_task parked, and rxe_enable_task alone does not re-run it.
+ *
+ * Both kicks are no-ops for a QP resumed after a dump-freeze with an
+ * empty ring / inbound queue.
+ */
+void rxe_qp_resume(struct rxe_qp *qp)
+{
+	bool kick_send = false, kick_recv = false;
+	unsigned long flags;
+
+	/*
+	 * Idempotent (pairs with rxe_qp_pause): only thaw a QP that we
+	 * actually parked. A redundant resume on a live QP would
+	 * rxe_enable_task() -> force the task state to IDLE while a
+	 * send_task work item is still pending, so the next rnr-timer
+	 * reschedule does rxe_get()+num_sched++ but queue_work() returns
+	 * false (already pending), permanently leaking a task reservation
+	 * (num_sched > num_done) and hanging the eventual destroy.
+	 */
+	spin_lock_irqsave(&qp->state_lock, flags);
+	if (!qp->dp_frozen) {
+		spin_unlock_irqrestore(&qp->state_lock, flags);
+		rxe_dbg_qp(qp, "thaw: not frozen (redundant/none), state=%d\n",
+			   qp_state(qp));
+		return;
+	}
+	qp->dp_frozen = false;
+	spin_unlock_irqrestore(&qp->state_lock, flags);
+
+	rxe_enable_task(&qp->send_task);
+	rxe_enable_task(&qp->recv_task);
+
+	if (qp->sq.queue && qp_state(qp) == IB_QPS_RTS &&
+	    queue_get_producer(qp->sq.queue, qp->sq.queue->type) !=
+	    queue_get_consumer(qp->sq.queue, qp->sq.queue->type)) {
+		spin_lock_irqsave(&qp->state_lock, flags);
+		qp->req.need_retry = 1;
+		qp->req.wait_for_rnr_timer = 0;
+		spin_unlock_irqrestore(&qp->state_lock, flags);
+		rxe_sched_task(&qp->send_task);
+		kick_send = true;
+	}
+
+	if (!skb_queue_empty(&qp->req_pkts)) {
+		rxe_sched_task(&qp->recv_task);
+		kick_recv = true;
+	}
+
+	rxe_dbg_qp(qp,
+		   "thaw: state=%d sq(prod=%u cons=%u) kick_send=%d kick_recv=%d\n",
+		   qp_state(qp),
+		   qp->sq.queue ?
+			queue_get_producer(qp->sq.queue, qp->sq.queue->type) : 0,
+		   qp->sq.queue ?
+			queue_get_consumer(qp->sq.queue, qp->sq.queue->type) : 0,
+		   kick_send, kick_recv);
 }
 
 /* move the qp to the error state */
