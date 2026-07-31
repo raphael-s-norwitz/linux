@@ -7,10 +7,21 @@
  * and never collide with another provider's ids.
  *
  * RXE_IB_OBJECT_MIGRATE carries the rxe arm of the CRIU dump-side
- * choreography. Its methods run on a per-process uverbs fd. This slice
- * introduces the object with its first method, QUERY_CQ; method ids +0/+1
- * are reserved for FREEZE_DATAPATH / QUERY_QP, which land with the QP
- * migration slice, so QUERY_CQ is pinned to +2 and its id stays stable.
+ * choreography. Its methods run on a per-process uverbs fd. Method id +0
+ * (FREEZE_DATAPATH) and +3 (FREEZE_CONTEXT) are reserved for the freeze
+ * slice; QUERY_QP is +1 and QUERY_CQ is +2, so both query ids stay
+ * stable when freeze lands.
+ *
+ *   QUERY_QP  dump-side counterpart to UVERBS_METHOD_RESTORE_QP: pack the
+ *             full rxe wire state (AV, PSNs, cursors, transport attrs,
+ *             ring mmap offsets) into a payload byte-equal to
+ *             struct rxe_restore_qp_req so the destination can restore
+ *             the QP single-shot, plus the QP's userspace handle (the
+ *             async-event cookie, not standard-queryable). cap / qp_type
+ *             / qp_state are intentionally NOT emitted -- CRIU sources
+ *             those from the standard IB_USER_VERBS_CMD_QUERY_QP verb and
+ *             NLDEV. The in-flight SQ/RQ/responder ring images are a
+ *             later slice; this method emits only the drained subset.
  *
  *   QUERY_CQ  dump-side counterpart to UVERBS_METHOD_RESTORE_CQ: return a
  *             CQ's ring mmap offset + entry count so the dumper sources
@@ -34,11 +45,23 @@ enum rxe_ib_objects {
 
 enum rxe_ib_migrate_methods {
 	/*
-	 * +0 / +1 are reserved for RXE_IB_METHOD_FREEZE_DATAPATH and
-	 * RXE_IB_METHOD_QUERY_QP, which land with the QP migration slice.
-	 * QUERY_CQ is pinned to +2 so its id is stable when they arrive.
+	 * +0 (FREEZE_DATAPATH) and +3 (FREEZE_CONTEXT) are reserved for the
+	 * freeze slice; QUERY_QP is pinned to +1 and QUERY_CQ to +2 so both
+	 * query ids stay stable when freeze lands.
 	 */
+	RXE_IB_METHOD_QUERY_QP = (1U << UVERBS_ID_NS_SHIFT) + 1,
 	RXE_IB_METHOD_QUERY_CQ = (1U << UVERBS_ID_NS_SHIFT) + 2,
+};
+
+enum rxe_ib_query_qp_attrs {
+	RXE_IB_ATTR_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
+	/*
+	 * The QP's userspace async-event cookie (ib_qp_user_handle), which
+	 * is not standard-queryable. Attr ids +3/+4/+5 are reserved for the
+	 * in-flight SQ/RQ/responder ring image attrs added by a later slice.
+	 */
+	RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
 };
 
 enum rxe_ib_query_cq_attrs {

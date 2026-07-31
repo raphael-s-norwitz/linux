@@ -296,6 +296,138 @@ struct rxe_create_qp_resp {
 	struct mminfo sq_mi;
 };
 
+/*
+ * Driver-private QP wire-state payload, shared by the dump-side
+ * RXE_IB_METHOD_QUERY_QP (which emits it) and UVERBS_METHOD_RESTORE_QP
+ * (which consumes it via the UHW_IN tail).
+ *
+ * Unlike the FW-backed mlx5 path -- where LOAD_VHCA_STATE preserves the
+ * entire QPC, so the mlx5 UHW only carries userspace VAs and the qpn --
+ * rxe has no firmware. Every byte of wire-relevant QP state that the
+ * destination cannot re-derive from the generic RESTORE_QP method attrs
+ * (cap / type / state / create_flags / pd / cqs) must travel in this
+ * blob and be stamped directly by rxe_restore_qp. This is the rxe
+ * mirror of "mlx5 sources it from FW": same logical QP state, different
+ * backing store per driver. The restore verb is single-shot -- it lands
+ * the QP directly at its captured final state with no kernel-side
+ * ib_modify_qp chain and no userspace modify replay.
+ *
+ * Fields fall into three groups.
+ *
+ * Identity / mmap (always meaningful):
+ *   @qpn  the source QP number. rxe qpns are wire-visible (BTH DestQP),
+ *       so -- like the rxe MR lkey/rkey identity contract -- the
+ *       restored QP MUST reclaim the same qpn or the peer's in-flight
+ *       packets address a stranger. Installed via
+ *       rxe_add_to_pool_at_index(qp_pool, qpn); -EBUSY on collision.
+ *   @sq_vm_pgoff / @rq_vm_pgoff  source-side mmap offsets of the SQ / RQ
+ *       rings (from rxe_create_qp_resp::{sq,rq}_mi.offset). Non-zero =>
+ *       bind the restored rings at these exact offsets so the dumped
+ *       VMAs map back 1:1; zero => monotonic-counter fallback (probe /
+ *       pgoff-agnostic restore). Mirrors rxe_restore_cq_req::vm_pgoff.
+ *
+ * ib_qp_attr-class wire state (meaningful for RTR/RTS; RESET/INIT emit
+ * zeroes and rxe_restore_qp skips whatever the state didn't reach):
+ *   @av  primary address vector (qp->pri_av). Byte-identical to the
+ *       struct rxe_av the kernel stores; memcpy'd into place. Carries
+ *       dgid / dmac / sgid_index / network_type / port etc.
+ *   @dest_qp_num  remote QPN (qp->attr.dest_qp_num).
+ *   @qkey  Q_Key (qp->attr.qkey; UD).
+ *   @sq_psn / @rq_psn  the modify-time PSN bases (qp->attr.{sq,rq}_psn),
+ *       echoed back by ibv_query_qp.
+ *   @qp_access_flags  qp->attr.qp_access_flags.
+ *   @max_rd_atomic / @max_dest_rd_atomic  outstanding RDMA/atomic depths.
+ *   @pkey_index  qp->attr.pkey_index.
+ *   @path_mtu  IB MTU enum (qp->attr.path_mtu); drives qp->mtu.
+ *   @retry_cnt / @rnr_retry / @min_rnr_timer / @timeout  RC reliability
+ *       knobs; @timeout drives qp->qp_timeout_jiffies.
+ *   @port_num  qp->attr.port_num.
+ *   @sq_sig_all  create-time send completion policy (qp->sq_sig_type:
+ *       1 => IB_SIGNAL_ALL_WR, 0 => IB_SIGNAL_REQ_WR). Carried here
+ *       because the generic RESTORE_QP method exposes only
+ *       create_flags, not the legacy sq_sig_all bit.
+ *
+ * Internal cursors ib_modify_qp cannot express -- the precise reason a
+ * create+modify replay cannot faithfully restore an in-flight QP:
+ *   @req_psn   next PSN the requester will send (qp->req.psn).
+ *   @comp_psn  next PSN the completer expects ACKed (qp->comp.psn).
+ *   @resp_psn  next request PSN the responder expects (qp->resp.psn).
+ *   @resp_msn  responder message sequence number (qp->resp.msn).
+ *   @req_wqe_index  requester's SQ consumer cursor (qp->req.wqe_index).
+ *   @ssn  send sequence number (qp->ssn).
+ *
+ * In-flight (non-drained) datapath state. A QP frozen (not drained) at
+ * the snapshot point may have posted-but-unsent / sent-but-unacked SQ
+ * work, pre-posted RQ buffers, and RC responder replay resources. The
+ * fixed header carries the cursors + responder scalars; the
+ * variable-length ring/resource byte images travel out-of-band (QUERY_QP
+ * image attrs; RESTORE_QP UHW_IN tail) and are located by the
+ * @*_image_bytes counts. All-zero here (and zero-length images) means a
+ * drained/idle QP -- the cursor-only restore path. QUERY_QP leaves this
+ * whole group zero until the in-flight QP slice lands; a drained QP
+ * needs only the groups above.
+ *   @sq_producer / @sq_consumer  SQ ring shared-page indices. Together
+ *       with @req_wqe_index they bracket the three SQ regions
+ *       (unsent / unacked / retired); restore rewinds the requester to
+ *       @sq_consumer and replays [@sq_consumer, @sq_producer).
+ *   @rq_producer / @rq_consumer  RQ ring indices (pre-posted recv WQEs).
+ *   @resp_ack_psn / @resp_opcode / @resp_status / @resp_aeth_syndrome
+ *       responder scalars not already covered by @resp_psn / @resp_msn.
+ *   @res_head / @res_tail  RC responder-resources ring cursors.
+ *   @sq_image_bytes / @rq_image_bytes / @res_image_bytes  byte lengths of
+ *       the SQ slot region, RQ slot region, and responder-resources array
+ *       images. Zero => that image is absent (drained ring / UD-UC with no
+ *       responder array / SRQ-backed RQ, out of scope). The destination
+ *       validates each against the freshly-created ring/array geometry.
+ *
+ * Size note: well over the 8-byte inline-attr threshold (see
+ * rxe_restore_cq_req), so the uverbs dispatcher always takes the
+ * copy_from_user pointer path. @reserved* must be 0 and back
+ * forward-compat fields.
+ */
+struct rxe_restore_qp_req {
+	struct rxe_av	av;
+	__aligned_u64	sq_vm_pgoff;
+	__aligned_u64	rq_vm_pgoff;
+	__u32		qpn;
+	__u32		dest_qp_num;
+	__u32		qkey;
+	__u32		sq_psn;
+	__u32		rq_psn;
+	__u32		qp_access_flags;
+	__u32		max_rd_atomic;
+	__u32		max_dest_rd_atomic;
+	__u32		req_psn;
+	__u32		comp_psn;
+	__u32		resp_psn;
+	__u32		resp_msn;
+	__u32		req_wqe_index;
+	__u32		ssn;
+	__u16		pkey_index;
+	__u8		path_mtu;
+	__u8		retry_cnt;
+	__u8		rnr_retry;
+	__u8		min_rnr_timer;
+	__u8		timeout;
+	__u8		port_num;
+	__u8		sq_sig_all;
+	__u8		resp_aeth_syndrome;	/* qp->resp.aeth_syndrome */
+	__u16		reserved;
+	__u32		sq_producer;		/* SQ buf->producer_index */
+	__u32		sq_consumer;		/* SQ buf->consumer_index */
+	__u32		rq_producer;		/* RQ buf->producer_index */
+	__u32		rq_consumer;		/* RQ buf->consumer_index */
+	__u32		resp_ack_psn;		/* qp->resp.ack_psn */
+	__s32		resp_opcode;		/* qp->resp.opcode (-1 idle) */
+	__u32		resp_status;		/* qp->resp.status (ib_wc_status) */
+	__u32		res_head;		/* qp->resp.res_head */
+	__u32		res_tail;		/* qp->resp.res_tail */
+	__u32		sq_image_bytes;		/* SQ slot region byte count */
+	__u32		rq_image_bytes;		/* RQ slot region byte count */
+	__u32		res_image_bytes;	/* responder-resources byte count */
+	__aligned_u64	reserved2;
+};
+
 struct rxe_create_srq_resp {
 	struct mminfo mi;
 	__u32 srq_num;

@@ -7,10 +7,10 @@
  * UVERBS_OBJECT_RESTORE family; this object carries the dump-side queries
  * whose payloads are rxe-private.
  *
- * This slice introduces the object with its first method, QUERY_CQ -- the
- * dump-side counterpart to UVERBS_METHOD_RESTORE_CQ. FREEZE_DATAPATH,
- * QUERY_QP and the in-flight CQE ring image land with the QP migration
- * slice.
+ * The object carries the dump-side query verbs: QUERY_QP and QUERY_CQ,
+ * the counterparts to UVERBS_METHOD_RESTORE_QP / RESTORE_CQ. Both emit
+ * only the drained subset of wire state; FREEZE_DATAPATH and the
+ * in-flight SQ/RQ/CQE ring images land with later migration slices.
  */
 
 #include <rdma/uverbs_ioctl.h>
@@ -23,6 +23,102 @@
 
 #define UVERBS_MODULE_NAME rdma_rxe
 #include <rdma/uverbs_named_ioctl.h>
+
+/*
+ * Only connected/datagram transports carry the wire state QUERY_QP
+ * emits. GSI/SMI and other special QP types are out of scope for CRIU
+ * migration.
+ */
+static int rxe_migrate_chk_qp_type(const struct ib_qp *ibqp)
+{
+	switch (ibqp->qp_type) {
+	case IB_QPT_RC:
+	case IB_QPT_UC:
+	case IB_QPT_UD:
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct rxe_restore_qp_req blob = {};
+	struct ib_qp *ibqp;
+	u64 user_handle;
+	struct rxe_qp *qp;
+	int err;
+
+	ibqp = uverbs_attr_get_obj(attrs, RXE_IB_ATTR_QUERY_QP_HANDLE);
+	if (IS_ERR(ibqp))
+		return PTR_ERR(ibqp);
+
+	err = rxe_migrate_chk_qp_type(ibqp);
+	if (err)
+		return err;
+
+	qp = to_rqp(ibqp);
+
+	/* No user-side wire state to emit for kernel QPs. */
+	if (!qp->is_user || !qp->sq.queue)
+		return -ENXIO;
+
+	/* Identity + ring mmap offsets. */
+	blob.qpn = ibqp->qp_num;
+	if (qp->sq.queue->ip)
+		blob.sq_vm_pgoff = qp->sq.queue->ip->info.offset;
+	if (qp->rq.queue && qp->rq.queue->ip)
+		blob.rq_vm_pgoff = qp->rq.queue->ip->info.offset;
+
+	/* ib_qp_attr-class wire state. */
+	memcpy(&blob.av, &qp->pri_av, sizeof(blob.av));
+	blob.dest_qp_num	= qp->attr.dest_qp_num;
+	blob.qkey		= qp->attr.qkey;
+	blob.sq_psn		= qp->attr.sq_psn;
+	blob.rq_psn		= qp->attr.rq_psn;
+	blob.qp_access_flags	= qp->attr.qp_access_flags;
+	blob.max_rd_atomic	= qp->attr.max_rd_atomic;
+	blob.max_dest_rd_atomic = qp->attr.max_dest_rd_atomic;
+	blob.pkey_index		= qp->attr.pkey_index;
+	blob.path_mtu		= qp->attr.path_mtu;
+	blob.retry_cnt		= qp->attr.retry_cnt;
+	blob.rnr_retry		= qp->attr.rnr_retry;
+	blob.min_rnr_timer	= qp->attr.min_rnr_timer;
+	blob.timeout		= qp->attr.timeout;
+	blob.port_num		= qp->attr.port_num;
+	blob.sq_sig_all		= (qp->sq_sig_type == IB_SIGNAL_ALL_WR) ? 1 : 0;
+
+	/* Live cursors ib_modify_qp cannot express. */
+	blob.req_psn		= qp->req.psn;
+	blob.comp_psn		= qp->comp.psn;
+	blob.resp_psn		= qp->resp.psn;
+	blob.resp_msn		= qp->resp.msn;
+	blob.req_wqe_index	= qp->req.wqe_index;
+	blob.ssn		= atomic_read(&qp->ssn);
+
+	/*
+	 * The in-flight datapath group (SQ/RQ cursors, responder scalars,
+	 * ring image byte counts) stays zero here: this method emits only
+	 * the drained subset. Non-drained round-trip lands with the
+	 * in-flight QP slice.
+	 */
+
+	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
+			     &blob, sizeof(blob));
+	if (err)
+		return err;
+
+	/*
+	 * The async-event cookie the source's ibv_create_qp recorded on
+	 * the QP uobject. Not standard-queryable, so CRIU must preserve it
+	 * through the kernel-sourced dump.
+	 */
+	user_handle = ib_qp_user_handle(ibqp);
+
+	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
+			      &user_handle, sizeof(user_handle));
+}
 
 /*
  * Emit one optional CQE ring image attr, shipping only the in-flight
@@ -118,6 +214,19 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 }
 
 DECLARE_UVERBS_NAMED_METHOD(
+	RXE_IB_METHOD_QUERY_QP,
+	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_QP_HANDLE,
+			UVERBS_OBJECT_QP,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
+			    UVERBS_ATTR_TYPE(struct rxe_restore_qp_req),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
+			    UVERBS_ATTR_TYPE(u64),
+			    UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_CQ,
 	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_CQ_HANDLE,
 			UVERBS_OBJECT_CQ,
@@ -132,6 +241,7 @@ DECLARE_UVERBS_NAMED_METHOD(
 
 DECLARE_UVERBS_GLOBAL_METHODS(
 	RXE_IB_OBJECT_MIGRATE,
+	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_QP),
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ));
 
 const struct uapi_definition rxe_migrate_defs[] = {

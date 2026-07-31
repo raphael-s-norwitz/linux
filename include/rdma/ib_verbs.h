@@ -4200,6 +4200,20 @@ int ib_query_qp(struct ib_qp *qp,
 		struct ib_qp_init_attr *qp_init_attr);
 
 /**
+ * ib_qp_user_handle - Returns the userspace tag the source's
+ * `ib_uverbs_create_qp` recorded on the QP uobject, or 0 for a
+ * kernel-mode QP.
+ *
+ * `struct ib_qp.uobject` is opaquely typed `struct ib_uqp_object *`
+ * (XRC bookkeeping requires the embedded `ib_uevent_object`); the
+ * struct definition is private to drivers/infiniband/core. This
+ * accessor closes the gap so driver-side dump verbs (e.g. rxe's
+ * RXE_IB_METHOD_QUERY_QP) can read user_handle without reaching into
+ * the private struct.
+ */
+u64 ib_qp_user_handle(const struct ib_qp *qp);
+
+/**
  * ib_destroy_qp - Destroys the specified QP.
  * @qp: The QP to destroy.
  * @udata: Valid udata or NULL for kernel objects
