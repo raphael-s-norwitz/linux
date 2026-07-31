@@ -628,6 +628,25 @@ enum rdma_nldev_attr {
 	RDMA_NLDEV_ATTR_RES_HANDLE,		/* u32 */
 
 	/*
+	 * Restrack id of the send_cq backing a user-mode QP. Mirrors the
+	 * RDMA_NLDEV_ATTR_RES_CQN that fill_res_srq_entry emits for
+	 * SRQ->ext.cq, applied to qp->send_cq->res.id. Surfaced so a
+	 * userspace dumper (e.g. CRIU) can discover the SEND_CQ identity
+	 * that UVERBS_METHOD_RESTORE_QP requires via
+	 * RESTORE_QP_SEND_CQ_HANDLE without an extra dump-side verb. The
+	 * id keys into the same restrack id space the CQ
+	 * RDMA_NLDEV_ATTR_RES_CQN dump emits, so userspace can join QP
+	 * entries to CQ entries by id-equality.
+	 *
+	 * Kernel-mode QPs (those with !res->user) typically still have a
+	 * non-NULL send_cq, but the attr is omitted for them anyway --
+	 * mirrors the !rdma_is_kernel_res() gate on RES_PDN / RES_HANDLE
+	 * above. XRC_TGT QPs lack a conventional send_cq (xrc target is
+	 * sink-only), so the attr is also conditional on qp->send_cq.
+	 */
+	RDMA_NLDEV_ATTR_RES_SEND_CQN,		/* u32 */
+
+	/*
 	 * Always the end
 	 */
 	RDMA_NLDEV_ATTR_MAX
