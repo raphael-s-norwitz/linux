@@ -128,6 +128,7 @@ static const struct nla_policy nldev_policy[RDMA_NLDEV_ATTR_MAX] = {
 	[RDMA_NLDEV_ATTR_RES_QP]		= { .type = NLA_NESTED },
 	[RDMA_NLDEV_ATTR_RES_QP_ENTRY]		= { .type = NLA_NESTED },
 	[RDMA_NLDEV_ATTR_RES_RAW]		= { .type = NLA_BINARY },
+	[RDMA_NLDEV_ATTR_RES_RECV_CQN]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_RKEY]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_RQPN]		= { .type = NLA_U32 },
 	[RDMA_NLDEV_ATTR_RES_RQ_PSN]		= { .type = NLA_U32 },
@@ -624,6 +625,17 @@ static int fill_res_qp_entry(struct sk_buff *msg, bool has_cap_net_admin,
 	if (!rdma_is_kernel_res(res) && qp->send_cq &&
 	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_SEND_CQN,
 			qp->send_cq->res.id))
+		return -EMSGSIZE;
+
+	/*
+	 * RECV_CQN: symmetric to SEND_CQN above, for the QP's recv
+	 * completion CQ (RESTORE_QP_RECV_CQ_HANDLE). Usually equal to
+	 * SEND_CQN, but surfaced separately since the dispatcher takes
+	 * both as distinct IDR refs.
+	 */
+	if (!rdma_is_kernel_res(res) && qp->recv_cq &&
+	    nla_put_u32(msg, RDMA_NLDEV_ATTR_RES_RECV_CQN,
+			qp->recv_cq->res.id))
 		return -EMSGSIZE;
 
 	if (!rdma_is_kernel_res(res) &&

@@ -647,6 +647,17 @@ enum rdma_nldev_attr {
 	RDMA_NLDEV_ATTR_RES_SEND_CQN,		/* u32 */
 
 	/*
+	 * Restrack id of the recv_cq backing a user-mode QP. Same
+	 * rationale and gating as RDMA_NLDEV_ATTR_RES_SEND_CQN, applied to
+	 * qp->recv_cq->res.id. Surfaced for the RESTORE_QP_RECV_CQ_HANDLE
+	 * dependency. Often equal to RES_SEND_CQN (single-CQ
+	 * split-completion is the libibverbs default) but the dispatcher
+	 * requires both as distinct IDR refs, so the dump side carries
+	 * both ids.
+	 */
+	RDMA_NLDEV_ATTR_RES_RECV_CQN,		/* u32 */
+
+	/*
 	 * Always the end
 	 */
 	RDMA_NLDEV_ATTR_MAX
