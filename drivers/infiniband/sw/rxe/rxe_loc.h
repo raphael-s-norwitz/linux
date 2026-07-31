@@ -114,7 +114,7 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 			      enum ib_qp_state state);
 int rxe_qp_restore_inflight(struct rxe_qp *qp,
 			    const struct rxe_restore_qp_req *req,
-			    const void *sq_image);
+			    const void *sq_image, const void *rq_image);
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init);
 int rxe_qp_chk_attr(struct rxe_dev *rxe, struct rxe_qp *qp,
 		    struct ib_qp_attr *attr, int mask);
