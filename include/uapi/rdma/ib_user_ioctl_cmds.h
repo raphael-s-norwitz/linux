@@ -102,6 +102,7 @@ enum uverbs_methods_restore {
 	UVERBS_METHOD_RESTORE_PD,
 	UVERBS_METHOD_RESTORE_MR,
 	UVERBS_METHOD_RESTORE_CQ,
+	UVERBS_METHOD_RESTORE_QP,
 };
 
 enum uverbs_attrs_restore_pd {
@@ -253,6 +254,122 @@ enum uverbs_attrs_restore_cq {
 	 * UVERBS_ATTR_CREATE_CQ_RESP_CQE on the create-side path.
 	 */
 	UVERBS_ATTR_RESTORE_CQ_RESP_CQE,
+};
+
+/*
+ * UVERBS_METHOD_RESTORE_QP -- install a QP uobject at the caller-
+ * specified target ufile handle, on top of the source-side QP state
+ * the destination VHCA inherited (mlx5) or out of a fresh kernel-
+ * side wrapper (rxe). The dispatcher gates on the parent
+ * ucontext->ops.ucontext_is_restore_mode predicate so non-CRIU
+ * userspace cannot reach this path. v0 covers RC, UC and UD; XRC,
+ * GSI, RAW_PACKET, DRIVER (DCT/DCI) are dispatcher-rejected with
+ * -EOPNOTSUPP and re-enabled in later stages with the matching
+ * driver-private UHW shape.
+ *
+ * Field-level shape mirrors the create-side ioctl method
+ * UVERBS_METHOD_QP_CREATE so the capabilities the source's
+ * ibv_create_qp() supplied (qp_type, cap, send_cq, recv_cq, srq,
+ * create_flags) round-trip across SAVE/LOAD; the captured runtime
+ * QP state (RESET / INIT / RTR / RTS / SQD / SQE / ERR) is
+ * surfaced via UVERBS_ATTR_RESTORE_QP_STATE so the driver can
+ * skip the source-side MODIFY_QP chain if its FW has already
+ * preserved the qpc state. Driver-private FW state (mlx5's
+ * adopted qpn, source userspace VAs of WQ-ring/DBR umems, BFREG
+ * index, ECE options etc.; see struct mlx5_ib_restore_qp_req)
+ * travels through @udata via UVERBS_ATTR_UHW(); rxe ignores @udata.
+ */
+enum uverbs_attrs_restore_qp {
+	/*
+	 * Mandatory u32 input. Target ufile handle the restored QP
+	 * uobject must occupy. -EBUSY on collision; same semantics as
+	 * UVERBS_ATTR_RESTORE_{PD,MR,CQ}_HANDLE.
+	 */
+	UVERBS_ATTR_RESTORE_QP_HANDLE,
+	/*
+	 * Mandatory IDR reference into UVERBS_OBJECT_PD. Parent
+	 * protection domain (already restored via
+	 * UVERBS_METHOD_RESTORE_PD).
+	 */
+	UVERBS_ATTR_RESTORE_QP_PD_HANDLE,
+	/*
+	 * Mandatory IDR reference into UVERBS_OBJECT_CQ. Send
+	 * completion queue (already restored via
+	 * UVERBS_METHOD_RESTORE_CQ). Must live on the same device.
+	 */
+	UVERBS_ATTR_RESTORE_QP_SEND_CQ_HANDLE,
+	/*
+	 * Mandatory IDR reference into UVERBS_OBJECT_CQ. Receive
+	 * completion queue (already restored). May alias the send
+	 * CQ for self-loopback / DUAL_RC patterns.
+	 */
+	UVERBS_ATTR_RESTORE_QP_RECV_CQ_HANDLE,
+	/*
+	 * Optional IDR reference into UVERBS_OBJECT_SRQ for QPs
+	 * created with a shared receive queue. Absent for v0 RC/UD;
+	 * UVERBS_METHOD_RESTORE_SRQ has not landed yet (S6c).
+	 */
+	UVERBS_ATTR_RESTORE_QP_SRQ_HANDLE,
+	/*
+	 * Mandatory u32 input. The IBTA QP type (enum ib_qp_type
+	 * value: IB_QPT_RC, IB_QPT_UD, ...). Drivers reject
+	 * unsupported types with -EOPNOTSUPP; v0 accepts RC, UC, UD.
+	 */
+	UVERBS_ATTR_RESTORE_QP_TYPE,
+	/*
+	 * Mandatory u32 input. The captured final QP state at
+	 * SAVE_VHCA_STATE-time (enum ib_qp_state value: IB_QPS_INIT,
+	 * IB_QPS_RTR, IB_QPS_RTS, ...). The driver uses this to
+	 * decide whether the adopted FW QPC is already in the right
+	 * state or whether a destination-side MODIFY_QP chain is
+	 * required (mlx5 v0: no chain needed -- empirically validated
+	 * via design/uobject_restore.md K7 STRONG PASS).
+	 */
+	UVERBS_ATTR_RESTORE_QP_STATE,
+	/*
+	 * Mandatory u64 input. The user-supplied tag the source
+	 * passed as ibv_create_qp()'s qp_context parameter. Stored
+	 * verbatim in ib_uobject::user_handle so libibverbs sees the
+	 * same value via qp->qp_context post-restore.
+	 */
+	UVERBS_ATTR_RESTORE_QP_USER_HANDLE,
+	/*
+	 * Mandatory PTR_IN(struct ib_uverbs_qp_cap). The capability
+	 * tuple ibv_create_qp() returned to the source (max_send_wr,
+	 * max_recv_wr, max_send_sge, max_recv_sge, max_inline_data).
+	 * Reused verbatim from the create-side wire ABI -- the cap
+	 * struct shape has been stable since 2009. Drivers stamp
+	 * their kernel-side ib_qp_cap from this and may round up
+	 * the WQ-ring size to the same value the source-side
+	 * create_qp() rounded to (the WQ umem byte length is a
+	 * function of these fields, so equivalent rounding is
+	 * required for the umem_restore handshake).
+	 */
+	UVERBS_ATTR_RESTORE_QP_CAP,
+	/*
+	 * Optional FLAGS_IN(enum ib_uverbs_qp_create_flags). The
+	 * IBTA + vendor create_flags the source passed to
+	 * ibv_create_qp_ex() (CROSS_CHANNEL, BLOCK_MULTICAST_LOOPBACK,
+	 * SCATTER_FCS, ...). Absent -> 0.
+	 */
+	UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS,
+	/*
+	 * Optional FD reference into UVERBS_OBJECT_ASYNC_EVENT for
+	 * QPs whose source-side async event channel was not the
+	 * ufile default. Forward-compat with RESTORE_ASYNC_EVENT (S8).
+	 * Absent -> ufile->default_async_file, which is what the v0
+	 * CRIU plugin path supplies.
+	 */
+	UVERBS_ATTR_RESTORE_QP_EVENT_FD,
+	/*
+	 * Mandatory u32 output. The actual qpn the kernel installed.
+	 * For mlx5 this equals the source-side qpn the UHW supplied
+	 * (FW resource-id continuity is the whole point of the
+	 * adoption path); for rxe it is whatever rxe_pool_alloc()
+	 * returned. Userspace compares to detect the latter case
+	 * and to fail-fast on cross-arch migration.
+	 */
+	UVERBS_ATTR_RESTORE_QP_RESP_QPN,
 };
 
 enum uverbs_attrs_invoke_write_cmd_attr_ids {
