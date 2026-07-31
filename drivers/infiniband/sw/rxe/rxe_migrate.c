@@ -83,6 +83,46 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_DATAPATH)(
 	return 0;
 }
 
+/*
+ * Emit one optional ring image attr, shipping only the in-flight
+ * [consumer, producer) subspan rather than the whole ring. @producer /
+ * @consumer are the caller's coherent cursor snapshot; the emitted image
+ * agrees byte-for-byte with the cursors carried in the resp blob. A level
+ * ring (or a dumper that didn't ask for the attr) is a no-op; a
+ * provided-but-too-small buffer is a hard error. Linearizing the live
+ * subspan keeps a default ib_send_bw ring under the u16 uverbs attr
+ * length that a whole-ring blit would overflow.
+ */
+static int rxe_query_emit_ring(struct uverbs_attr_bundle *attrs, u16 attr_id,
+			       const struct rxe_queue *q,
+			       u32 producer, u32 consumer)
+{
+	u32 count = (producer - consumer) & q->index_mask;
+	size_t bytes = (size_t)count << q->log2_elem_size;
+	int user_len, ret;
+	void *tmp;
+
+	if (!uverbs_attr_is_valid(attrs, attr_id) || bytes == 0)
+		return 0;
+
+	user_len = uverbs_attr_get_len(attrs, attr_id);
+	if (user_len < 0)
+		return 0;
+	if ((u32)user_len < bytes)
+		return -ENOSPC;
+
+	tmp = kvmalloc(bytes, GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
+
+	ret = queue_inflight_capture(q, producer, consumer, tmp, bytes);
+	if (ret >= 0)
+		ret = uverbs_copy_to(attrs, attr_id, tmp, bytes);
+
+	kvfree(tmp);
+	return ret;
+}
+
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	struct uverbs_attr_bundle *attrs)
 {
@@ -140,11 +180,17 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	blob.ssn		= atomic_read(&qp->ssn);
 
 	/*
-	 * The in-flight datapath group (SQ/RQ cursors, responder scalars,
-	 * ring image byte counts) stays zero here: this method emits only
-	 * the drained subset. Non-drained round-trip lands with the
-	 * in-flight QP slice.
+	 * In-flight SQ ring: the cursors locate the live [consumer, producer)
+	 * send work and sq_image_bytes is that subspan's byte length (0 for a
+	 * drained ring, where producer == consumer). The RQ and responder
+	 * groups land in following commits and stay zero here, so the drained
+	 * dump path is unchanged.
 	 */
+	blob.sq_producer = queue_get_producer(qp->sq.queue, qp->sq.queue->type);
+	blob.sq_consumer = queue_get_consumer(qp->sq.queue, qp->sq.queue->type);
+	blob.sq_image_bytes = ((blob.sq_producer - blob.sq_consumer) &
+			       qp->sq.queue->index_mask)
+			      << qp->sq.queue->log2_elem_size;
 
 	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 			     &blob, sizeof(blob));
@@ -157,49 +203,20 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	 * through the kernel-sourced dump.
 	 */
 	user_handle = ib_qp_user_handle(ibqp);
+	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
+			     &user_handle, sizeof(user_handle));
+	if (err)
+		return err;
 
-	return uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
-			      &user_handle, sizeof(user_handle));
-}
-
-/*
- * Emit one optional CQE ring image attr, shipping only the in-flight
- * [consumer, producer) subspan rather than the whole ring. @producer /
- * @consumer are the caller's coherent cursor snapshot; the emitted image
- * agrees byte-for-byte with the cursors carried in the resp blob. A level
- * ring (or a dumper that didn't ask for the attr) is a no-op; a
- * provided-but-too-small buffer is a hard error. Linearizing the live
- * subspan keeps a default ib_send_bw ring under the u16 uverbs attr
- * length that a whole-ring blit would overflow.
- */
-static int rxe_query_emit_ring(struct uverbs_attr_bundle *attrs, u16 attr_id,
-			       const struct rxe_queue *q,
-			       u32 producer, u32 consumer)
-{
-	u32 count = (producer - consumer) & q->index_mask;
-	size_t bytes = (size_t)count << q->log2_elem_size;
-	int user_len, ret;
-	void *tmp;
-
-	if (!uverbs_attr_is_valid(attrs, attr_id) || bytes == 0)
-		return 0;
-
-	user_len = uverbs_attr_get_len(attrs, attr_id);
-	if (user_len < 0)
-		return 0;
-	if ((u32)user_len < bytes)
-		return -ENOSPC;
-
-	tmp = kvmalloc(bytes, GFP_KERNEL);
-	if (!tmp)
-		return -ENOMEM;
-
-	ret = queue_inflight_capture(q, producer, consumer, tmp, bytes);
-	if (ret >= 0)
-		ret = uverbs_copy_to(attrs, attr_id, tmp, bytes);
-
-	kvfree(tmp);
-	return ret;
+	/*
+	 * In-flight SQ ring image (optional PTR_OUT): the live [consumer,
+	 * producer) subspan, round-tripped opaquely into the RESTORE_QP
+	 * UHW_IN tail. A no-op when the subspan is empty or the dumper didn't
+	 * request the attr.
+	 */
+	return rxe_query_emit_ring(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+				   qp->sq.queue, blob.sq_producer,
+				   blob.sq_consumer);
 }
 
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
@@ -276,7 +293,10 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
 			    UVERBS_ATTR_TYPE(u64),
-			    UA_MANDATORY));
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+			    UVERBS_ATTR_MIN_SIZE(0),
+			    UA_OPTIONAL));
 
 DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_CQ,

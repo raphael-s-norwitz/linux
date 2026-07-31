@@ -67,10 +67,17 @@ enum rxe_ib_query_qp_attrs {
 	RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 	/*
 	 * The QP's userspace async-event cookie (ib_qp_user_handle), which
-	 * is not standard-queryable. Attr ids +3/+4/+5 are reserved for the
-	 * in-flight SQ/RQ/responder ring image attrs added by a later slice.
+	 * is not standard-queryable.
 	 */
 	RXE_IB_ATTR_QUERY_QP_RESP_USER_HANDLE,
+	/*
+	 * In-flight SQ ring image (optional): the live [consumer, producer)
+	 * subspan, round-tripped opaquely into the RESTORE_QP UHW_IN tail.
+	 * Byte length is reported in rxe_restore_qp_req::sq_image_bytes;
+	 * absent/zero-length for a drained QP. Attr ids +4/+5 (RQ / responder
+	 * resources) are added by the following commits.
+	 */
+	RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
 };
 
 enum rxe_ib_query_cq_attrs {
