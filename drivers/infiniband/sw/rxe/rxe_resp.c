@@ -1499,7 +1499,7 @@ static enum resp_states do_class_d1e_error(struct rxe_qp *qp)
 }
 
 /* drain incoming request packet queue */
-static void drain_req_pkts(struct rxe_qp *qp)
+void rxe_drain_req_pkts(struct rxe_qp *qp)
 {
 	struct sk_buff *skb;
 
@@ -1581,7 +1581,7 @@ int rxe_receiver(struct rxe_qp *qp)
 			  qp_state(qp) == IB_QPS_RESET) {
 		bool notify = qp->valid && (qp_state(qp) == IB_QPS_ERR);
 
-		drain_req_pkts(qp);
+		rxe_drain_req_pkts(qp);
 		flush_recv_queue(qp, notify);
 		spin_unlock_irqrestore(&qp->state_lock, flags);
 		goto exit;
