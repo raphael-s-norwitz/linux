@@ -40,6 +40,17 @@ static int check_type_state(struct rxe_dev *rxe, struct rxe_pkt_info *pkt,
 	}
 
 	spin_lock_irqsave(&qp->state_lock, flags);
+	/*
+	 * CRIU datapath freeze (S6a): the QP keeps its IBTA state (usually
+	 * RTS) but must drop newly arriving packets while parked. Accepting
+	 * one would queue an skb that pins a QP reference the disabled
+	 * responder/completer never releases, hanging destroy. The RC peer
+	 * retransmits after thaw, so the drop is lossless.
+	 */
+	if (unlikely(qp->dp_frozen)) {
+		spin_unlock_irqrestore(&qp->state_lock, flags);
+		return -EINVAL;
+	}
 	if (pkt->mask & RXE_REQ_MASK) {
 		if (unlikely(qp_state(qp) < IB_QPS_RTR)) {
 			spin_unlock_irqrestore(&qp->state_lock, flags);
