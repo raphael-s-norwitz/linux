@@ -78,6 +78,13 @@ enum rxe_ib_query_qp_attrs {
 	 * resources) are added by the following commits.
 	 */
 	RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+	/*
+	 * In-flight RQ ring image (optional): the live [consumer, producer)
+	 * subspan, sized by rxe_restore_qp_req::rq_image_bytes. Absent for a
+	 * drained or SRQ-fed QP. Attr id +5 (responder resources) is added by
+	 * the following commit.
+	 */
+	RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
 };
 
 enum rxe_ib_query_cq_attrs {
