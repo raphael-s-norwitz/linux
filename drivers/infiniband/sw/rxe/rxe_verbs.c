@@ -624,7 +624,7 @@ static int rxe_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *init,
 		goto err_out;
 	}
 
-	err = rxe_qp_from_init(rxe, qp, pd, init, uresp, ibqp->pd, udata);
+	err = rxe_qp_from_init(rxe, qp, pd, init, uresp, ibqp->pd, udata, 0, 0);
 	if (err) {
 		rxe_dbg_qp(qp, "create qp failed, err = %d\n", err);
 		goto err_cleanup;

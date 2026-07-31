@@ -407,12 +407,17 @@ static int rxe_qp_init_resp(struct rxe_dev *rxe, struct rxe_qp *qp,
 	return 0;
 }
 
-/* called by the create qp verb */
+/*
+ * called by the create qp verb (sq/rq_forced_vm_pgoff == 0) and by the
+ * CRIU restore qp verb (rxe_restore_qp), which passes the source-side
+ * ring mmap offsets so the dumped VMAs map back 1:1 on the destination.
+ */
 int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
 		     struct ib_qp_init_attr *init,
 		     struct rxe_create_qp_resp __user *uresp,
 		     struct ib_pd *ibpd,
-		     struct ib_udata *udata)
+		     struct ib_udata *udata,
+		     u64 sq_forced_vm_pgoff, u64 rq_forced_vm_pgoff)
 {
 	int err;
 	struct rxe_cq *rcq = to_rcq(init->recv_cq);
@@ -436,11 +441,11 @@ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
 
 	rxe_qp_init_misc(rxe, qp, init);
 
-	err = rxe_qp_init_req(rxe, qp, init, udata, uresp, 0);
+	err = rxe_qp_init_req(rxe, qp, init, udata, uresp, sq_forced_vm_pgoff);
 	if (err)
 		goto err1;
 
-	err = rxe_qp_init_resp(rxe, qp, init, udata, uresp, 0);
+	err = rxe_qp_init_resp(rxe, qp, init, udata, uresp, rq_forced_vm_pgoff);
 	if (err)
 		goto err2;
 
