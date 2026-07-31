@@ -666,23 +666,22 @@ err_out:
  *
  * A drained source ships the fixed rxe_restore_qp_req header alone and
  * takes the cursor-only fast path. A non-drained source appends its live
- * ring image(s) in the UHW_IN tail (located by the header's
- * {sq,rq,res}_image_bytes); rxe_restore_qp_inflight slices and applies
- * them over the rings rxe_qp_from_init just built. Images not yet
- * consumed by this handler are rejected (-EOPNOTSUPP) rather than
- * silently dropped.
+ * SQ/RQ ring and responder-resource images in the UHW_IN tail (located by
+ * the header's {sq,rq,res}_image_bytes); rxe_restore_qp_inflight slices
+ * and applies them over the rings rxe_qp_from_init just built.
  */
 static int rxe_restore_qp_inflight(struct rxe_qp *qp,
 				   const struct rxe_restore_qp_req *req,
 				   struct ib_udata *udata)
 {
-	const void *sq_image = NULL, *rq_image = NULL;
+	const void *sq_image = NULL, *rq_image = NULL, *res_image = NULL;
 	const size_t hdr = sizeof(*req);
 	size_t tail, off;
 	void *buf;
 	int err;
 
-	tail = (size_t)req->sq_image_bytes + req->rq_image_bytes;
+	tail = (size_t)req->sq_image_bytes + req->rq_image_bytes +
+	       req->res_image_bytes;
 	/* Caller only invokes this for a tail; a header-sized inlen is drained. */
 	if (tail == 0 || udata->inlen != hdr + tail)
 		return -EINVAL;
@@ -704,8 +703,10 @@ static int rxe_restore_qp_inflight(struct rxe_qp *qp,
 		rq_image = buf + off;
 		off += req->rq_image_bytes;
 	}
+	if (req->res_image_bytes)
+		res_image = buf + off;
 
-	err = rxe_qp_restore_inflight(qp, req, sq_image, rq_image);
+	err = rxe_qp_restore_inflight(qp, req, sq_image, rq_image, res_image);
 out:
 	kvfree(buf);
 	return err;
@@ -774,19 +775,6 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	if (req.qpn == 0) {
 		err = -EINVAL;
 		rxe_dbg_dev(rxe, "restore qp req qpn must be non-zero\n");
-		goto err_out;
-	}
-
-	/*
-	 * The SQ and RQ in-flight images are applied below; the
-	 * responder-resource image lands in the next commit. Reject it rather
-	 * than silently dropping replay state we cannot yet restore.
-	 */
-	if (req.res_image_bytes) {
-		err = -EOPNOTSUPP;
-		rxe_dbg_dev(rxe,
-			    "restore qp: res image unsupported (res=%u)\n",
-			    req.res_image_bytes);
 		goto err_out;
 	}
 

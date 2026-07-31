@@ -572,6 +572,24 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	atomic_set(&qp->ssn, req->ssn);
 
 	/*
+	 * Responder continuity scalars. These describe where the responder
+	 * sits in the *peer's* request stream (mid multi-packet message,
+	 * last ack/nak emitted), so they are independent of whether the
+	 * local SQ was in-flight: a drained / pure-responder QP still needs
+	 * them. Restore unconditionally here rather than in
+	 * rxe_qp_restore_inflight() (which only runs when an SQ/RQ/res image
+	 * tail is present). Without resp.opcode in particular, a peer
+	 * replaying a multi-packet RDMA WRITE/SEND hits check_op_seq() with
+	 * resp.opcode == OPCODE_NONE -> RESPST_ERR_MISSING_OPCODE_FIRST ->
+	 * AETH_NAK_INVALID_REQ, completing the peer's WQE with
+	 * IB_WC_REM_INV_REQ_ERR.
+	 */
+	qp->resp.ack_psn	 = req->resp_ack_psn & BTH_PSN_MASK;
+	qp->resp.opcode		 = req->resp_opcode;
+	qp->resp.status		 = req->resp_status;
+	qp->resp.aeth_syndrome	 = req->resp_aeth_syndrome;
+
+	/*
 	 * Seed the freshly-created ring cursors to the source base so the
 	 * shared-page producer/consumer that userspace reads agree with
 	 * qp->req.wqe_index. Without this the ring is left at 0/0 while
@@ -607,7 +625,8 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
  */
 int rxe_qp_restore_inflight(struct rxe_qp *qp,
 			    const struct rxe_restore_qp_req *req,
-			    const void *sq_image, const void *rq_image)
+			    const void *sq_image, const void *rq_image,
+			    const void *res_image)
 {
 	int err;
 
@@ -640,6 +659,18 @@ int rxe_qp_restore_inflight(struct rxe_qp *qp,
 			return err;
 		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
 				 req->rq_consumer);
+	}
+
+	if (res_image) {
+		size_t want = (size_t)qp->attr.max_dest_rd_atomic *
+			      sizeof(struct resp_res);
+
+		if (!qp->resp.resources || want == 0 ||
+		    want != req->res_image_bytes)
+			return -EINVAL;
+		memcpy(qp->resp.resources, res_image, want);
+		qp->resp.res_head = req->res_head;
+		qp->resp.res_tail = req->res_tail;
 	}
 
 	return 0;
