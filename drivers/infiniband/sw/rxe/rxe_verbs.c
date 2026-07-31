@@ -642,6 +642,177 @@ err_out:
 	return err;
 }
 
+/*
+ * CRIU-restore variant of rxe_create_qp. The generic
+ * UVERBS_METHOD_RESTORE_QP dispatcher has already gated on
+ * ucontext_is_restore_mode(), reserved @target_handle in the ufile idr
+ * via rdma_alloc_begin_uobject_at_handle(), validated qp_type against
+ * the v0 set {RC,UC,UD}, validated qp_state against {RESET,INIT,RTR,RTS},
+ * rejected any SRQ reference (no RESTORE_SRQ at v0), and pre-stamped the
+ * ib_qp shell (device/pd/qp_type/send_cq/recv_cq/event handlers,
+ * qp_num=0). It passes the hw-agnostic @cap, captured @qp_state, and
+ * @create_flags; the rxe-private wire state rides in the UHW
+ * (struct rxe_restore_qp_req).
+ *
+ * Unlike mlx5 -- whose QPC is preserved verbatim by LOAD_VHCA_STATE --
+ * rxe has no firmware, so this handler reconstructs the entire QP from
+ * scratch and stamps every wire-relevant byte from the UHW: it installs
+ * the QP at the *source qpn* (rxe qpns are wire-visible, BTH DestQP, so
+ * the peer's in-flight packets must keep addressing the same number --
+ * the QP analogue of rxe_restore_mr's lkey/rkey identity contract),
+ * binds the SQ/RQ ring mmaps at the source vm_pgoffs, then lands the QP
+ * directly at its captured final state via rxe_qp_restore_wire_state
+ * with no ib_modify_qp chain.
+ *
+ * This v0 handler restores a *drained* QP only: the source is quiesced
+ * with no in-flight WQEs, so the ring images are empty. A non-zero
+ * sq/rq/res image tail is rejected (-EOPNOTSUPP) rather than silently
+ * dropped -- in-flight WQE replay is a later slice.
+ */
+static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
+			  const struct ib_qp_cap *cap,
+			  enum ib_qp_state qp_state, u32 create_flags,
+			  struct ib_udata *udata)
+{
+	struct rxe_dev *rxe = to_rdev(ibqp->device);
+	struct rxe_pd *pd = to_rpd(ibqp->pd);
+	struct rxe_qp *qp = to_rqp(ibqp);
+	struct rxe_create_qp_resp __user *uresp = NULL;
+	struct rxe_restore_qp_req req = {};
+	struct ib_qp_init_attr init = {};
+	int err, cleanup_err;
+	size_t n;
+
+	/* rxe has no create_flags support (matches rxe_create_qp). */
+	if (create_flags) {
+		err = -EOPNOTSUPP;
+		rxe_dbg_dev(rxe, "unsupported create_flags, err = %d\n", err);
+		goto err_out;
+	}
+
+	/* Restore is always userspace-driven and must publish mminfo. */
+	if (!udata) {
+		err = -EINVAL;
+		rxe_dbg_dev(rxe, "restore qp requires udata, err = %d\n", err);
+		goto err_out;
+	}
+	if (udata->outlen < sizeof(*uresp)) {
+		err = -EINVAL;
+		rxe_dbg_dev(rxe, "malformed udata outbuf, err = %d\n", err);
+		goto err_out;
+	}
+	uresp = udata->outbuf;
+	qp->is_user = true;
+
+	/*
+	 * UHW_IN carries the full rxe wire state (struct rxe_restore_qp_req).
+	 * Same inline-attr-threshold discipline as rxe_restore_cq: the
+	 * struct is sized strictly larger than __u64 so the dispatcher
+	 * takes the copy_from_user pointer path; reject anything in the
+	 * inline range to surface a malformed caller loudly.
+	 */
+	if (udata->inlen <= sizeof(__u64)) {
+		err = -EINVAL;
+		rxe_dbg_dev(rxe,
+			    "restore qp req inbuf must exceed inline-attr threshold (got %zu, need > %zu)\n",
+			    udata->inlen, sizeof(__u64));
+		goto err_out;
+	}
+	n = min_t(size_t, udata->inlen, sizeof(req));
+	err = ib_copy_from_udata(&req, udata, n);
+	if (err) {
+		rxe_dbg_dev(rxe, "bad restore qp req, err = %d\n", err);
+		goto err_out;
+	}
+	if (req.reserved || req.reserved2) {
+		err = -EINVAL;
+		rxe_dbg_dev(rxe, "restore qp req reserved must be 0\n");
+		goto err_out;
+	}
+	if (req.qpn == 0) {
+		err = -EINVAL;
+		rxe_dbg_dev(rxe, "restore qp req qpn must be non-zero\n");
+		goto err_out;
+	}
+
+	/*
+	 * v0 restores a drained QP: reject any in-flight ring image. The
+	 * cursor fields are still honoured (a drained QP's producer ==
+	 * consumer), but a non-empty [consumer, producer) slot image means
+	 * the source had queued work we cannot replay yet.
+	 */
+	if (req.sq_image_bytes || req.rq_image_bytes || req.res_image_bytes) {
+		err = -EOPNOTSUPP;
+		rxe_dbg_dev(rxe,
+			    "restore qp: in-flight image unsupported (sq=%u rq=%u res=%u)\n",
+			    req.sq_image_bytes, req.rq_image_bytes,
+			    req.res_image_bytes);
+		goto err_out;
+	}
+
+	/*
+	 * Build init attrs from the generic method args + the dispatcher's
+	 * pre-stamped object refs. The PSN/AV/etc. captured state is applied
+	 * later by rxe_qp_restore_wire_state; init only needs the create-time
+	 * shape (type, cqs, cap, sig policy, port).
+	 */
+	init.qp_type		 = ibqp->qp_type;
+	init.send_cq		 = ibqp->send_cq;
+	init.recv_cq		 = ibqp->recv_cq;
+	init.srq		 = ibqp->srq;
+	init.sq_sig_type	 = req.sq_sig_all ? IB_SIGNAL_ALL_WR :
+						    IB_SIGNAL_REQ_WR;
+	init.port_num		 = req.port_num ? req.port_num : 1;
+	init.cap.max_send_wr	 = cap->max_send_wr;
+	init.cap.max_recv_wr	 = cap->max_recv_wr;
+	init.cap.max_send_sge	 = cap->max_send_sge;
+	init.cap.max_recv_sge	 = cap->max_recv_sge;
+	init.cap.max_inline_data = cap->max_inline_data;
+
+	err = rxe_qp_chk_init(rxe, &init);
+	if (err) {
+		rxe_dbg_dev(rxe, "bad init attr, err = %d\n", err);
+		goto err_out;
+	}
+
+	/*
+	 * Install at the source qpn. __rxe_add_to_pool_at_index range-checks
+	 * the qpn against the pool limits (-EINVAL) and returns -EBUSY if the
+	 * slot is occupied -- the per-verb collision shape CRIU expects.
+	 */
+	err = rxe_add_to_pool_at_index(&rxe->qp_pool, qp, req.qpn);
+	if (err) {
+		rxe_dbg_dev(rxe,
+			    "restore qp: pool install at qpn 0x%x failed, err = %d\n",
+			    req.qpn, err);
+		goto err_out;
+	}
+
+	err = rxe_qp_from_init(rxe, qp, pd, &init, uresp, ibqp->pd, udata,
+			       req.sq_vm_pgoff, req.rq_vm_pgoff);
+	if (err) {
+		rxe_dbg_qp(qp, "restore qp init failed, err = %d\n", err);
+		goto err_cleanup;
+	}
+
+	err = rxe_qp_restore_wire_state(qp, &req, qp_state);
+	if (err) {
+		rxe_dbg_qp(qp, "restore qp wire state failed, err = %d\n", err);
+		goto err_cleanup;
+	}
+
+	rxe_finalize(qp);
+	return 0;
+
+err_cleanup:
+	cleanup_err = rxe_cleanup(qp);
+	if (cleanup_err)
+		rxe_err_qp(qp, "cleanup failed, err = %d\n", cleanup_err);
+err_out:
+	rxe_err_dev(rxe, "returned err = %d\n", err);
+	return err;
+}
+
 static int rxe_modify_qp(struct ib_qp *ibqp, struct ib_qp_attr *attr,
 			 int mask, struct ib_udata *udata)
 {
@@ -1890,6 +2061,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.restore_cq = rxe_restore_cq,
 	.restore_mr = rxe_restore_mr,
 	.restore_pd = rxe_restore_pd,
+	.restore_qp = rxe_restore_qp,
 	.ucontext_is_restore_mode = rxe_ucontext_is_restore_mode,
 
 	INIT_RDMA_OBJ_SIZE(ib_ah, rxe_ah, ibah),
