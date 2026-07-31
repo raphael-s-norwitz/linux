@@ -109,6 +109,9 @@ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
 		     struct rxe_create_qp_resp __user *uresp,
 		     struct ib_pd *ibpd, struct ib_udata *udata,
 		     u64 sq_forced_vm_pgoff, u64 rq_forced_vm_pgoff);
+int rxe_qp_restore_wire_state(struct rxe_qp *qp,
+			      const struct rxe_restore_qp_req *req,
+			      enum ib_qp_state state);
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init);
 int rxe_qp_chk_attr(struct rxe_dev *rxe, struct rxe_qp *qp,
 		    struct ib_qp_attr *attr, int mask);

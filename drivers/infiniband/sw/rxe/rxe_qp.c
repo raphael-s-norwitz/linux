@@ -477,6 +477,125 @@ err1:
 	return err;
 }
 
+/*
+ * Seed a freshly-created ring's cursors to the source-side indices. For
+ * the SQ/RQ (QUEUE_TYPE_FROM_CLIENT) the client owns @producer and rxe
+ * owns @consumer (mirrored into the shared page and rxe's private copy).
+ * Indices are masked to slot width to match the wire bookkeeping.
+ */
+static void rxe_qp_seed_ring(struct rxe_queue *q, u32 producer, u32 consumer)
+{
+	producer &= q->index_mask;
+	consumer &= q->index_mask;
+
+	q->buf->producer_index = producer;
+	q->buf->consumer_index = consumer;
+	q->index = consumer;
+}
+
+/*
+ * CRIU restore: stamp a freshly-created QP with the captured wire
+ * state from the rxe_restore_qp_req UHW and land it directly at its
+ * final IBTA state. No ib_modify_qp chain runs -- this is the
+ * software-device mirror of mlx5 adopting a LOAD_VHCA_STATE-preserved
+ * QPC. The caller (rxe_restore_qp) has already created the QP at the
+ * source qpn via rxe_qp_from_init with the source ring vm_pgoffs, so
+ * qp->valid is set and the rings are mapped; here we overwrite the
+ * attr / AV / PSN / cursor state that create-time defaults got wrong.
+ *
+ * The PSNs and SQ cursor are set to the *live* source values
+ * (next-to-send, next-ack-expected, next-recv-expected) rather than
+ * the modify-time bases, because an in-flight QP's cursors have
+ * advanced past sq_psn/rq_psn and ib_modify_qp cannot express them.
+ *
+ * rd_atomic depths are stored verbatim (the source already rounded
+ * them up to a power of two at modify time, so re-rounding here would
+ * be a no-op and would break QUERY_QP byte-fidelity).
+ */
+int rxe_qp_restore_wire_state(struct rxe_qp *qp,
+			      const struct rxe_restore_qp_req *req,
+			      enum ib_qp_state state)
+{
+	unsigned long flags;
+	int err;
+
+	/* address path + transport attrs (mirrors rxe_qp_from_attr) */
+	memcpy(&qp->pri_av, &req->av, sizeof(qp->pri_av));
+
+	qp->attr.dest_qp_num	 = req->dest_qp_num;
+	qp->attr.qkey		 = req->qkey;
+	qp->attr.qp_access_flags = req->qp_access_flags;
+	qp->attr.pkey_index	 = req->pkey_index;
+	qp->attr.port_num	 = req->port_num;
+
+	qp->attr.path_mtu	 = req->path_mtu;
+	qp->mtu			 = ib_mtu_enum_to_int(req->path_mtu);
+
+	qp->attr.retry_cnt	 = req->retry_cnt;
+	qp->comp.retry_cnt	 = req->retry_cnt;
+	qp->attr.rnr_retry	 = req->rnr_retry;
+	qp->comp.rnr_retry	 = req->rnr_retry;
+	qp->attr.min_rnr_timer	 = req->min_rnr_timer;
+
+	qp->attr.timeout	 = req->timeout;
+	if (req->timeout == 0) {
+		qp->qp_timeout_jiffies = 0;
+	} else {
+		/* spec: timeout = 4.096 * 2 ^ timeout [us] */
+		int j = nsecs_to_jiffies(4096ULL << req->timeout);
+
+		qp->qp_timeout_jiffies = j ? j : 1;
+	}
+
+	qp->attr.max_rd_atomic	 = req->max_rd_atomic;
+	atomic_set(&qp->req.rd_atomic, req->max_rd_atomic);
+
+	if (req->max_dest_rd_atomic) {
+		qp->attr.max_dest_rd_atomic = req->max_dest_rd_atomic;
+		err = alloc_rd_atomic_resources(qp, req->max_dest_rd_atomic);
+		if (err)
+			return err;
+	}
+
+	qp->attr.sq_psn		 = req->sq_psn & BTH_PSN_MASK;
+	qp->attr.rq_psn		 = req->rq_psn & BTH_PSN_MASK;
+
+	/*
+	 * live cursors: the per-flight state ib_modify_qp can't carry.
+	 * Masked to PSN width to match the wire bookkeeping.
+	 */
+	qp->req.psn		 = req->req_psn & BTH_PSN_MASK;
+	qp->comp.psn		 = req->comp_psn & BTH_PSN_MASK;
+	qp->resp.psn		 = req->resp_psn & BTH_PSN_MASK;
+	qp->resp.msn		 = req->resp_msn;
+	qp->req.wqe_index	 = req->req_wqe_index;
+	atomic_set(&qp->ssn, req->ssn);
+
+	/*
+	 * Seed the freshly-created ring cursors to the source base so the
+	 * shared-page producer/consumer that userspace reads agree with
+	 * qp->req.wqe_index. Without this the ring is left at 0/0 while
+	 * wqe_index sits at the source base: the first post-restore
+	 * post_send lands at slot 0, but the requester computes
+	 * wqe_index == producer and skips the WQE forever (no packet,
+	 * post_send hangs). For a drained QP the source cursors equal the
+	 * wqe_index base, so producer/consumer/wqe_index stay coherent.
+	 */
+	if (qp->sq.queue)
+		rxe_qp_seed_ring(qp->sq.queue, req->sq_producer,
+				 req->sq_consumer);
+	if (qp->rq.queue && !qp->srq)
+		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
+				 req->rq_consumer);
+
+	spin_lock_irqsave(&qp->state_lock, flags);
+	qp->attr.qp_state	 = state;
+	qp->attr.cur_qp_state	 = state;
+	spin_unlock_irqrestore(&qp->state_lock, flags);
+
+	return 0;
+}
+
 /* called by the query qp verb */
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init)
 {
