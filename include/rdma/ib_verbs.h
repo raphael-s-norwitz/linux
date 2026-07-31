@@ -2786,6 +2786,49 @@ struct ib_device_ops {
 	int (*query_qp)(struct ib_qp *qp, struct ib_qp_attr *qp_attr,
 			int qp_attr_mask, struct ib_qp_init_attr *qp_init_attr);
 	int (*destroy_qp)(struct ib_qp *qp, struct ib_udata *udata);
+	/**
+	 * restore_qp - install a CRIU-restored QP at the caller-chosen
+	 * @target_handle.
+	 *
+	 * Mirror of restore_cq for QPs:
+	 *   - gated on ucontext_is_restore_mode(),
+	 *   - only invoked from the UVERBS_METHOD_RESTORE_QP dispatcher
+	 *     in uverbs_std_types_restore.c, which has already
+	 *     reserved @target_handle in the ufile idr,
+	 *     allocated @qp via rdma_zalloc_drv_obj(ib_qp), and wired
+	 *     up @qp->{device, pd, send_cq, recv_cq, srq, qp_type,
+	 *     qp_context, event_handler, uobject, qp_num (zero -- the
+	 *     driver fills it in from the UHW source-qpn)}.
+	 *
+	 * The driver's job is to make the QP hw-usable: install any
+	 * pool/FW-id state (FW qpn for mlx5; rxe_pool elem for rxe),
+	 * size the WQ rings to match @cap, and stamp @qp->qp_num with
+	 * the actual installed qpn. @cap carries the legacy
+	 * ib_qp_cap tuple (max_send_wr / max_recv_wr / max_send_sge /
+	 * max_recv_sge / max_inline_data) the source-side
+	 * ibv_create_qp() returned.
+	 *
+	 * @qp_state is the captured final state at SAVE_VHCA_STATE-time
+	 * (RESET / INIT / RTR / RTS / SQD / SQE / ERR). Drivers whose
+	 * FW intrinsically preserves the qpc state across save/load
+	 * (mlx5 -- empirically validated by K7) honour it without a
+	 * destination-side MODIFY_QP chain; drivers that need to
+	 * replay the state machine (rxe) walk it here.
+	 *
+	 * Driver-private FW state (e.g. mlx5's source FW qpn, in
+	 * struct mlx5_ib_restore_qp_req) travels through @udata via
+	 * UVERBS_ATTR_UHW(). Drivers that need qpn continuity (mlx5)
+	 * MUST validate the UHW payload and adopt the source qpn.
+	 * Drivers with no wire-spec qpn (rxe) ignore @udata.
+	 *
+	 * Returns 0 on success, -errno on failure (failure aborts
+	 * the uobject install).
+	 */
+	int (*restore_qp)(struct ib_qp *qp, u32 target_handle,
+			  const struct ib_qp_cap *cap,
+			  enum ib_qp_state qp_state,
+			  u32 create_flags,
+			  struct ib_udata *udata);
 	int (*create_cq)(struct ib_cq *cq, const struct ib_cq_init_attr *attr,
 			 struct uverbs_attr_bundle *attrs);
 	int (*create_user_cq)(struct ib_cq *cq,

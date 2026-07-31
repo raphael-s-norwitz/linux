@@ -17,6 +17,7 @@
 #include <rdma/uverbs_std_types.h>
 #include <rdma/uverbs_ioctl.h>
 #include <rdma/uverbs_types.h>
+#include "core_priv.h"
 #include "rdma_core.h"
 #include "uverbs.h"
 #include "restrack.h"
@@ -408,10 +409,252 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
 	UVERBS_ATTR_UHW());
 
+static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_QP)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_ucontext *ctx;
+	struct ib_device *ib_dev;
+	struct ib_uobject *uobj;
+	struct ib_uqp_object *obj;
+	struct ib_uverbs_qp_cap cap = {};
+	struct ib_qp_cap kcap = {};
+	struct ib_pd *pd;
+	struct ib_cq *send_cq, *recv_cq;
+	struct ib_srq *srq = NULL;
+	struct ib_qp *qp;
+	enum ib_qp_type qp_type;
+	enum ib_qp_state qp_state;
+	u32 target_handle, create_flags = 0;
+	u64 user_handle;
+	int ret;
+
+	ret = restore_check_ucontext(attrs, &ctx);
+	if (ret)
+		return ret;
+	ib_dev = ctx->device;
+	/*
+	 * destroy_qp is checked alongside restore_qp because the
+	 * cleanup path (uverbs_free_qp -> ib_destroy_qp_user) calls it
+	 * unconditionally on any QP uobject -- including ones we just
+	 * created here via restore. A driver that lacks destroy_qp
+	 * would leak the kernel object on uobject teardown.
+	 */
+	if (!ib_dev->ops.restore_qp || !ib_dev->ops.destroy_qp)
+		return -EOPNOTSUPP;
+
+	ret = uverbs_copy_from(&target_handle, attrs,
+			       UVERBS_ATTR_RESTORE_QP_HANDLE);
+	if (ret)
+		return ret;
+	ret = uverbs_get_const(&qp_type, attrs, UVERBS_ATTR_RESTORE_QP_TYPE);
+	if (ret)
+		return ret;
+	ret = uverbs_get_const(&qp_state, attrs,
+			       UVERBS_ATTR_RESTORE_QP_STATE);
+	if (ret)
+		return ret;
+	ret = uverbs_copy_from(&user_handle, attrs,
+			       UVERBS_ATTR_RESTORE_QP_USER_HANDLE);
+	if (ret)
+		return ret;
+	ret = uverbs_copy_from_or_zero(&cap, attrs, UVERBS_ATTR_RESTORE_QP_CAP);
+	if (ret)
+		return ret;
+	ret = uverbs_get_flags32(&create_flags, attrs,
+				 UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS,
+				 IB_UVERBS_QP_CREATE_BLOCK_MULTICAST_LOOPBACK |
+				 IB_UVERBS_QP_CREATE_SCATTER_FCS |
+				 IB_UVERBS_QP_CREATE_CVLAN_STRIPPING |
+				 IB_UVERBS_QP_CREATE_PCI_WRITE_END_PADDING |
+				 IB_UVERBS_QP_CREATE_SQ_SIG_ALL);
+	if (ret)
+		return ret;
+
+	/*
+	 * v0 QP types: RC, UC, UD. XRC, GSI, RAW_PACKET, DRIVER
+	 * (DCT/DCI) are reserved for later stages with the matching
+	 * driver-private UHW shape.
+	 */
+	switch (qp_type) {
+	case IB_QPT_RC:
+	case IB_QPT_UD:
+	case IB_QPT_UC:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	/*
+	 * v0 captured states. ERR is excluded -- a destroyed-mid-error
+	 * QP serializes through a different rung.
+	 */
+	switch (qp_state) {
+	case IB_QPS_RESET:
+	case IB_QPS_INIT:
+	case IB_QPS_RTR:
+	case IB_QPS_RTS:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	pd = uverbs_attr_get_obj(attrs, UVERBS_ATTR_RESTORE_QP_PD_HANDLE);
+	if (IS_ERR(pd))
+		return PTR_ERR(pd);
+	if (pd->device != ib_dev)
+		return -EINVAL;
+
+	send_cq = uverbs_attr_get_obj(attrs,
+				      UVERBS_ATTR_RESTORE_QP_SEND_CQ_HANDLE);
+	if (IS_ERR(send_cq))
+		return PTR_ERR(send_cq);
+	if (send_cq->device != ib_dev)
+		return -EINVAL;
+
+	recv_cq = uverbs_attr_get_obj(attrs,
+				      UVERBS_ATTR_RESTORE_QP_RECV_CQ_HANDLE);
+	if (IS_ERR(recv_cq))
+		return PTR_ERR(recv_cq);
+	if (recv_cq->device != ib_dev)
+		return -EINVAL;
+
+	/*
+	 * SRQ is forward-compat: UVERBS_METHOD_RESTORE_SRQ is not
+	 * implemented at v0 (S6c), so any caller passing one is
+	 * rejected here. Plain RC/UD self-loopback (the v0 plugin
+	 * scope) does not exercise SRQ.
+	 */
+	if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_RESTORE_QP_SRQ_HANDLE))
+		return -EOPNOTSUPP;
+
+	uobj = rdma_alloc_begin_uobject_at_handle(attrs, UVERBS_OBJECT_QP,
+						  target_handle);
+	if (IS_ERR(uobj))
+		return PTR_ERR(uobj);
+	obj = container_of(uobj, struct ib_uqp_object, uevent.uobject);
+
+	INIT_LIST_HEAD(&obj->uevent.event_list);
+	INIT_LIST_HEAD(&obj->mcast_list);
+	mutex_init(&obj->mcast_lock);
+	obj->uevent.event_file =
+		ib_uverbs_get_async_event(attrs,
+					  UVERBS_ATTR_RESTORE_QP_EVENT_FD);
+	uobj->user_handle = user_handle;
+
+	qp = rdma_zalloc_drv_obj_numa(ib_dev, ib_qp);
+	if (!qp) {
+		ret = -ENOMEM;
+		goto err_event_file;
+	}
+
+	qp->device = ib_dev;
+	qp->pd = pd;
+	qp->uobject = obj;
+	qp->real_qp = qp;
+	qp->qp_type = qp_type;
+	qp->qp_num = 0;	/* driver fills in from UHW source qpn */
+	qp->srq = srq;
+	qp->event_handler = ib_qp_event_handler;
+	qp->registered_event_handler = ib_uverbs_qp_event_handler;
+	qp->qp_context = NULL;
+	qp->send_cq = send_cq;
+	qp->recv_cq = recv_cq;
+	atomic_set(&qp->usecnt, 0);
+
+	spin_lock_init(&qp->mr_lock);
+	xa_init(&qp->comp_cntrs);
+	INIT_LIST_HEAD(&qp->rdma_mrs);
+	INIT_LIST_HEAD(&qp->sig_mrs);
+	init_completion(&qp->srq_completion);
+
+	rdma_restrack_new(&qp->res, RDMA_RESTRACK_QP);
+	rdma_restrack_set_name(&qp->res, NULL);
+
+	kcap.max_send_wr = cap.max_send_wr;
+	kcap.max_recv_wr = cap.max_recv_wr;
+	kcap.max_send_sge = cap.max_send_sge;
+	kcap.max_recv_sge = cap.max_recv_sge;
+	kcap.max_inline_data = cap.max_inline_data;
+
+	ret = ib_dev->ops.restore_qp(qp, target_handle, &kcap, qp_state,
+				     create_flags, &attrs->driver_udata);
+	if (ret)
+		goto err_restrack;
+
+	ret = ib_create_qp_security(qp, ib_dev);
+	if (ret)
+		goto err_destroy;
+
+	rdma_restrack_add(&qp->res);
+	ib_qp_usecnt_inc(qp);
+
+	uobj->object = qp;
+	rdma_alloc_commit_uobject(uobj, attrs);
+
+	return uverbs_copy_to(attrs, UVERBS_ATTR_RESTORE_QP_RESP_QPN,
+			      &qp->qp_num, sizeof(qp->qp_num));
+
+err_destroy:
+	{
+		struct ib_udata dummy = {};
+
+		ib_dev->ops.destroy_qp(qp, &dummy);
+	}
+err_restrack:
+	rdma_restrack_put(&qp->res);
+	kfree(qp);
+err_event_file:
+	if (obj->uevent.event_file)
+		uverbs_uobject_put(&obj->uevent.event_file->uobj);
+	rdma_alloc_abort_uobject(uobj, attrs, false);
+	return ret;
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_RESTORE_QP,
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_QP_HANDLE,
+			   UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_IDR(UVERBS_ATTR_RESTORE_QP_PD_HANDLE,
+			UVERBS_OBJECT_PD,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_IDR(UVERBS_ATTR_RESTORE_QP_SEND_CQ_HANDLE,
+			UVERBS_OBJECT_CQ,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_IDR(UVERBS_ATTR_RESTORE_QP_RECV_CQ_HANDLE,
+			UVERBS_OBJECT_CQ,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_IDR(UVERBS_ATTR_RESTORE_QP_SRQ_HANDLE,
+			UVERBS_OBJECT_SRQ,
+			UVERBS_ACCESS_READ,
+			UA_OPTIONAL),
+	UVERBS_ATTR_CONST_IN(UVERBS_ATTR_RESTORE_QP_TYPE, enum ib_qp_type,
+			     UA_MANDATORY),
+	UVERBS_ATTR_CONST_IN(UVERBS_ATTR_RESTORE_QP_STATE, enum ib_qp_state,
+			     UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_QP_USER_HANDLE,
+			   UVERBS_ATTR_TYPE(__u64), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_QP_CAP,
+			   UVERBS_ATTR_STRUCT(struct ib_uverbs_qp_cap,
+					      max_inline_data),
+			   UA_MANDATORY),
+	UVERBS_ATTR_FLAGS_IN(UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS,
+			     enum ib_uverbs_qp_create_flags),
+	UVERBS_ATTR_FD(UVERBS_ATTR_RESTORE_QP_EVENT_FD,
+		       UVERBS_OBJECT_ASYNC_EVENT,
+		       UVERBS_ACCESS_READ,
+		       UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_RESTORE_QP_RESP_QPN,
+			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_UHW());
+
 DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_RESTORE,
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_PD),
 			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_MR),
-			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_CQ));
+			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_CQ),
+			      &UVERBS_METHOD(UVERBS_METHOD_RESTORE_QP));
 
 const struct uapi_definition uverbs_def_obj_restore[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_RESTORE),

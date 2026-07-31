@@ -327,6 +327,15 @@ struct ib_qp *ib_create_qp_user(struct ib_device *dev, struct ib_pd *pd,
 void ib_qp_usecnt_inc(struct ib_qp *qp);
 void ib_qp_usecnt_dec(struct ib_qp *qp);
 
+/*
+ * Two-stage QP event dispatch. Real handler installed by
+ * create_qp / restore_qp paths into qp->event_handler; calls into
+ * qp->registered_event_handler (the userspace-facing hook,
+ * ib_uverbs_qp_event_handler for uverbs) after the LAST_WQE_REACHED
+ * srq_completion bookkeeping. Defined in verbs.c.
+ */
+void ib_qp_event_handler(struct ib_event *event, void *context);
+
 struct rdma_dev_addr;
 
 int rdma_addr_find_l2_eth_by_grh(const union ib_gid *sgid,
