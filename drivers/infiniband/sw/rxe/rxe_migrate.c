@@ -7,10 +7,10 @@
  * UVERBS_OBJECT_RESTORE family; this object carries the dump-side queries
  * whose payloads are rxe-private.
  *
- * The object carries FREEZE_DATAPATH plus the dump-side query verbs
- * QUERY_QP and QUERY_CQ, the counterparts to UVERBS_METHOD_RESTORE_QP /
- * RESTORE_CQ. The query verbs emit only the drained subset of wire
- * state; the in-flight SQ/RQ/CQE ring images land with later slices.
+ * The object carries FREEZE_DATAPATH and FREEZE_CONTEXT plus the
+ * dump-side query verbs QUERY_QP and QUERY_CQ, the counterparts to
+ * UVERBS_METHOD_RESTORE_QP / RESTORE_CQ. FREEZE_DATAPATH parks one QP;
+ * FREEZE_CONTEXT parks every user QP owned by the calling uverbs fd.
  */
 
 #include <rdma/uverbs_ioctl.h>
@@ -79,6 +79,71 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_DATAPATH)(
 		rxe_qp_pause(qp);
 	else
 		rxe_qp_resume(qp);
+
+	return 0;
+}
+
+/*
+ * Ucontext-scoped freeze-all: pause (or resume) every user QP owned by
+ * the calling uverbs fd in a single call, for CRIU's early
+ * CHECKPOINT_DEVICES hook (one ioctl, before per-QP fds are dumped).
+ *
+ * A driver module cannot reach the core-internal ufile object walk, so
+ * the QP set is enumerated from rxe's own QP pool and filtered by owning
+ * ucontext. rxe_qp_pause() drains the worker tasks and can sleep, so we
+ * take a pool reference on each element under RCU and run the
+ * pause/resume outside the read-side critical section.
+ */
+static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_CONTEXT)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_ucontext *ucontext = ib_uverbs_get_ucontext(attrs);
+	struct rxe_pool_elem *elem;
+	unsigned long index = 0;
+	struct rxe_pool *pool;
+	struct rxe_dev *rxe;
+	u8 freeze;
+	int err;
+
+	if (IS_ERR(ucontext))
+		return PTR_ERR(ucontext);
+
+	err = uverbs_copy_from(&freeze, attrs,
+			       RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE);
+	if (err)
+		return err;
+
+	rxe = to_rdev(ucontext->device);
+	pool = &rxe->qp_pool;
+
+	rcu_read_lock();
+	for (elem = xa_find(&pool->xa, &index, ULONG_MAX, XA_PRESENT);
+	     elem;
+	     elem = xa_find_after(&pool->xa, &index, ULONG_MAX, XA_PRESENT)) {
+		struct rxe_qp *qp = elem->obj;
+
+		/* Pin across the (sleeping) pause; skip elems being freed. */
+		if (!kref_get_unless_zero(&elem->ref_cnt))
+			continue;
+		rcu_read_unlock();
+
+		/*
+		 * Only this ucontext's user QPs. Skip kernel QPs (no user
+		 * datapath) and QPs owned by other processes sharing the
+		 * device. Freezing is non-destructive (no IBTA transition),
+		 * so unlike the per-QP QUERY path there is no type gate.
+		 */
+		if (qp->is_user && ib_qp_ucontext(&qp->ibqp) == ucontext) {
+			if (freeze)
+				rxe_qp_pause(qp);
+			else
+				rxe_qp_resume(qp);
+		}
+
+		rxe_put(qp);
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
 
 	return 0;
 }
@@ -342,6 +407,12 @@ DECLARE_UVERBS_NAMED_METHOD(
 			   UA_MANDATORY));
 
 DECLARE_UVERBS_NAMED_METHOD(
+	RXE_IB_METHOD_FREEZE_CONTEXT,
+	UVERBS_ATTR_PTR_IN(RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE,
+			   UVERBS_ATTR_TYPE(u8),
+			   UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_QP,
 	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_QP_HANDLE,
 			UVERBS_OBJECT_QP,
@@ -380,7 +451,8 @@ DECLARE_UVERBS_GLOBAL_METHODS(
 	RXE_IB_OBJECT_MIGRATE,
 	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_DATAPATH),
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_QP),
-	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ));
+	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ),
+	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_CONTEXT));
 
 const struct uapi_definition rxe_migrate_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(RXE_IB_OBJECT_MIGRATE),

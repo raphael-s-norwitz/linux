@@ -4257,6 +4257,17 @@ int ib_query_qp(struct ib_qp *qp,
 u64 ib_qp_user_handle(const struct ib_qp *qp);
 
 /**
+ * ib_qp_ucontext - Returns the ucontext that owns a user-mode QP, or
+ * NULL for a kernel-mode QP. Same opacity rationale as
+ * ib_qp_user_handle(): `struct ib_qp.uobject` is the private
+ * `struct ib_uqp_object *`, so driver-side context-scoped verbs
+ * (e.g. rxe's `RXE_IB_METHOD_FREEZE_CONTEXT`) use this accessor to
+ * filter a QP pool by owning ucontext without reaching into the
+ * private struct.
+ */
+struct ib_ucontext *ib_qp_ucontext(const struct ib_qp *qp);
+
+/**
  * ib_destroy_qp - Destroys the specified QP.
  * @qp: The QP to destroy.
  * @udata: Valid udata or NULL for kernel objects
