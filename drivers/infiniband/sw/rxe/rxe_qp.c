@@ -596,6 +596,43 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
 	return 0;
 }
 
+/*
+ * Apply a non-drained QP's captured in-flight datapath onto the freshly
+ * created rings, after rxe_qp_restore_wire_state() has stamped the
+ * PSNs/AV/attrs. Each image is the [consumer, producer) subspan QUERY_QP
+ * emitted; queue_inflight_restore() scatters it back to the same absolute
+ * slots (validating the geometry against the cursors, -EINVAL on
+ * mismatch) so the resumed client's cached indices still point at the
+ * right WQEs. A drained QP has no image tail and never reaches here.
+ */
+int rxe_qp_restore_inflight(struct rxe_qp *qp,
+			    const struct rxe_restore_qp_req *req,
+			    const void *sq_image)
+{
+	int err;
+
+	if (sq_image) {
+		if (!qp->sq.queue)
+			return -EINVAL;
+		err = queue_inflight_restore(qp->sq.queue, req->sq_producer,
+					     req->sq_consumer, sq_image,
+					     req->sq_image_bytes);
+		if (err)
+			return err;
+		rxe_qp_seed_ring(qp->sq.queue, req->sq_producer,
+				 req->sq_consumer);
+		/*
+		 * Rewind the requester to the unacked tail so it replays the
+		 * whole [consumer, producer) window; the peer drops duplicate
+		 * PSNs. rxe_qp_resume() arms the retry that resets each
+		 * blitted WQE's DMA cursor before the send_task runs.
+		 */
+		qp->req.wqe_index = req->sq_consumer & qp->sq.queue->index_mask;
+	}
+
+	return 0;
+}
+
 /* called by the query qp verb */
 int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init)
 {

@@ -664,11 +664,49 @@ err_out:
  * directly at its captured final state via rxe_qp_restore_wire_state
  * with no ib_modify_qp chain.
  *
- * This v0 handler restores a *drained* QP only: the source is quiesced
- * with no in-flight WQEs, so the ring images are empty. A non-zero
- * sq/rq/res image tail is rejected (-EOPNOTSUPP) rather than silently
- * dropped -- in-flight WQE replay is a later slice.
+ * A drained source ships the fixed rxe_restore_qp_req header alone and
+ * takes the cursor-only fast path. A non-drained source appends its live
+ * ring image(s) in the UHW_IN tail (located by the header's
+ * {sq,rq,res}_image_bytes); rxe_restore_qp_inflight slices and applies
+ * them over the rings rxe_qp_from_init just built. Images not yet
+ * consumed by this handler are rejected (-EOPNOTSUPP) rather than
+ * silently dropped.
  */
+static int rxe_restore_qp_inflight(struct rxe_qp *qp,
+				   const struct rxe_restore_qp_req *req,
+				   struct ib_udata *udata)
+{
+	const void *sq_image = NULL;
+	const size_t hdr = sizeof(*req);
+	size_t tail, off;
+	void *buf;
+	int err;
+
+	tail = req->sq_image_bytes;
+	/* Caller only invokes this for a tail; a header-sized inlen is drained. */
+	if (tail == 0 || udata->inlen != hdr + tail)
+		return -EINVAL;
+
+	buf = kvmalloc(udata->inlen, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	err = ib_copy_from_udata(buf, udata, udata->inlen);
+	if (err)
+		goto out;
+
+	off = hdr;
+	if (req->sq_image_bytes) {
+		sq_image = buf + off;
+		off += req->sq_image_bytes;
+	}
+
+	err = rxe_qp_restore_inflight(qp, req, sq_image);
+out:
+	kvfree(buf);
+	return err;
+}
+
 static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 			  const struct ib_qp_cap *cap,
 			  enum ib_qp_state qp_state, u32 create_flags,
@@ -736,17 +774,15 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	}
 
 	/*
-	 * v0 restores a drained QP: reject any in-flight ring image. The
-	 * cursor fields are still honoured (a drained QP's producer ==
-	 * consumer), but a non-empty [consumer, producer) slot image means
-	 * the source had queued work we cannot replay yet.
+	 * The SQ in-flight image is applied below; the RQ and
+	 * responder-resource images land in later commits. Reject them rather
+	 * than silently dropping queued work we cannot yet replay.
 	 */
-	if (req.sq_image_bytes || req.rq_image_bytes || req.res_image_bytes) {
+	if (req.rq_image_bytes || req.res_image_bytes) {
 		err = -EOPNOTSUPP;
 		rxe_dbg_dev(rxe,
-			    "restore qp: in-flight image unsupported (sq=%u rq=%u res=%u)\n",
-			    req.sq_image_bytes, req.rq_image_bytes,
-			    req.res_image_bytes);
+			    "restore qp: rq/res image unsupported (rq=%u res=%u)\n",
+			    req.rq_image_bytes, req.res_image_bytes);
 		goto err_out;
 	}
 
@@ -799,6 +835,20 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	if (err) {
 		rxe_dbg_qp(qp, "restore qp wire state failed, err = %d\n", err);
 		goto err_cleanup;
+	}
+
+	/*
+	 * A UHW tail beyond the fixed header carries the source's in-flight
+	 * ring image(s); apply them over the rings rxe_qp_from_init built.
+	 * Drained restores skip this.
+	 */
+	if (udata->inlen > sizeof(req)) {
+		err = rxe_restore_qp_inflight(qp, &req, udata);
+		if (err) {
+			rxe_dbg_qp(qp, "restore qp inflight failed, err = %d\n",
+				   err);
+			goto err_cleanup;
+		}
 	}
 
 	rxe_finalize(qp);
