@@ -8,13 +8,19 @@
  *
  * RXE_IB_OBJECT_MIGRATE carries the rxe arm of the CRIU dump-side
  * choreography. Its methods run on a per-process uverbs fd. Method id +0
- * is FREEZE_DATAPATH; QUERY_QP is +1 and QUERY_CQ is +2. Method id +3
- * (FREEZE_CONTEXT) stays reserved for the in-flight restore slice.
+ * is FREEZE_DATAPATH; QUERY_QP is +1, QUERY_CQ is +2 and FREEZE_CONTEXT
+ * is +3.
  *
  *   FREEZE_DATAPATH  non-destructively park (freeze=1) or unpark
  *             (freeze=0) a QP's requester/responder tasks so the dumper
  *             can take a consistent PSN/cursor snapshot. Keyed by QP
  *             handle; the QP keeps its IBTA state (typically RTS).
+ *
+ *   FREEZE_CONTEXT  ucontext-scoped freeze-all: one call parks (freeze=1)
+ *             or unparks (freeze=0) every user QP owned by the calling
+ *             uverbs fd, for CRIU's early CHECKPOINT_DEVICES hook (before
+ *             per-QP fds are resolved). Handle-less; enumerates rxe's QP
+ *             pool filtered by owning ucontext.
  *
  *   QUERY_QP  dump-side counterpart to UVERBS_METHOD_RESTORE_QP: pack the
  *             full rxe wire state (AV, PSNs, cursors, transport attrs,
@@ -48,18 +54,32 @@ enum rxe_ib_objects {
 };
 
 enum rxe_ib_migrate_methods {
-	/*
-	 * FREEZE_DATAPATH is +0, QUERY_QP +1, QUERY_CQ +2. Method +3
-	 * (FREEZE_CONTEXT) stays reserved for the in-flight restore slice.
-	 */
+	/* FREEZE_DATAPATH is +0, QUERY_QP +1, QUERY_CQ +2, FREEZE_CONTEXT +3. */
 	RXE_IB_METHOD_FREEZE_DATAPATH = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_METHOD_QUERY_QP = (1U << UVERBS_ID_NS_SHIFT) + 1,
 	RXE_IB_METHOD_QUERY_CQ = (1U << UVERBS_ID_NS_SHIFT) + 2,
+	RXE_IB_METHOD_FREEZE_CONTEXT = (1U << UVERBS_ID_NS_SHIFT) + 3,
 };
 
 enum rxe_ib_freeze_datapath_attrs {
 	RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE,
+};
+
+/*
+ * FREEZE_CONTEXT is the ucontext-scoped freeze-all: a single call that
+ * pauses (or resumes) every user QP owned by the calling uverbs fd, so
+ * CRIU can quiesce the whole RDMA datapath at the early
+ * CHECKPOINT_DEVICES hook with one ioctl, before per-QP fds are
+ * resolved/dumped. It takes no QP handle -- the caller is identified by
+ * ib_uverbs_get_ucontext() and the QP set is enumerated from rxe's own
+ * QP pool filtered by owning ucontext (a driver cannot reach the
+ * core-internal ufile object walk). Idempotent and order-independent vs
+ * FREEZE_DATAPATH (both drive the same per-QP rxe_qp_pause/resume).
+ * @FREEZE selects pause (1) / resume (0).
+ */
+enum rxe_ib_freeze_context_attrs {
+	RXE_IB_ATTR_FREEZE_CONTEXT_FREEZE = (1U << UVERBS_ID_NS_SHIFT),
 };
 
 enum rxe_ib_query_qp_attrs {

@@ -2131,6 +2131,24 @@ u64 ib_qp_user_handle(const struct ib_qp *qp)
 }
 EXPORT_SYMBOL(ib_qp_user_handle);
 
+/**
+ * ib_qp_ucontext - Returns the ucontext that owns a user-mode QP, or
+ * NULL for a kernel-mode QP.
+ *
+ * Same opacity rationale as ib_qp_user_handle(): `struct ib_qp.uobject`
+ * is the private `struct ib_uqp_object *`, so driver code cannot reach
+ * `qp->uobject->uevent.uobject.context` directly. Used by context-scoped
+ * dump-side verbs (e.g. rxe's RXE_IB_METHOD_FREEZE_CONTEXT) to filter a
+ * driver's QP pool down to the QPs owned by the calling uverbs fd.
+ */
+struct ib_ucontext *ib_qp_ucontext(const struct ib_qp *qp)
+{
+	if (!qp->uobject)
+		return NULL;
+	return qp->uobject->uevent.uobject.context;
+}
+EXPORT_SYMBOL(ib_qp_ucontext);
+
 int ib_close_qp(struct ib_qp *qp)
 {
 	struct ib_qp *real_qp;
