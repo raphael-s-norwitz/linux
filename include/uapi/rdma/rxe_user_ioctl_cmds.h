@@ -85,6 +85,14 @@ enum rxe_ib_query_qp_attrs {
 	 * the following commit.
 	 */
 	RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
+	/*
+	 * In-flight responder-resources image (optional): the RC responder's
+	 * max_dest_rd_atomic-entry duplicate-read / atomic replay table,
+	 * emitted verbatim. Byte length is reported in
+	 * rxe_restore_qp_req::res_image_bytes; absent for a drained QP or one
+	 * with no inbound RDMA-read/atomic capacity.
+	 */
+	RXE_IB_ATTR_QUERY_QP_RESP_RES,
 };
 
 enum rxe_ib_query_cq_attrs {

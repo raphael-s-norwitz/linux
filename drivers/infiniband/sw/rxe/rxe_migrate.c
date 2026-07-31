@@ -123,6 +123,29 @@ static int rxe_query_emit_ring(struct uverbs_attr_bundle *attrs, u16 attr_id,
 	return ret;
 }
 
+/*
+ * Emit one optional fixed-length image attr verbatim (no ring cursors).
+ * Used for the responder-resources array, which is a plain
+ * max_dest_rd_atomic-entry table, not a producer/consumer ring. Same
+ * optional / too-small-is-fatal contract as rxe_query_emit_ring().
+ */
+static int rxe_query_emit_image(struct uverbs_attr_bundle *attrs, u16 attr_id,
+				const void *data, u32 len)
+{
+	int user_len;
+
+	if (!uverbs_attr_is_valid(attrs, attr_id) || len == 0)
+		return 0;
+
+	user_len = uverbs_attr_get_len(attrs, attr_id);
+	if (user_len < 0)
+		return 0;
+	if ((u32)user_len < len)
+		return -ENOSPC;
+
+	return uverbs_copy_to(attrs, attr_id, data, len);
+}
+
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	struct uverbs_attr_bundle *attrs)
 {
@@ -184,8 +207,9 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	 * [consumer, producer) work and {sq,rq}_image_bytes is that subspan's
 	 * byte length (0 for a drained ring, where producer == consumer). An
 	 * SRQ-fed QP has no private receive queue, so its RQ cursors stay
-	 * zero. The responder group lands in the next commit and stays zero
-	 * here, so the drained dump path is unchanged.
+	 * zero. The responder scalars + resources array below carry the RC
+	 * duplicate-read / atomic replay state. All these stay zero for a
+	 * drained QP, so the drained dump path is unchanged.
 	 */
 	blob.sq_producer = queue_get_producer(qp->sq.queue, qp->sq.queue->type);
 	blob.sq_consumer = queue_get_consumer(qp->sq.queue, qp->sq.queue->type);
@@ -202,6 +226,16 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 				       qp->rq.queue->index_mask)
 				      << qp->rq.queue->log2_elem_size;
 	}
+
+	blob.resp_ack_psn	= qp->resp.ack_psn;
+	blob.resp_opcode	= qp->resp.opcode;
+	blob.resp_status	= qp->resp.status;
+	blob.resp_aeth_syndrome	= qp->resp.aeth_syndrome;
+	blob.res_head		= qp->resp.res_head;
+	blob.res_tail		= qp->resp.res_tail;
+	if (qp->resp.resources && qp->attr.max_dest_rd_atomic)
+		blob.res_image_bytes = qp->attr.max_dest_rd_atomic *
+				       sizeof(struct resp_res);
 
 	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 			     &blob, sizeof(blob));
@@ -220,10 +254,10 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 		return err;
 
 	/*
-	 * In-flight SQ/RQ ring images (optional PTR_OUT): the live
-	 * [consumer, producer) subspans, round-tripped opaquely into the
-	 * RESTORE_QP UHW_IN tail. Each is a no-op when its subspan is empty
-	 * or the dumper didn't request the attr.
+	 * In-flight images (optional PTR_OUT attrs): the live SQ/RQ ring
+	 * subspans and the responder-resources array, round-tripped opaquely
+	 * into the RESTORE_QP UHW_IN tail. Each is a no-op when its byte
+	 * count is zero (drained) or the dumper didn't request the attr.
 	 */
 	err = rxe_query_emit_ring(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
 				  qp->sq.queue, blob.sq_producer,
@@ -231,13 +265,17 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	if (err)
 		return err;
 
-	if (qp->rq.queue && !qp->srq)
-		return rxe_query_emit_ring(attrs,
-					   RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
-					   qp->rq.queue, blob.rq_producer,
-					   blob.rq_consumer);
+	if (qp->rq.queue && !qp->srq) {
+		err = rxe_query_emit_ring(attrs,
+					  RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
+					  qp->rq.queue, blob.rq_producer,
+					  blob.rq_consumer);
+		if (err)
+			return err;
+	}
 
-	return 0;
+	return rxe_query_emit_image(attrs, RXE_IB_ATTR_QUERY_QP_RESP_RES,
+				    qp->resp.resources, blob.res_image_bytes);
 }
 
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
@@ -319,6 +357,9 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_MIN_SIZE(0),
 			    UA_OPTIONAL),
 	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
+			    UVERBS_ATTR_MIN_SIZE(0),
+			    UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_RES,
 			    UVERBS_ATTR_MIN_SIZE(0),
 			    UA_OPTIONAL));
 
