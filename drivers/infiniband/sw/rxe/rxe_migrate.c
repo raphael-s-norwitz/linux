@@ -180,17 +180,28 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 	blob.ssn		= atomic_read(&qp->ssn);
 
 	/*
-	 * In-flight SQ ring: the cursors locate the live [consumer, producer)
-	 * send work and sq_image_bytes is that subspan's byte length (0 for a
-	 * drained ring, where producer == consumer). The RQ and responder
-	 * groups land in following commits and stay zero here, so the drained
-	 * dump path is unchanged.
+	 * In-flight SQ/RQ rings: the cursors locate the live
+	 * [consumer, producer) work and {sq,rq}_image_bytes is that subspan's
+	 * byte length (0 for a drained ring, where producer == consumer). An
+	 * SRQ-fed QP has no private receive queue, so its RQ cursors stay
+	 * zero. The responder group lands in the next commit and stays zero
+	 * here, so the drained dump path is unchanged.
 	 */
 	blob.sq_producer = queue_get_producer(qp->sq.queue, qp->sq.queue->type);
 	blob.sq_consumer = queue_get_consumer(qp->sq.queue, qp->sq.queue->type);
 	blob.sq_image_bytes = ((blob.sq_producer - blob.sq_consumer) &
 			       qp->sq.queue->index_mask)
 			      << qp->sq.queue->log2_elem_size;
+
+	if (qp->rq.queue && !qp->srq) {
+		blob.rq_producer = queue_get_producer(qp->rq.queue,
+						      qp->rq.queue->type);
+		blob.rq_consumer = queue_get_consumer(qp->rq.queue,
+						      qp->rq.queue->type);
+		blob.rq_image_bytes = ((blob.rq_producer - blob.rq_consumer) &
+				       qp->rq.queue->index_mask)
+				      << qp->rq.queue->log2_elem_size;
+	}
 
 	err = uverbs_copy_to(attrs, RXE_IB_ATTR_QUERY_QP_RESP_BLOB,
 			     &blob, sizeof(blob));
@@ -209,14 +220,24 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
 		return err;
 
 	/*
-	 * In-flight SQ ring image (optional PTR_OUT): the live [consumer,
-	 * producer) subspan, round-tripped opaquely into the RESTORE_QP
-	 * UHW_IN tail. A no-op when the subspan is empty or the dumper didn't
-	 * request the attr.
+	 * In-flight SQ/RQ ring images (optional PTR_OUT): the live
+	 * [consumer, producer) subspans, round-tripped opaquely into the
+	 * RESTORE_QP UHW_IN tail. Each is a no-op when its subspan is empty
+	 * or the dumper didn't request the attr.
 	 */
-	return rxe_query_emit_ring(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
-				   qp->sq.queue, blob.sq_producer,
-				   blob.sq_consumer);
+	err = rxe_query_emit_ring(attrs, RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+				  qp->sq.queue, blob.sq_producer,
+				  blob.sq_consumer);
+	if (err)
+		return err;
+
+	if (qp->rq.queue && !qp->srq)
+		return rxe_query_emit_ring(attrs,
+					   RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
+					   qp->rq.queue, blob.rq_producer,
+					   blob.rq_consumer);
+
+	return 0;
 }
 
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
@@ -295,6 +316,9 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(u64),
 			    UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_SQ_IMAGE,
+			    UVERBS_ATTR_MIN_SIZE(0),
+			    UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(RXE_IB_ATTR_QUERY_QP_RESP_RQ_IMAGE,
 			    UVERBS_ATTR_MIN_SIZE(0),
 			    UA_OPTIONAL));
 
