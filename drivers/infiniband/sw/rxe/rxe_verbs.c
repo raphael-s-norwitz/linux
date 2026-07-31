@@ -666,9 +666,10 @@ err_out:
  *
  * A drained source ships the fixed rxe_restore_qp_req header alone and
  * takes the cursor-only fast path. A non-drained source appends its live
- * SQ/RQ ring and responder-resource images in the UHW_IN tail (located by
- * the header's {sq,rq,res}_image_bytes); rxe_restore_qp_inflight slices
- * and applies them over the rings rxe_qp_from_init just built.
+ * SQ/RQ ring subspans and responder-resources array in the UHW_IN tail
+ * (located by the header's {sq,rq,res}_image_bytes); rxe_restore_qp_inflight
+ * slices and applies them. The restored QP is installed datapath-frozen
+ * so the replay does not fire until the orchestrator thaws the ucontext.
  */
 static int rxe_restore_qp_inflight(struct rxe_qp *qp,
 				   const struct rxe_restore_qp_req *req,
@@ -831,8 +832,8 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 
 	/*
 	 * A UHW tail beyond the fixed header carries the source's in-flight
-	 * ring image(s); apply them over the rings rxe_qp_from_init built.
-	 * Drained restores skip this.
+	 * SQ/RQ ring images + responder resources; apply them over the rings
+	 * rxe_qp_from_init just built. Drained restores skip this.
 	 */
 	if (udata->inlen > sizeof(req)) {
 		err = rxe_restore_qp_inflight(qp, &req, udata);
@@ -842,6 +843,21 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 			goto err_cleanup;
 		}
 	}
+
+	/*
+	 * Install the QP datapath-frozen, before rxe_finalize() makes it
+	 * reachable to rxe_rcv(). Neither the requester nor the responder
+	 * runs until the orchestrator thaws the whole ucontext with
+	 * FREEZE_CONTEXT(freeze=0) once the restore tree is consistent.
+	 *
+	 * Do NOT kick send_task here to replay a restored in-flight window:
+	 * at this point the rest of the tree is still being rebuilt -- peer
+	 * QPs may not exist yet and SGE-referenced MR pages are not populated
+	 * until CRIU's post-VMA phase -- so transmitting now would fire at a
+	 * nonexistent peer (retry burst) or put stale bytes on the wire. The
+	 * replay is driven from rxe_qp_resume() at thaw instead.
+	 */
+	rxe_qp_pause(qp);
 
 	rxe_finalize(qp);
 	return 0;
