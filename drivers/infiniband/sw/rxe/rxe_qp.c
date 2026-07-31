@@ -736,6 +736,63 @@ static void rxe_qp_reset(struct rxe_qp *qp)
 	rxe_enable_task(&qp->send_task);
 }
 
+/*
+ * CRIU dump (S6a): non-destructively freeze a QP's datapath so a
+ * consistent PSN/cursor snapshot can be taken. Unlike rxe_qp_reset /
+ * rxe_qp_error this touches NO IBTA state -- it only drains and parks
+ * the requester/completer (send_task) and responder (recv_task) work
+ * so no packet/WQE processing advances the PSNs mid-snapshot. Mirrors
+ * mlx5's SAVE_VHCA_STATE freeze; the QP stays in whatever state it was
+ * (typically RTS) and ibv_query_qp still reports that state.
+ *
+ * rxe_disable_task drains any in-flight run and blocks until the task
+ * is quiescent, so on return the datapath is guaranteed idle.
+ */
+void rxe_qp_pause(struct rxe_qp *qp)
+{
+	unsigned long flags;
+
+	/*
+	 * Idempotent: a redundant freeze must not re-run. dp_frozen pairs
+	 * with rxe_qp_resume so the enable/disable refcount stays matched.
+	 */
+	spin_lock_irqsave(&qp->state_lock, flags);
+	if (qp->dp_frozen) {
+		spin_unlock_irqrestore(&qp->state_lock, flags);
+		rxe_dbg_qp(qp, "freeze: already frozen (redundant)\n");
+		return;
+	}
+	qp->dp_frozen = true;
+	spin_unlock_irqrestore(&qp->state_lock, flags);
+
+	rxe_disable_task(&qp->send_task);
+	rxe_disable_task(&qp->recv_task);
+
+	/*
+	 * Leave the QP with empty packet queues so it can be queried,
+	 * resumed or destroyed without a leaked reference. check_type_state()
+	 * now drops inbound packets once dp_frozen is visible, but a packet
+	 * that read dp_frozen == false just before the store above can still
+	 * be queued onto req_pkts/resp_pkts after rxe_disable_task() parked
+	 * the tasks -- and every queued skb pins a QP reference that the
+	 * parked responder/completer will never release (the destroy path
+	 * would then block in __rxe_cleanup until the refcount timeout).
+	 *
+	 * synchronize_net() waits out any rxe_rcv() softirq already in
+	 * flight, so once it returns no further skb can be enqueued (newer
+	 * receives observe dp_frozen and are dropped). Draining afterward
+	 * therefore empties the queues for good. The pre-freeze backlog was
+	 * already consumed by rxe_disable_task() above; this only mops up the
+	 * race stragglers. The dropped packets are recovered by the RC peer's
+	 * retransmit after thaw.
+	 */
+	synchronize_net();
+	rxe_drain_req_pkts(qp);
+	rxe_drain_resp_pkts(qp);
+
+	rxe_dbg_qp(qp, "freeze: parked, state=%d\n", qp_state(qp));
+}
+
 /* move the qp to the error state */
 void rxe_qp_error(struct rxe_qp *qp)
 {

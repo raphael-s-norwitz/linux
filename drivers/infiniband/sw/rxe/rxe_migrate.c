@@ -7,10 +7,10 @@
  * UVERBS_OBJECT_RESTORE family; this object carries the dump-side queries
  * whose payloads are rxe-private.
  *
- * The object carries the dump-side query verbs: QUERY_QP and QUERY_CQ,
- * the counterparts to UVERBS_METHOD_RESTORE_QP / RESTORE_CQ. Both emit
- * only the drained subset of wire state; FREEZE_DATAPATH and the
- * in-flight SQ/RQ/CQE ring images land with later migration slices.
+ * The object carries FREEZE_DATAPATH plus the dump-side query verbs
+ * QUERY_QP and QUERY_CQ, the counterparts to UVERBS_METHOD_RESTORE_QP /
+ * RESTORE_CQ. The query verbs emit only the drained subset of wire
+ * state; the in-flight SQ/RQ/CQE ring images land with later slices.
  */
 
 #include <rdma/uverbs_ioctl.h>
@@ -39,6 +39,49 @@ static int rxe_migrate_chk_qp_type(const struct ib_qp *ibqp)
 	default:
 		return -EOPNOTSUPP;
 	}
+}
+
+/*
+ * FREEZE_DATAPATH: non-destructively park (freeze=1) or unpark
+ * (freeze=0) a user QP's datapath so the dumper can take a coherent
+ * PSN/cursor snapshot. rxe_qp_pause/resume are idempotent, so a repeated
+ * freeze or thaw is harmless.
+ */
+static int UVERBS_HANDLER(RXE_IB_METHOD_FREEZE_DATAPATH)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_qp *ibqp;
+	struct rxe_qp *qp;
+	u8 freeze;
+	int err;
+
+	ibqp = uverbs_attr_get_obj(attrs,
+				   RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE);
+	if (IS_ERR(ibqp))
+		return PTR_ERR(ibqp);
+
+	err = rxe_migrate_chk_qp_type(ibqp);
+	if (err)
+		return err;
+
+	err = uverbs_copy_from(&freeze, attrs,
+			       RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE);
+	if (err)
+		return err;
+
+	qp = to_rqp(ibqp);
+
+	/* Only user QPs carry the datapath CRIU freezes. */
+	if (!qp->is_user)
+		return -ENXIO;
+
+	/* Thaw (freeze=0) lands with rxe_qp_resume in the next commit. */
+	if (!freeze)
+		return -EOPNOTSUPP;
+
+	rxe_qp_pause(qp);
+
+	return 0;
 }
 
 static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_QP)(
@@ -214,6 +257,16 @@ static int UVERBS_HANDLER(RXE_IB_METHOD_QUERY_CQ)(
 }
 
 DECLARE_UVERBS_NAMED_METHOD(
+	RXE_IB_METHOD_FREEZE_DATAPATH,
+	UVERBS_ATTR_IDR(RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE,
+			UVERBS_OBJECT_QP,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE,
+			   UVERBS_ATTR_TYPE(u8),
+			   UA_MANDATORY));
+
+DECLARE_UVERBS_NAMED_METHOD(
 	RXE_IB_METHOD_QUERY_QP,
 	UVERBS_ATTR_IDR(RXE_IB_ATTR_QUERY_QP_HANDLE,
 			UVERBS_OBJECT_QP,
@@ -241,6 +294,7 @@ DECLARE_UVERBS_NAMED_METHOD(
 
 DECLARE_UVERBS_GLOBAL_METHODS(
 	RXE_IB_OBJECT_MIGRATE,
+	&UVERBS_METHOD(RXE_IB_METHOD_FREEZE_DATAPATH),
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_QP),
 	&UVERBS_METHOD(RXE_IB_METHOD_QUERY_CQ));
 
