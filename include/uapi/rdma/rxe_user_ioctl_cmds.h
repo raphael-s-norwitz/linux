@@ -8,9 +8,13 @@
  *
  * RXE_IB_OBJECT_MIGRATE carries the rxe arm of the CRIU dump-side
  * choreography. Its methods run on a per-process uverbs fd. Method id +0
- * (FREEZE_DATAPATH) and +3 (FREEZE_CONTEXT) are reserved for the freeze
- * slice; QUERY_QP is +1 and QUERY_CQ is +2, so both query ids stay
- * stable when freeze lands.
+ * is FREEZE_DATAPATH; QUERY_QP is +1 and QUERY_CQ is +2. Method id +3
+ * (FREEZE_CONTEXT) stays reserved for the in-flight restore slice.
+ *
+ *   FREEZE_DATAPATH  non-destructively park (freeze=1) or unpark
+ *             (freeze=0) a QP's requester/responder tasks so the dumper
+ *             can take a consistent PSN/cursor snapshot. Keyed by QP
+ *             handle; the QP keeps its IBTA state (typically RTS).
  *
  *   QUERY_QP  dump-side counterpart to UVERBS_METHOD_RESTORE_QP: pack the
  *             full rxe wire state (AV, PSNs, cursors, transport attrs,
@@ -45,12 +49,17 @@ enum rxe_ib_objects {
 
 enum rxe_ib_migrate_methods {
 	/*
-	 * +0 (FREEZE_DATAPATH) and +3 (FREEZE_CONTEXT) are reserved for the
-	 * freeze slice; QUERY_QP is pinned to +1 and QUERY_CQ to +2 so both
-	 * query ids stay stable when freeze lands.
+	 * FREEZE_DATAPATH is +0, QUERY_QP +1, QUERY_CQ +2. Method +3
+	 * (FREEZE_CONTEXT) stays reserved for the in-flight restore slice.
 	 */
+	RXE_IB_METHOD_FREEZE_DATAPATH = (1U << UVERBS_ID_NS_SHIFT),
 	RXE_IB_METHOD_QUERY_QP = (1U << UVERBS_ID_NS_SHIFT) + 1,
 	RXE_IB_METHOD_QUERY_CQ = (1U << UVERBS_ID_NS_SHIFT) + 2,
+};
+
+enum rxe_ib_freeze_datapath_attrs {
+	RXE_IB_ATTR_FREEZE_DATAPATH_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	RXE_IB_ATTR_FREEZE_DATAPATH_FREEZE,
 };
 
 enum rxe_ib_query_qp_attrs {
