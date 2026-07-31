@@ -607,7 +607,7 @@ int rxe_qp_restore_wire_state(struct rxe_qp *qp,
  */
 int rxe_qp_restore_inflight(struct rxe_qp *qp,
 			    const struct rxe_restore_qp_req *req,
-			    const void *sq_image)
+			    const void *sq_image, const void *rq_image)
 {
 	int err;
 
@@ -628,6 +628,18 @@ int rxe_qp_restore_inflight(struct rxe_qp *qp,
 		 * blitted WQE's DMA cursor before the send_task runs.
 		 */
 		qp->req.wqe_index = req->sq_consumer & qp->sq.queue->index_mask;
+	}
+
+	if (rq_image) {
+		if (!qp->rq.queue || qp->srq)
+			return -EINVAL;
+		err = queue_inflight_restore(qp->rq.queue, req->rq_producer,
+					     req->rq_consumer, rq_image,
+					     req->rq_image_bytes);
+		if (err)
+			return err;
+		rxe_qp_seed_ring(qp->rq.queue, req->rq_producer,
+				 req->rq_consumer);
 	}
 
 	return 0;

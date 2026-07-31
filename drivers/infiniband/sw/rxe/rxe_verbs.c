@@ -676,13 +676,13 @@ static int rxe_restore_qp_inflight(struct rxe_qp *qp,
 				   const struct rxe_restore_qp_req *req,
 				   struct ib_udata *udata)
 {
-	const void *sq_image = NULL;
+	const void *sq_image = NULL, *rq_image = NULL;
 	const size_t hdr = sizeof(*req);
 	size_t tail, off;
 	void *buf;
 	int err;
 
-	tail = req->sq_image_bytes;
+	tail = (size_t)req->sq_image_bytes + req->rq_image_bytes;
 	/* Caller only invokes this for a tail; a header-sized inlen is drained. */
 	if (tail == 0 || udata->inlen != hdr + tail)
 		return -EINVAL;
@@ -700,8 +700,12 @@ static int rxe_restore_qp_inflight(struct rxe_qp *qp,
 		sq_image = buf + off;
 		off += req->sq_image_bytes;
 	}
+	if (req->rq_image_bytes) {
+		rq_image = buf + off;
+		off += req->rq_image_bytes;
+	}
 
-	err = rxe_qp_restore_inflight(qp, req, sq_image);
+	err = rxe_qp_restore_inflight(qp, req, sq_image, rq_image);
 out:
 	kvfree(buf);
 	return err;
@@ -774,15 +778,15 @@ static int rxe_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	}
 
 	/*
-	 * The SQ in-flight image is applied below; the RQ and
-	 * responder-resource images land in later commits. Reject them rather
-	 * than silently dropping queued work we cannot yet replay.
+	 * The SQ and RQ in-flight images are applied below; the
+	 * responder-resource image lands in the next commit. Reject it rather
+	 * than silently dropping replay state we cannot yet restore.
 	 */
-	if (req.rq_image_bytes || req.res_image_bytes) {
+	if (req.res_image_bytes) {
 		err = -EOPNOTSUPP;
 		rxe_dbg_dev(rxe,
-			    "restore qp: rq/res image unsupported (rq=%u res=%u)\n",
-			    req.rq_image_bytes, req.res_image_bytes);
+			    "restore qp: res image unsupported (res=%u)\n",
+			    req.res_image_bytes);
 		goto err_out;
 	}
 
