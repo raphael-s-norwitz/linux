@@ -16,6 +16,27 @@ config MLX5_CORE
 	  Core driver for low level functionality of the ConnectX-4 and
 	  Connect-IB cards by Mellanox Technologies.
 
+config MLX5_VFMIG
+	bool "Mellanox MLX5 host-driven VF migration / CRIU restore plumbing"
+	depends on MLX5_CORE
+	default y
+	help
+	  Builds the in-driver SAVE+LOAD plumbing for mlx5 SR-IOV VFs that
+	  is exposed as a per-PF char device at /dev/mlx5_vfmig/<pf-bdf>.
+	  This is the host-driver side of a CRIU-style checkpoint/restore
+	  flow for RDMA workloads -- it lets a PF mlx5_core snapshot a VF's
+	  firmware state into an opaque blob and apply it to a freshly
+	  re-provisioned VF on the same or another host without going
+	  through a guest VM. UAPI lives in include/uapi/linux/mlx5_vfmig.h.
+
+	  Disabling this option compiles out the vfmig.c subsystem
+	  entirely: no cdev appears, no per-VF tracking state is allocated,
+	  and the mlx5_core probe path is bit-identical to a tree without
+	  any of this work. Safe to disable when migration support is not
+	  needed.
+
+	  If unsure, say Y.
+
 config MLX5_FPGA
 	bool "Mellanox Technologies Innova support"
 	depends on MLX5_CORE
