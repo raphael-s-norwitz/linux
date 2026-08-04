@@ -865,6 +865,21 @@ struct mlx5_vfmig_save_ctx {
 	struct mutex io_lock;		/* serializes concurrent read()s */
 	u32 vf_id;
 	u16 vhca_id;
+	u32 flags;			/* MLX5_VFMIG_SAVE_FLAG_* */
+
+	/*
+	 * Transient suspend bookkeeping for the self-suspend / resume-on-
+	 * close policy. @owns_suspend is true only when this SAVE session
+	 * issued the SUSPEND itself (the VF was RUNNING/P2P at open); it is
+	 * false when the caller pre-parked the VF to STOP via SUSPEND_VHCA,
+	 * in which case the caller owns the matching RESUME_VHCA and close()
+	 * must not auto-resume. The suspended_* bools track which ladder
+	 * steps this session actually issued, so close() (or the setup error
+	 * path) undoes exactly those.
+	 */
+	bool owns_suspend;
+	bool suspended_initiator;
+	bool suspended_responder;
 
 	/* Firmware-tied resources, mutated under vfmig->lock. */
 	bool resources_freed;
@@ -1012,6 +1027,28 @@ static void vfmig_save_release_resources(struct mlx5_vfmig_save_ctx *ctx)
 		mlx5_core_dealloc_pd(pf_mdev, ctx->pdn);
 		ctx->pd_allocated = false;
 	}
+
+	/*
+	 * Resume-on-close, inverse order of suspend (responder then
+	 * initiator). Only undo suspends this session owns and issued, and
+	 * only when the caller did not ask to keep the VF parked
+	 * (KEEP_SUSPENDED). Best-effort: a failed resume is logged, not
+	 * propagated -- the blob is already drained. The suspended_* bools
+	 * guard against a stray RESUME if the SUSPEND never landed.
+	 */
+	if (!ctx->owns_suspend)
+		return;
+	if (ctx->flags & MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED)
+		return;
+
+	if (ctx->suspended_responder) {
+		vfmig_dp_resume_step(pf_mdev, ctx->vhca_id, MLX5_VFMIG_DP_STOP);
+		ctx->suspended_responder = false;
+	}
+	if (ctx->suspended_initiator) {
+		vfmig_dp_resume_step(pf_mdev, ctx->vhca_id, MLX5_VFMIG_DP_P2P);
+		ctx->suspended_initiator = false;
+	}
 }
 
 static int vfmig_save_release(struct inode *inode, struct file *filp)
@@ -1053,10 +1090,10 @@ static bool vfmig_vf_id_save_busy_locked(struct mlx5_vfmig_pf *vfmig, u32 vf_id)
 }
 
 /*
- * Set up a SAVE session on a VF already quiesced to STOP: resolve vhca_id,
- * size the snapshot, allocate a PD + image pages + MKEY, run
- * SAVE_VHCA_STATE, then hand back a read-only anon-inode fd. Caller holds
- * vfmig->lock for read.
+ * Set up a SAVE session: resolve vhca_id, quiesce the VF to STOP (owning
+ * and later undoing only the ladder steps this session issues), size the
+ * snapshot, allocate a PD + image pages + MKEY, run SAVE_VHCA_STATE, then
+ * hand back a read-only anon-inode fd. Caller holds vfmig->lock for read.
  */
 static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 				      void __user *uarg)
@@ -1075,20 +1112,12 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.flags || arg.reserved)
+	if (arg.reserved || (arg.flags & ~MLX5_VFMIG_SAVE_FLAG_ALL))
 		return -EINVAL;
 
 	sriov = &pf_mdev->priv.sriov;
 	if (arg.vf_id >= sriov->num_vfs)
 		return -EINVAL;
-
-	/* SAVE captures a stopped VHCA; quiesce it first via SUSPEND_VHCA. */
-	if (sriov->vfs_ctx[arg.vf_id].vfmig_dp_state != MLX5_VFMIG_DP_STOP) {
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: vf %u must be suspended to STOP before SAVE\n",
-			       arg.vf_id);
-		return -EINVAL;
-	}
 
 	err = vfmig_check_pf_migration_caps(pf_mdev);
 	if (err)
@@ -1116,6 +1145,7 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	mutex_init(&ctx->io_lock);
 	ctx->vf_id = arg.vf_id;
 	ctx->vhca_id = vhca_id;
+	ctx->flags = arg.flags;
 
 	/* Claim vf_id atomically vs other SAVE sessions. */
 	mutex_lock(&vfmig->ctxs_lock);
@@ -1133,6 +1163,44 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	if (err)
 		goto err_res;
 	ctx->pd_allocated = true;
+
+	/*
+	 * Quiesce to STOP for the capture, owning only the steps we issue:
+	 *   - STOP already (explicit SUSPEND_VHCA): do nothing; the caller
+	 *     owns the resume via RESUME_VHCA.
+	 *   - P2P (explicit SUSPEND_VHCA(INITIATOR)): suspend the responder
+	 *     only, and resume just that on close.
+	 *   - RUNNING (standalone SAVE): suspend both directions and resume
+	 *     both on close.
+	 * The persistent vfmig_dp_state is owned by SUSPEND/RESUME_VHCA and
+	 * left untouched: SAVE's suspend is transient and undone on close.
+	 */
+	switch (sriov->vfs_ctx[arg.vf_id].vfmig_dp_state) {
+	case MLX5_VFMIG_DP_STOP:
+		ctx->owns_suspend = false;
+		break;
+	case MLX5_VFMIG_DP_P2P:
+		ctx->owns_suspend = true;
+		err = vfmig_dp_suspend_step(pf_mdev, vhca_id,
+					    MLX5_VFMIG_DP_P2P);
+		if (err)
+			goto err_res;
+		ctx->suspended_responder = true;
+		break;
+	default: /* MLX5_VFMIG_DP_RUNNING */
+		ctx->owns_suspend = true;
+		err = vfmig_dp_suspend_step(pf_mdev, vhca_id,
+					    MLX5_VFMIG_DP_RUNNING);
+		if (err)
+			goto err_res;
+		ctx->suspended_initiator = true;
+		err = vfmig_dp_suspend_step(pf_mdev, vhca_id,
+					    MLX5_VFMIG_DP_P2P);
+		if (err)
+			goto err_res;
+		ctx->suspended_responder = true;
+		break;
+	}
 
 	err = vfmig_cmd_query_vhca_migration_state(pf_mdev, vhca_id,
 						   &query_size);
@@ -1227,6 +1295,13 @@ err_file:
 err_fd:
 	put_unused_fd(fd);
 err_res:
+	/*
+	 * Setup failed and no fd escapes, so fully restore the VF: drop
+	 * KEEP_SUSPENDED before teardown so release_resources unwinds any
+	 * suspend this session issued, even if the caller asked to keep it
+	 * parked on a *successful* save.
+	 */
+	ctx->flags &= ~MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
 	vfmig_save_release_resources(ctx);
 	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
 	mutex_lock(&vfmig->ctxs_lock);

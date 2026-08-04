@@ -172,12 +172,28 @@ struct mlx5_vfmig_resume_vhca {
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x14, struct mlx5_vfmig_resume_vhca)
 
 /*
+ * KEEP_SUSPENDED: when SAVE self-suspended the VF (it was not already
+ * parked via SUSPEND_VHCA), leave it parked on close instead of resuming
+ * it. Ignored when the VF was pre-parked by the caller (that suspend is
+ * the caller's to resume).
+ */
+#define MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED	(1u << 0)
+#define MLX5_VFMIG_SAVE_FLAG_ALL \
+	(MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED)
+
+/*
  * MLX5_VFMIG_IOC_SAVE_VHCA_STATE:
  *   Open a read-only data session that captures VF @vf_id's current
- *   firmware state into a blob. The VF must already be quiesced to STOP
- *   via MLX5_VFMIG_IOC_SUSPEND_VHCA (SAVE captures a stopped VHCA; it does
- *   not itself touch the datapath state). It must also be migration-enabled
- *   (see ENABLE_MIGRATABLE).
+ *   firmware state into a blob. The VF must be migration-enabled (see
+ *   ENABLE_MIGRATABLE).
+ *
+ *   SAVE needs the VHCA quiesced to STOP. If the caller already parked it
+ *   via MLX5_VFMIG_IOC_SUSPEND_VHCA, SAVE captures it as-is and leaves the
+ *   resume to the caller's RESUME_VHCA. Otherwise SAVE transiently
+ *   suspends the VF itself and, on close, resumes exactly the ladder steps
+ *   it issued -- unless @flags carries MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED,
+ *   in which case a self-suspended VF is left parked. The persistent
+ *   SUSPEND/RESUME_VHCA datapath state is never changed by SAVE.
  *
  *   On the ioctl call the driver synchronously queries the VF's vhca_id,
  *   sizes the snapshot via QUERY_VHCA_MIGRATION_STATE, allocates a PD +
@@ -186,18 +202,17 @@ struct mlx5_vfmig_resume_vhca {
  *   the blob from it (any chunk size) until EOF. The stream begins with a
  *   16-byte FW_DATA record header (record_size, flags=0, tag=0) followed by
  *   the firmware payload, so it can later be fed verbatim into
- *   LOAD_VHCA_STATE. Closing @save_fd frees the firmware resources; the VF
- *   is left at STOP for the caller to RESUME_VHCA.
+ *   LOAD_VHCA_STATE. Closing @save_fd frees the firmware resources.
  *
  *   Returns 0 with @save_fd populated on success; -EINVAL if @vf_id is out
- *   of range, the VF is not at STOP, or @flags / @reserved are non-zero;
- *   -EOPNOTSUPP if the VF is not migration-enabled; -EBUSY if a save
- *   session already exists for this vf_id; -ENODEV if the PF is gone; or a
- *   negative firmware error if a QUERY/SAVE step fails.
+ *   of range or @flags / @reserved carry unknown bits; -EOPNOTSUPP if the
+ *   VF is not migration-enabled; -EBUSY if a save session already exists
+ *   for this vf_id; -ENODEV if the PF is gone; or a negative firmware error
+ *   if a QUERY/SUSPEND/SAVE step fails.
  */
 struct mlx5_vfmig_save_state {
 	__u32 vf_id;	/* in  */
-	__u32 flags;	/* in: reserved, must be 0 */
+	__u32 flags;	/* in: 0 or MLX5_VFMIG_SAVE_FLAG_* */
 	__s32 save_fd;	/* out */
 	__u32 reserved;
 };
