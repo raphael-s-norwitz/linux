@@ -23,6 +23,22 @@
 #define MLX5_VFMIG_IOC_MAGIC	0xB5
 
 /*
+ * MLX5_VFMIG_IOC_MARK_RESTORED:
+ *   Latch VF @vf_id as having had its firmware state restored. A later
+ *   mlx5_core probe of that VF consumes the bit to skip re-init of state
+ *   that was loaded out of band. Returns 0 on success, -EINVAL if @vf_id
+ *   is out of range or @reserved is non-zero, -EALREADY if the bit was
+ *   already set.
+ */
+struct mlx5_vfmig_mark_restored {
+	__u32 vf_id;	/* in */
+	__u32 reserved;
+};
+
+#define MLX5_VFMIG_IOC_MARK_RESTORED \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x01, struct mlx5_vfmig_mark_restored)
+
+/*
  * MLX5_VFMIG_IOC_GET_VHCA_ID:
  *   PF-side query of the VF's vhca_id via QUERY_HCA_CAP(other_function=1).
  *   Lets userspace confirm the PF can address the VF without binding any
