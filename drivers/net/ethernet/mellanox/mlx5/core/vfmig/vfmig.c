@@ -50,9 +50,9 @@ static DEFINE_IDA(mlx5_vfmig_minor_ida);
  * @cdev:    the /dev/mlx5_vfmig/<bdf> character device.
  * @minor:   minor number allocated from mlx5_vfmig_minor_ida.
  * @max_vfs: size of @restored in bits (PF's VF capacity at init).
- * @restored: per-VF "restored" latch, indexed by SR-IOV VF id, read
- *           back via QUERY_VF. Accessed with atomic bitops; NULL when
- *           @max_vfs is 0.
+ * @restored: per-VF "restored" latch, indexed by SR-IOV VF id. Set via
+ *           MARK_RESTORED, read back via QUERY_VF. Accessed with atomic
+ *           bitops; NULL when @max_vfs is 0.
  */
 struct mlx5_vfmig_pf {
 	struct kref		kref;
@@ -171,6 +171,30 @@ static long vfmig_ioc_get_vhca_id(struct mlx5_vfmig_pf *vfmig,
 	return 0;
 }
 
+static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
+				    void __user *uarg)
+{
+	struct mlx5_vfmig_mark_restored arg;
+	struct mlx5_core_sriov *sriov;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+
+	sriov = &vfmig->pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs || arg.vf_id >= vfmig->max_vfs)
+		return -EINVAL;
+
+	if (test_and_set_bit(arg.vf_id, vfmig->restored))
+		return -EALREADY;
+
+	mlx5_core_dbg(vfmig->pf_mdev, "vfmig: VF %u marked restored\n",
+		      arg.vf_id);
+
+	return 0;
+}
+
 static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 			       void __user *uarg)
 {
@@ -221,6 +245,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	switch (cmd) {
+	case MLX5_VFMIG_IOC_MARK_RESTORED:
+		ret = vfmig_ioc_mark_restored(vfmig, uarg);
+		break;
 	case MLX5_VFMIG_IOC_GET_VHCA_ID:
 		ret = vfmig_ioc_get_vhca_id(vfmig, uarg);
 		break;
