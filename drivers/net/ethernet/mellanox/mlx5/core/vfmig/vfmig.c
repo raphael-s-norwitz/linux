@@ -23,7 +23,10 @@
 #include <linux/module.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/mlx5/device.h>
 #include <linux/mlx5/driver.h>
+#include <uapi/linux/mlx5_vfmig.h>
 
 #include "mlx5_core.h"
 #include "vfmig.h"
@@ -93,16 +96,93 @@ static int vfmig_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+/* -------- ioctl handlers ------------------------------------------------- */
+
+/*
+ * QUERY_HCA_CAP(other_function=1) - PF-side query of a VF's vhca_id.
+ * Mirrors mlx5vf_cmd_get_vhca_id() in drivers/vfio/pci/mlx5/cmd.c.
+ */
+static int vfmig_query_vhca_id(struct mlx5_core_dev *pf_mdev,
+			       u16 function_id, u16 *vhca_id)
+{
+	u32 in[MLX5_ST_SZ_DW(query_hca_cap_in)] = {};
+	void *out;
+	int out_size;
+	int ret;
+
+	out_size = MLX5_ST_SZ_BYTES(query_hca_cap_out);
+	out = kzalloc(out_size, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
+	MLX5_SET(query_hca_cap_in, in, opcode, MLX5_CMD_OP_QUERY_HCA_CAP);
+	MLX5_SET(query_hca_cap_in, in, other_function, 1);
+	MLX5_SET(query_hca_cap_in, in, function_id, function_id);
+	MLX5_SET(query_hca_cap_in, in, op_mod,
+		 MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE << 1 |
+		 HCA_CAP_OPMOD_GET_CUR);
+
+	ret = mlx5_cmd_exec_inout(pf_mdev, query_hca_cap, in, out);
+	if (ret)
+		goto out;
+
+	*vhca_id = MLX5_GET(query_hca_cap_out, out,
+			    capability.cmd_hca_cap.vhca_id);
+out:
+	kfree(out);
+	return ret;
+}
+
+static long vfmig_ioc_get_vhca_id(struct mlx5_vfmig_pf *vfmig,
+				  void __user *uarg)
+{
+	struct mlx5_vfmig_get_vhca_id arg;
+	struct mlx5_core_sriov *sriov;
+	u16 vhca_id;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+
+	sriov = &vfmig->pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	/* SR-IOV VF index @vf_id maps to function_id vf_id + 1. */
+	err = vfmig_query_vhca_id(vfmig->pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	arg.vhca_id = vhca_id;
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
+	void __user *uarg = (void __user *)arg;
 	long ret;
 
 	down_read(&vfmig->lock);
-	if (vfmig->dead)
+	if (vfmig->dead) {
 		ret = -ENODEV;
-	else
+		goto out;
+	}
+
+	switch (cmd) {
+	case MLX5_VFMIG_IOC_GET_VHCA_ID:
+		ret = vfmig_ioc_get_vhca_id(vfmig, uarg);
+		break;
+	default:
 		ret = -ENOTTY;
+		break;
+	}
+out:
 	up_read(&vfmig->lock);
 
 	return ret;
