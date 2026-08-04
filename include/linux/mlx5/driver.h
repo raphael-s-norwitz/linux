@@ -462,6 +462,18 @@ enum {
 	MLX5_PF_NOTIFY_ENABLE_VF,
 };
 
+/*
+ * Datapath-quiesce depth of a VF's VHCA on the firmware migration FSM's
+ * RUNNING <-> RUNNING_P2P <-> STOP ladder, latched per VF in
+ * vfs_ctx[].vfmig_dp_state so the vfmig SUSPEND/RESUME ioctls stay
+ * idempotent across calls.
+ */
+enum mlx5_vfmig_dp_state {
+	MLX5_VFMIG_DP_RUNNING = 0,	/* both directions live */
+	MLX5_VFMIG_DP_P2P,		/* initiator parked, responder live */
+	MLX5_VFMIG_DP_STOP,		/* fully parked; cmd ring dead */
+};
+
 struct mlx5_vf_context {
 	int	enabled;
 	u64	port_guid;
@@ -471,6 +483,8 @@ struct mlx5_vf_context {
 	 */
 	u8	port_guid_valid:1;
 	u8	node_guid_valid:1;
+	/* Current mlx5_vfmig_dp_state; driven by the vfmig SUSPEND/RESUME ioctls. */
+	u8	vfmig_dp_state;
 	enum port_state_policy	policy;
 	struct blocking_notifier_head notifier;
 };

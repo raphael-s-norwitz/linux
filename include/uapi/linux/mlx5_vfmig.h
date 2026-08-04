@@ -96,4 +96,54 @@ struct mlx5_vfmig_enable_migratable {
 #define MLX5_VFMIG_IOC_ENABLE_MIGRATABLE \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x06, struct mlx5_vfmig_enable_migratable)
 
+/*
+ * Direction selector for SUSPEND_VHCA / RESUME_VHCA @flags. The firmware
+ * migration FSM has a RUNNING <-> RUNNING_P2P <-> STOP ladder driven by
+ * per-direction SUSPEND/RESUME:
+ *   RUNNING       both directions live
+ *   RUNNING_P2P   responder answers peers; initiator quiesced
+ *   STOP          fully parked
+ *
+ * @flags picks which direction(s) an ioctl drives:
+ *   0 (== INITIATOR | RESPONDER)  the full fused ladder in one call
+ *   INITIATOR                     SUSPEND: RUNNING->P2P;  RESUME: P2P->RUNNING
+ *   RESPONDER                     SUSPEND: P2P->STOP;     RESUME: STOP->P2P
+ *
+ * A directional request out of order for the current state (e.g.
+ * SUSPEND(RESPONDER) while still RUNNING) is rejected with -EINVAL; a
+ * request already satisfied is a no-op (returns 0, no firmware traffic).
+ */
+#define MLX5_VFMIG_DIR_FLAG_INITIATOR	(1u << 0)
+#define MLX5_VFMIG_DIR_FLAG_RESPONDER	(1u << 1)
+#define MLX5_VFMIG_DIR_FLAG_ALL \
+	(MLX5_VFMIG_DIR_FLAG_INITIATOR | MLX5_VFMIG_DIR_FLAG_RESPONDER)
+
+/*
+ * MLX5_VFMIG_IOC_SUSPEND_VHCA:
+ *   Quiesce VF @vf_id's datapath toward STOP (PF-issued SUSPEND_VHCA on
+ *   the VF's vhca_id, other_function=1) so no peer RDMA and no VF self-DMA
+ *   lands mid-migration. With @flags == 0 this issues SUSPEND(INITIATOR)
+ *   then SUSPEND(RESPONDER), walking RUNNING -> RUNNING_P2P -> STOP in one
+ *   call; @flags may instead select a single ladder step (see
+ *   MLX5_VFMIG_DIR_FLAG_*). The VF may be bound or unbound but must be
+ *   migration-enabled (see ENABLE_MIGRATABLE).
+ *
+ *   Idempotent: returns 0 with no firmware traffic if the requested depth
+ *   is already reached. On a partial failure the reached depth is latched
+ *   (truthfully) and the error returned; recover with RESUME_VHCA.
+ *
+ *   Returns 0 on success; -EINVAL if @vf_id is out of range, @flags has
+ *   unknown bits or is out of order for the current state, or @reserved is
+ *   non-zero; -EOPNOTSUPP if the VF is not migration-enabled; or a negative
+ *   firmware error if a SUSPEND step fails.
+ */
+struct mlx5_vfmig_suspend_vhca {
+	__u32 vf_id;		/* in  */
+	__u32 flags;		/* in: 0 or a subset of MLX5_VFMIG_DIR_FLAG_* */
+	__u32 reserved[2];
+};
+
+#define MLX5_VFMIG_IOC_SUSPEND_VHCA \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x13, struct mlx5_vfmig_suspend_vhca)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */

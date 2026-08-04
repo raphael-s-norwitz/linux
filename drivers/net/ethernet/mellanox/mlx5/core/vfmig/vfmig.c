@@ -333,6 +333,177 @@ static long vfmig_ioc_enable_migratable(struct mlx5_vfmig_pf *vfmig,
 	return vfmig_set_vf_migratable(vfmig->pf_mdev, arg.vf_id);
 }
 
+/*
+ * Raw firmware SUSPEND_VHCA on a VF's @vhca_id, issued by the PF with
+ * other_function implied by @vhca_id. @op_mod selects the
+ * initiator/responder direction. This is the primitive the suspend
+ * ladder is built from.
+ */
+static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+				  u16 op_mod)
+{
+	u32 out[MLX5_ST_SZ_DW(suspend_vhca_out)] = {};
+	u32 in[MLX5_ST_SZ_DW(suspend_vhca_in)] = {};
+
+	MLX5_SET(suspend_vhca_in, in, opcode, MLX5_CMD_OP_SUSPEND_VHCA);
+	MLX5_SET(suspend_vhca_in, in, vhca_id, vhca_id);
+	MLX5_SET(suspend_vhca_in, in, op_mod, op_mod);
+
+	return mlx5_cmd_exec_inout(pf_mdev, suspend_vhca, in, out);
+}
+
+/* Park one ladder step deeper from state @s (RUNNING->P2P or P2P->STOP). */
+static int vfmig_dp_suspend_step(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+				 u8 s)
+{
+	u16 op_mod = (s == MLX5_VFMIG_DP_RUNNING) ?
+		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_INITIATOR :
+		MLX5_SUSPEND_VHCA_IN_OP_MOD_SUSPEND_RESPONDER;
+	int err = vfmig_cmd_suspend_vhca(pf_mdev, vhca_id, op_mod);
+
+	if (err)
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SUSPEND_VHCA(%s) vhca_id 0x%04x failed: %d\n",
+			       s == MLX5_VFMIG_DP_RUNNING ? "INITIATOR" : "RESPONDER",
+			       vhca_id, err);
+	return err;
+}
+
+/*
+ * Walk the datapath ladder from @from toward the deeper @to one firmware
+ * step at a time, latching the depth actually reached in *@reached. On a
+ * step failure the walk stops and *@reached holds the truthful
+ * intermediate depth, so the caller can recover with the inverse
+ * operation. Returns 0 or the first firmware error; *@reached is always
+ * set. The shallower (resume) direction is added by a later patch.
+ */
+static int vfmig_dp_transition(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+			       u8 from, u8 to, u8 *reached)
+{
+	int err = 0;
+	u8 s = from;
+
+	while (s < to) {		/* deeper suspend */
+		err = vfmig_dp_suspend_step(pf_mdev, vhca_id, s);
+		if (err)
+			break;
+		s++;
+	}
+
+	*reached = s;
+	return err;
+}
+
+/*
+ * Read back cmd_hca_cap_2.migratable for @vf_id via
+ * QUERY_HCA_CAP(other_function=1), the gate SUSPEND requires. The vport
+ * number for VF index @vf_id under standard SR-IOV is @vf_id + 1.
+ */
+static int vfmig_query_vf_migratable(struct mlx5_core_dev *pf_mdev, u32 vf_id,
+				     bool *enabled)
+{
+	int query_sz = MLX5_ST_SZ_BYTES(query_hca_cap_out);
+	u16 vport = vf_id + 1;
+	void *query_ctx;
+	void *hca_caps;
+	int err;
+
+	query_ctx = kzalloc(query_sz, GFP_KERNEL);
+	if (!query_ctx)
+		return -ENOMEM;
+
+	err = mlx5_vport_get_other_func_cap(pf_mdev, vport, query_ctx,
+					    MLX5_CAP_GENERAL_2);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: query GENERAL_2 cap for vf %u (vport %u) failed: %d\n",
+			       vf_id, vport, err);
+		goto out;
+	}
+
+	hca_caps = MLX5_ADDR_OF(query_hca_cap_out, query_ctx, capability);
+	*enabled = MLX5_GET(cmd_hca_cap_2, hca_caps, migratable);
+out:
+	kfree(query_ctx);
+	return err;
+}
+
+static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
+				   void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_suspend_vhca arg;
+	struct mlx5_core_sriov *sriov;
+	bool migratable = false;
+	u8 cur, target, reached;
+	u32 dir;
+	u16 vhca_id;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved[0] || arg.reserved[1])
+		return -EINVAL;
+	dir = arg.flags ? arg.flags : MLX5_VFMIG_DIR_FLAG_ALL;
+	if (dir & ~(u32)MLX5_VFMIG_DIR_FLAG_ALL)
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	cur = sriov->vfs_ctx[arg.vf_id].vfmig_dp_state;
+
+	/*
+	 * Map the requested direction(s) onto a target depth: suspending the
+	 * initiator parks it (RUNNING->P2P); suspending the responder implies
+	 * the initiator is already parked and drives to STOP. A responder-only
+	 * suspend while still RUNNING is out of order (firmware requires
+	 * initiator-first) -- reject it.
+	 */
+	if ((dir & MLX5_VFMIG_DIR_FLAG_RESPONDER) &&
+	    !(dir & MLX5_VFMIG_DIR_FLAG_INITIATOR) &&
+	    cur == MLX5_VFMIG_DP_RUNNING)
+		return -EINVAL;
+
+	target = cur;
+	if ((dir & MLX5_VFMIG_DIR_FLAG_INITIATOR) && target < MLX5_VFMIG_DP_P2P)
+		target = MLX5_VFMIG_DP_P2P;
+	if (dir & MLX5_VFMIG_DIR_FLAG_RESPONDER)
+		target = MLX5_VFMIG_DP_STOP;
+
+	if (target <= cur)		/* already at or past the target */
+		return 0;
+
+	err = vfmig_check_pf_migration_caps(pf_mdev);
+	if (err)
+		return err;
+
+	err = vfmig_query_vf_migratable(pf_mdev, arg.vf_id, &migratable);
+	if (err)
+		return err;
+	if (!migratable) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u is not migration-enabled (issue ENABLE_MIGRATABLE pre-bind)\n",
+			       arg.vf_id);
+		return -EOPNOTSUPP;
+	}
+
+	err = vfmig_query_vhca_id(pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	err = vfmig_dp_transition(pf_mdev, vhca_id, cur, target, &reached);
+	sriov->vfs_ctx[arg.vf_id].vfmig_dp_state = reached;
+	if (err)
+		return err;
+
+	mlx5_core_info(pf_mdev,
+		       "vfmig: suspended vf %u (vhca_id 0x%04x) datapath %u->%u\n",
+		       arg.vf_id, vhca_id, cur, reached);
+	return 0;
+}
+
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
@@ -357,6 +528,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_ENABLE_MIGRATABLE:
 		ret = vfmig_ioc_enable_migratable(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_SUSPEND_VHCA:
+		ret = vfmig_ioc_suspend_vhca(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;
