@@ -36,11 +36,24 @@
 
 #ifdef CONFIG_MLX5_VFMIG
 
+/* Per-PF cdev create/destroy; no-ops on VFs. */
+int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev);
+void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev);
+
 /* Module init/exit hooks for the cdev region. */
 int  mlx5_vfmig_module_init(void);
 void mlx5_vfmig_module_exit(void);
 
 #else /* !CONFIG_MLX5_VFMIG */
+
+static inline int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
+{
+	return 0;
+}
+
+static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
+{
+}
 
 static inline int mlx5_vfmig_module_init(void)
 {

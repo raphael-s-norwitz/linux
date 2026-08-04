@@ -1439,6 +1439,16 @@ int mlx5_init_one_devl_locked(struct mlx5_core_dev *dev)
 		mlx5_core_err(dev, "mlx5_hwmon_dev_register failed with error code %d\n", err);
 
 	mutex_unlock(&dev->intf_state_mutex);
+
+	/*
+	 * Register the per-PF /dev/mlx5_vfmig cdev. Done after dropping
+	 * intf_state_mutex to keep cdev / device class APIs out of any
+	 * mlx5 lock ordering. No-op on VFs. Failure is non-fatal: the
+	 * device works without the host-driven migration interface.
+	 */
+	if (mlx5_vfmig_pf_init(dev))
+		mlx5_core_warn(dev, "vfmig: cdev init failed; migration knob unavailable\n");
+
 	return 0;
 
 err_register:
@@ -1480,6 +1490,13 @@ unlock:
 void mlx5_uninit_one(struct mlx5_core_dev *dev)
 {
 	struct devlink *devlink = priv_to_devlink(dev);
+
+	/*
+	 * Drop the cdev before any device-state cleanup so userspace opens
+	 * of /dev/mlx5_vfmig/<bdf> are sealed off first. No-op on VFs and
+	 * on PFs where pf_init failed or wasn't called.
+	 */
+	mlx5_vfmig_pf_cleanup(dev);
 
 	devl_lock(devlink);
 	mutex_lock(&dev->intf_state_mutex);
