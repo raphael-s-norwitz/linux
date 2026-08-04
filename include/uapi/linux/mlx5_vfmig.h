@@ -74,4 +74,26 @@ struct mlx5_vfmig_query_vf {
 #define MLX5_VFMIG_IOC_QUERY_VF \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)
 
+/*
+ * MLX5_VFMIG_IOC_ENABLE_MIGRATABLE:
+ *   Set the per-VF cmd_hca_cap_2.migratable bit, the firmware gate for
+ *   SUSPEND/SAVE/LOAD/RESUME. This MUST be called while the VF is
+ *   unbound (no driver attached): firmware accepts the modify-cap on a
+ *   VHCA in pre-ENABLE_HCA state but rejects it on one mlx5_core has
+ *   already probed.
+ *
+ *   Idempotent: returns 0 with no firmware traffic if the bit is
+ *   already set. Returns -EOPNOTSUPP if the PF firmware does not
+ *   advertise migration / vhca_resource_manager, -EINVAL if @vf_id is
+ *   out of range or @reserved is non-zero. The bit is intentionally
+ *   left set across mlx5_core probes.
+ */
+struct mlx5_vfmig_enable_migratable {
+	__u32 vf_id;	/* in */
+	__u32 reserved;
+};
+
+#define MLX5_VFMIG_IOC_ENABLE_MIGRATABLE \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x06, struct mlx5_vfmig_enable_migratable)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
