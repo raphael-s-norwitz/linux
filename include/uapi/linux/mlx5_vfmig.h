@@ -146,4 +146,29 @@ struct mlx5_vfmig_suspend_vhca {
 #define MLX5_VFMIG_IOC_SUSPEND_VHCA \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x13, struct mlx5_vfmig_suspend_vhca)
 
+/*
+ * MLX5_VFMIG_IOC_RESUME_VHCA:
+ *   Un-quiesce VF @vf_id's datapath, the inverse of SUSPEND_VHCA. With
+ *   @flags == 0 this issues RESUME(RESPONDER) then RESUME(INITIATOR),
+ *   walking STOP -> RUNNING_P2P -> RUNNING in one call; @flags may instead
+ *   select a single ladder step (see MLX5_VFMIG_DIR_FLAG_*). Use it on the
+ *   source to recover a VF after an aborted migration.
+ *
+ *   Idempotent: returns 0 with no firmware traffic if the requested depth
+ *   is already reached. On a partial failure the reached depth is latched
+ *   (truthfully) and the error returned.
+ *
+ *   Returns 0 on success; -EINVAL if @vf_id is out of range, @flags has
+ *   unknown bits or is out of order for the current state, or @reserved is
+ *   non-zero; or a negative firmware error if a RESUME step fails.
+ */
+struct mlx5_vfmig_resume_vhca {
+	__u32 vf_id;		/* in  */
+	__u32 flags;		/* in: 0 or a subset of MLX5_VFMIG_DIR_FLAG_* */
+	__u32 reserved[2];
+};
+
+#define MLX5_VFMIG_IOC_RESUME_VHCA \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x14, struct mlx5_vfmig_resume_vhca)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
