@@ -171,4 +171,38 @@ struct mlx5_vfmig_resume_vhca {
 #define MLX5_VFMIG_IOC_RESUME_VHCA \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x14, struct mlx5_vfmig_resume_vhca)
 
+/*
+ * MLX5_VFMIG_IOC_SAVE_VHCA_STATE:
+ *   Open a read-only data session that captures VF @vf_id's current
+ *   firmware state into a blob. The VF must already be quiesced to STOP
+ *   via MLX5_VFMIG_IOC_SUSPEND_VHCA (SAVE captures a stopped VHCA; it does
+ *   not itself touch the datapath state). It must also be migration-enabled
+ *   (see ENABLE_MIGRATABLE).
+ *
+ *   On the ioctl call the driver synchronously queries the VF's vhca_id,
+ *   sizes the snapshot via QUERY_VHCA_MIGRATION_STATE, allocates a PD +
+ *   image pages + MKEY (DMA_FROM_DEVICE), runs SAVE_VHCA_STATE to populate
+ *   the pages, and returns @save_fd, an anon-inode fd. Userspace read()s
+ *   the blob from it (any chunk size) until EOF. The stream begins with a
+ *   16-byte FW_DATA record header (record_size, flags=0, tag=0) followed by
+ *   the firmware payload, so it can later be fed verbatim into
+ *   LOAD_VHCA_STATE. Closing @save_fd frees the firmware resources; the VF
+ *   is left at STOP for the caller to RESUME_VHCA.
+ *
+ *   Returns 0 with @save_fd populated on success; -EINVAL if @vf_id is out
+ *   of range, the VF is not at STOP, or @flags / @reserved are non-zero;
+ *   -EOPNOTSUPP if the VF is not migration-enabled; -EBUSY if a save
+ *   session already exists for this vf_id; -ENODEV if the PF is gone; or a
+ *   negative firmware error if a QUERY/SAVE step fails.
+ */
+struct mlx5_vfmig_save_state {
+	__u32 vf_id;	/* in  */
+	__u32 flags;	/* in: reserved, must be 0 */
+	__s32 save_fd;	/* out */
+	__u32 reserved;
+};
+
+#define MLX5_VFMIG_IOC_SAVE_VHCA_STATE \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x05, struct mlx5_vfmig_save_state)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */

@@ -12,17 +12,24 @@
  * tracking commands off it.
  */
 
+#include <linux/anon_inodes.h>
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/device/class.h>
+#include <linux/dma-mapping.h>
 #include <linux/err.h>
+#include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/highmem.h>
 #include <linux/idr.h>
 #include <linux/kdev_t.h>
 #include <linux/kref.h>
+#include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -41,6 +48,27 @@ static dev_t mlx5_vfmig_devt;
 static struct class *mlx5_vfmig_class;
 static DEFINE_IDA(mlx5_vfmig_minor_ida);
 
+/*
+ * Upper bound on a SAVE snapshot, from the width of save_vhca_state_in.size.
+ * A firmware-reported size beyond this is treated as corruption.
+ */
+#define VFMIG_MAX_SAVE_SIZE \
+	(BIT_ULL(__mlx5_bit_sz(save_vhca_state_in, size)) - 1)
+
+/*
+ * Wire-format record header prefixing the SAVE stream, byte-compatible
+ * with the VFIO mlx5 variant driver's migration header
+ * (drivers/vfio/pci/mlx5/cmd.h:mlx5_vf_migration_header) so a saved blob
+ * can later be replayed through LOAD_VHCA_STATE.
+ */
+struct vfmig_wire_header {
+	__le64 record_size;
+	__le32 flags;
+	__le32 tag;
+};
+
+#define VFMIG_WIRE_TAG_FW_DATA		0
+
 /**
  * struct mlx5_vfmig_pf - per-PF vfmig control-plane state
  * @kref:    refcount; drops the last reference from an open fd or the
@@ -54,6 +82,8 @@ static DEFINE_IDA(mlx5_vfmig_minor_ida);
  * @restored: per-VF "restored" latch, indexed by SR-IOV VF id. Set via
  *           MARK_RESTORED, read back via QUERY_VF. Accessed with atomic
  *           bitops; NULL when @max_vfs is 0.
+ * @ctxs_lock: mutex protecting @save_ctxs list mutations.
+ * @save_ctxs: open SAVE_VHCA_STATE sessions (struct mlx5_vfmig_save_ctx).
  */
 struct mlx5_vfmig_pf {
 	struct kref		kref;
@@ -64,6 +94,8 @@ struct mlx5_vfmig_pf {
 	int			minor;
 	u16			max_vfs;
 	unsigned long		*restored;
+	struct mutex		ctxs_lock; /* guards save_ctxs mutations */
+	struct list_head	save_ctxs;
 };
 
 static void vfmig_pf_release(struct kref *kref)
@@ -71,6 +103,8 @@ static void vfmig_pf_release(struct kref *kref)
 	struct mlx5_vfmig_pf *vfmig =
 		container_of(kref, struct mlx5_vfmig_pf, kref);
 
+	WARN_ON(!list_empty(&vfmig->save_ctxs));
+	mutex_destroy(&vfmig->ctxs_lock);
 	bitmap_free(vfmig->restored);
 	ida_free(&mlx5_vfmig_minor_ida, vfmig->minor);
 	kfree(vfmig);
@@ -600,6 +634,614 @@ static long vfmig_ioc_resume_vhca(struct mlx5_vfmig_pf *vfmig,
 	return 0;
 }
 
+/* -------- SAVE_VHCA_STATE: DMA/mkey helpers (cloned from VFIO variant) --- */
+
+/*
+ * The helpers below (alloc_mkey_in, create_mkey, register_dma_pages,
+ * unregister_dma_pages, alloc_pages, free_pages) are copies of the static
+ * helpers in drivers/vfio/pci/mlx5/cmd.c. They are duplicated here so this
+ * driver needs no new export boundary into the VFIO variant; a future
+ * patch should hoist them into mlx5_core proper and let both consume the
+ * shared versions.
+ */
+static u32 *vfmig_alloc_mkey_in(u32 npages, u32 pdn)
+{
+	int inlen;
+	void *mkc;
+	u32 *in;
+
+	inlen = MLX5_ST_SZ_BYTES(create_mkey_in) +
+		sizeof(__be64) * round_up(npages, 2);
+
+	in = kvzalloc(inlen, GFP_KERNEL_ACCOUNT);
+	if (!in)
+		return NULL;
+
+	MLX5_SET(create_mkey_in, in, translations_octword_actual_size,
+		 DIV_ROUND_UP(npages, 2));
+
+	mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
+	MLX5_SET(mkc, mkc, access_mode_1_0, MLX5_MKC_ACCESS_MODE_MTT);
+	MLX5_SET(mkc, mkc, lr, 1);
+	MLX5_SET(mkc, mkc, lw, 1);
+	MLX5_SET(mkc, mkc, rr, 1);
+	MLX5_SET(mkc, mkc, rw, 1);
+	MLX5_SET(mkc, mkc, pd, pdn);
+	MLX5_SET(mkc, mkc, bsf_octword_size, 0);
+	MLX5_SET(mkc, mkc, qpn, 0xffffff);
+	MLX5_SET(mkc, mkc, log_page_size, PAGE_SHIFT);
+	MLX5_SET(mkc, mkc, translations_octword_size, DIV_ROUND_UP(npages, 2));
+	MLX5_SET64(mkc, mkc, len, npages * PAGE_SIZE);
+
+	return in;
+}
+
+static int vfmig_create_mkey(struct mlx5_core_dev *mdev, u32 npages,
+			     u32 *mkey_in, u32 *mkey)
+{
+	int inlen = MLX5_ST_SZ_BYTES(create_mkey_in) +
+		sizeof(__be64) * round_up(npages, 2);
+
+	return mlx5_core_create_mkey(mdev, mkey, mkey_in, inlen);
+}
+
+static void vfmig_unregister_dma_pages(struct mlx5_core_dev *mdev, u32 npages,
+				       u32 *mkey_in,
+				       struct dma_iova_state *state,
+				       enum dma_data_direction dir)
+{
+	dma_addr_t addr;
+	__be64 *mtt;
+	int i;
+
+	if (dma_use_iova(state)) {
+		dma_iova_destroy(mdev->device, state, npages * PAGE_SIZE, dir,
+				 0);
+	} else {
+		mtt = (__be64 *)MLX5_ADDR_OF(create_mkey_in, mkey_in,
+					     klm_pas_mtt);
+		for (i = npages - 1; i >= 0; i--) {
+			addr = be64_to_cpu(mtt[i]);
+			dma_unmap_page(mdev->device, addr, PAGE_SIZE, dir);
+		}
+	}
+}
+
+static int vfmig_register_dma_pages(struct mlx5_core_dev *mdev, u32 npages,
+				    struct page **page_list, u32 *mkey_in,
+				    struct dma_iova_state *state,
+				    enum dma_data_direction dir)
+{
+	dma_addr_t addr;
+	size_t mapped = 0;
+	__be64 *mtt;
+	int i, err;
+
+	mtt = (__be64 *)MLX5_ADDR_OF(create_mkey_in, mkey_in, klm_pas_mtt);
+
+	if (dma_iova_try_alloc(mdev->device, state, 0, npages * PAGE_SIZE)) {
+		addr = state->addr;
+		for (i = 0; i < npages; i++) {
+			err = dma_iova_link(mdev->device, state,
+					    page_to_phys(page_list[i]), mapped,
+					    PAGE_SIZE, dir, 0);
+			if (err)
+				goto error;
+			*mtt++ = cpu_to_be64(addr);
+			addr += PAGE_SIZE;
+			mapped += PAGE_SIZE;
+		}
+		err = dma_iova_sync(mdev->device, state, 0, mapped);
+		if (err)
+			goto error;
+	} else {
+		for (i = 0; i < npages; i++) {
+			addr = dma_map_page(mdev->device, page_list[i], 0,
+					    PAGE_SIZE, dir);
+			err = dma_mapping_error(mdev->device, addr);
+			if (err)
+				goto error;
+			*mtt++ = cpu_to_be64(addr);
+		}
+	}
+	return 0;
+
+error:
+	vfmig_unregister_dma_pages(mdev, i, mkey_in, state, dir);
+	return err;
+}
+
+static int vfmig_alloc_pages(struct page ***page_list, unsigned int npages)
+{
+	unsigned int filled, done = 0;
+	int i;
+
+	*page_list = kvcalloc(npages, sizeof(struct page *),
+			      GFP_KERNEL_ACCOUNT);
+	if (!*page_list)
+		return -ENOMEM;
+
+	for (;;) {
+		filled = alloc_pages_bulk(GFP_KERNEL_ACCOUNT, npages - done,
+					  *page_list + done);
+		if (!filled)
+			goto err;
+
+		done += filled;
+		if (done == npages)
+			break;
+	}
+
+	return 0;
+err:
+	for (i = 0; i < done; i++)
+		__free_page((*page_list)[i]);
+
+	kvfree(*page_list);
+	*page_list = NULL;
+	return -ENOMEM;
+}
+
+static void vfmig_free_pages(struct page **page_list, u32 npages)
+{
+	int i;
+
+	if (!page_list)
+		return;
+
+	for (i = npages - 1; i >= 0; i--)
+		__free_page(page_list[i]);
+
+	kvfree(page_list);
+}
+
+/*
+ * Synchronous QUERY_VHCA_MIGRATION_STATE: single-shot (no incremental, no
+ * chunk mode), *@size_out gets required_umem_size in bytes.
+ */
+static int vfmig_cmd_query_vhca_migration_state(struct mlx5_core_dev *pf_mdev,
+						u16 vhca_id, u64 *size_out)
+{
+	u32 out[MLX5_ST_SZ_DW(query_vhca_migration_state_out)] = {};
+	u32 in[MLX5_ST_SZ_DW(query_vhca_migration_state_in)] = {};
+	int err;
+
+	MLX5_SET(query_vhca_migration_state_in, in, opcode,
+		 MLX5_CMD_OP_QUERY_VHCA_MIGRATION_STATE);
+	MLX5_SET(query_vhca_migration_state_in, in, vhca_id, vhca_id);
+	MLX5_SET(query_vhca_migration_state_in, in, op_mod, 0);
+	MLX5_SET(query_vhca_migration_state_in, in, incremental, 0);
+	MLX5_SET(query_vhca_migration_state_in, in, chunk, 0);
+
+	err = mlx5_cmd_exec_inout(pf_mdev, query_vhca_migration_state, in, out);
+	if (err)
+		return err;
+
+	*size_out = MLX5_GET(query_vhca_migration_state_out, out,
+			     required_umem_size);
+	return 0;
+}
+
+/*
+ * Synchronous SAVE_VHCA_STATE. @size is the buffer capacity offered to the
+ * firmware (bytes); *@actual_size_out gets the bytes it actually wrote.
+ */
+static int vfmig_cmd_save_vhca_state(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+				     u32 mkey, size_t size,
+				     u64 *actual_size_out)
+{
+	u32 out[MLX5_ST_SZ_DW(save_vhca_state_out)] = {};
+	u32 in[MLX5_ST_SZ_DW(save_vhca_state_in)] = {};
+	int err;
+
+	MLX5_SET(save_vhca_state_in, in, opcode, MLX5_CMD_OP_SAVE_VHCA_STATE);
+	MLX5_SET(save_vhca_state_in, in, op_mod, 0);
+	MLX5_SET(save_vhca_state_in, in, vhca_id, vhca_id);
+	MLX5_SET(save_vhca_state_in, in, mkey, mkey);
+	MLX5_SET(save_vhca_state_in, in, size, size);
+	MLX5_SET(save_vhca_state_in, in, incremental, 0);
+	MLX5_SET(save_vhca_state_in, in, set_track, 0);
+
+	err = mlx5_cmd_exec_inout(pf_mdev, save_vhca_state, in, out);
+	if (err)
+		return err;
+
+	*actual_size_out = MLX5_GET(save_vhca_state_out, out,
+				    actual_image_size);
+	return 0;
+}
+
+/* -------- SAVE_VHCA_STATE: per-fd state buffer -------------------------- */
+
+/*
+ * Per-SAVE-fd context, hung off vfmig->save_ctxs. All firmware resources
+ * are allocated up front in the ioctl handler and torn down on release()
+ * (or by pf_cleanup if the PF is removed first). The fd's sole job is to
+ * drain the staging pages, framed as one FW_DATA wire record.
+ */
+struct mlx5_vfmig_save_ctx {
+	struct list_head node;		/* on vfmig->save_ctxs */
+	struct mlx5_vfmig_pf *vfmig;	/* holds a kref */
+	struct mutex io_lock;		/* serializes concurrent read()s */
+	u32 vf_id;
+	u16 vhca_id;
+
+	/* Firmware-tied resources, mutated under vfmig->lock. */
+	bool resources_freed;
+	bool pd_allocated;
+	u32 pdn;
+	bool image_dma_mapped;
+	bool image_mkey_created;
+	struct page **image_pages;
+	u32 image_npages;		/* allocated capacity in PAGE_SIZE */
+	u32 *image_mkey_in;
+	u32 image_mkey;
+	struct dma_iova_state image_dma_state;
+
+	u64 image_size;			/* bytes the firmware wrote */
+	u64 read_pos;			/* cursor over [FW_DATA hdr | payload] */
+};
+
+/* Build the on-wire FW_DATA header for ctx->image_size into @hdr. */
+static void vfmig_save_build_header(struct mlx5_vfmig_save_ctx *ctx,
+				    struct vfmig_wire_header *hdr)
+{
+	hdr->record_size = cpu_to_le64(ctx->image_size);
+	hdr->flags = cpu_to_le32(0);
+	hdr->tag = cpu_to_le32(VFMIG_WIRE_TAG_FW_DATA);
+}
+
+/*
+ * Copy out the byte range [read_pos, read_pos+count) of the save stream:
+ *   [0 .. HDR_SZ)                  FW_DATA wire header
+ *   [HDR_SZ .. HDR_SZ+image_size)  firmware payload from image_pages[]
+ * EOF is HDR_SZ + image_size. Caller holds vfmig->lock for read AND
+ * ctx->io_lock.
+ */
+static ssize_t vfmig_save_drain(struct mlx5_vfmig_save_ctx *ctx,
+				char __user *ubuf, size_t count)
+{
+	const u64 HDR_SZ = sizeof(struct vfmig_wire_header);
+	const u64 total  = HDR_SZ + ctx->image_size;
+	size_t copied = 0;
+	ssize_t err = 0;
+
+	if (ctx->read_pos >= total)
+		return 0;
+
+	/* FW_DATA wire header. */
+	if (ctx->read_pos < HDR_SZ && count) {
+		struct vfmig_wire_header hdr;
+		u64 hoff = ctx->read_pos;
+		size_t want = min_t(size_t, count, HDR_SZ - hoff);
+
+		vfmig_save_build_header(ctx, &hdr);
+		if (copy_to_user(ubuf, ((u8 *)&hdr) + hoff, want))
+			return -EFAULT;
+		ctx->read_pos += want;
+		ubuf += want;
+		count -= want;
+		copied += want;
+	}
+
+	/* FW payload pages. */
+	while (count && ctx->read_pos < total) {
+		u64 payload_off = ctx->read_pos - HDR_SZ;
+		u32 page_idx = payload_off >> PAGE_SHIFT;
+		size_t page_off = payload_off & (PAGE_SIZE - 1);
+		size_t want = min3((size_t)(total - ctx->read_pos), count,
+				   PAGE_SIZE - page_off);
+		const u8 *from;
+
+		if (page_idx >= ctx->image_npages)
+			return copied ? (ssize_t)copied : -EINVAL;
+
+		from = kmap_local_page(ctx->image_pages[page_idx]);
+		if (copy_to_user(ubuf, from + page_off, want)) {
+			kunmap_local(from);
+			err = -EFAULT;
+			break;
+		}
+		kunmap_local(from);
+		ctx->read_pos += want;
+		ubuf += want;
+		count -= want;
+		copied += want;
+	}
+
+	if (!copied && err)
+		return err;
+	return copied;
+}
+
+static ssize_t vfmig_save_read(struct file *filp, char __user *ubuf,
+			       size_t count, loff_t *ppos)
+{
+	struct mlx5_vfmig_save_ctx *ctx = filp->private_data;
+	struct mlx5_vfmig_pf *vfmig = ctx->vfmig;
+	ssize_t ret;
+
+	if (!count)
+		return 0;
+
+	mutex_lock(&ctx->io_lock);
+	down_read(&vfmig->lock);
+	if (vfmig->dead || ctx->resources_freed) {
+		ret = -ENODEV;
+		goto out;
+	}
+	ret = vfmig_save_drain(ctx, ubuf, count);
+out:
+	up_read(&vfmig->lock);
+	mutex_unlock(&ctx->io_lock);
+	return ret;	/* stream_open() => ppos is NULL, leave it */
+}
+
+/*
+ * Drop the firmware-tied resources held by @ctx. Idempotent via
+ * @resources_freed. Called from release() (pf_mdev alive) or pf_cleanup()
+ * (before pf_mdev is NULLed). The image page list is host memory and is
+ * freed separately in release(). Caller holds vfmig->lock.
+ */
+static void vfmig_save_release_resources(struct mlx5_vfmig_save_ctx *ctx)
+{
+	struct mlx5_core_dev *pf_mdev = ctx->vfmig->pf_mdev;
+
+	if (ctx->resources_freed)
+		return;
+	ctx->resources_freed = true;
+
+	if (!pf_mdev)
+		return;
+
+	if (ctx->image_mkey_created) {
+		mlx5_core_destroy_mkey(pf_mdev, ctx->image_mkey);
+		ctx->image_mkey_created = false;
+	}
+	if (ctx->image_dma_mapped) {
+		vfmig_unregister_dma_pages(pf_mdev, ctx->image_npages,
+					   ctx->image_mkey_in,
+					   &ctx->image_dma_state,
+					   DMA_FROM_DEVICE);
+		ctx->image_dma_mapped = false;
+	}
+	kvfree(ctx->image_mkey_in);
+	ctx->image_mkey_in = NULL;
+
+	if (ctx->pd_allocated) {
+		mlx5_core_dealloc_pd(pf_mdev, ctx->pdn);
+		ctx->pd_allocated = false;
+	}
+}
+
+static int vfmig_save_release(struct inode *inode, struct file *filp)
+{
+	struct mlx5_vfmig_save_ctx *ctx = filp->private_data;
+	struct mlx5_vfmig_pf *vfmig = ctx->vfmig;
+
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_save_release_resources(ctx);
+	up_read(&vfmig->lock);
+
+	mutex_lock(&vfmig->ctxs_lock);
+	list_del(&ctx->node);
+	mutex_unlock(&vfmig->ctxs_lock);
+
+	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
+	mutex_destroy(&ctx->io_lock);
+	vfmig_pf_put(vfmig);
+	kfree(ctx);
+	return 0;
+}
+
+static const struct file_operations mlx5_vfmig_save_fops = {
+	.owner		= THIS_MODULE,
+	.read		= vfmig_save_read,
+	.release	= vfmig_save_release,
+};
+
+/* True iff @vf_id already has an open SAVE session. ctxs_lock held. */
+static bool vfmig_vf_id_save_busy_locked(struct mlx5_vfmig_pf *vfmig, u32 vf_id)
+{
+	struct mlx5_vfmig_save_ctx *s;
+
+	list_for_each_entry(s, &vfmig->save_ctxs, node)
+		if (s->vf_id == vf_id)
+			return true;
+	return false;
+}
+
+/*
+ * Set up a SAVE session on a VF already quiesced to STOP: resolve vhca_id,
+ * size the snapshot, allocate a PD + image pages + MKEY, run
+ * SAVE_VHCA_STATE, then hand back a read-only anon-inode fd. Caller holds
+ * vfmig->lock for read.
+ */
+static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
+				      void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_save_state arg;
+	struct mlx5_vfmig_save_ctx *ctx;
+	struct mlx5_core_sriov *sriov;
+	bool migratable = false;
+	u64 query_size = 0;
+	u64 actual_size = 0;
+	struct file *file;
+	u32 npages;
+	u16 vhca_id;
+	int fd, err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.flags || arg.reserved)
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	/* SAVE captures a stopped VHCA; quiesce it first via SUSPEND_VHCA. */
+	if (sriov->vfs_ctx[arg.vf_id].vfmig_dp_state != MLX5_VFMIG_DP_STOP) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u must be suspended to STOP before SAVE\n",
+			       arg.vf_id);
+		return -EINVAL;
+	}
+
+	err = vfmig_check_pf_migration_caps(pf_mdev);
+	if (err)
+		return err;
+
+	err = vfmig_query_vf_migratable(pf_mdev, arg.vf_id, &migratable);
+	if (err)
+		return err;
+	if (!migratable) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u is not migration-enabled\n",
+			       arg.vf_id);
+		return -EOPNOTSUPP;
+	}
+
+	err = vfmig_query_vhca_id(pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&ctx->node);
+	mutex_init(&ctx->io_lock);
+	ctx->vf_id = arg.vf_id;
+	ctx->vhca_id = vhca_id;
+
+	/* Claim vf_id atomically vs other SAVE sessions. */
+	mutex_lock(&vfmig->ctxs_lock);
+	if (vfmig_vf_id_save_busy_locked(vfmig, ctx->vf_id)) {
+		mutex_unlock(&vfmig->ctxs_lock);
+		err = -EBUSY;
+		goto err_claim;
+	}
+	vfmig_pf_get(vfmig);
+	ctx->vfmig = vfmig;
+	list_add(&ctx->node, &vfmig->save_ctxs);
+	mutex_unlock(&vfmig->ctxs_lock);
+
+	err = mlx5_core_alloc_pd(pf_mdev, &ctx->pdn);
+	if (err)
+		goto err_res;
+	ctx->pd_allocated = true;
+
+	err = vfmig_cmd_query_vhca_migration_state(pf_mdev, vhca_id,
+						   &query_size);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: QUERY_VHCA_MIGRATION_STATE vf %u (vhca_id 0x%04x) failed: %d\n",
+			       arg.vf_id, vhca_id, err);
+		goto err_res;
+	}
+	if (!query_size || query_size > VFMIG_MAX_SAVE_SIZE) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: implausible migration size %llu for vf %u\n",
+			       query_size, arg.vf_id);
+		err = -ERANGE;
+		goto err_res;
+	}
+
+	npages = max_t(u32, 1, DIV_ROUND_UP(query_size, PAGE_SIZE));
+	err = vfmig_alloc_pages(&ctx->image_pages, npages);
+	if (err)
+		goto err_res;
+	ctx->image_npages = npages;
+
+	ctx->image_mkey_in = vfmig_alloc_mkey_in(npages, ctx->pdn);
+	if (!ctx->image_mkey_in) {
+		err = -ENOMEM;
+		goto err_res;
+	}
+
+	err = vfmig_register_dma_pages(pf_mdev, npages, ctx->image_pages,
+				       ctx->image_mkey_in,
+				       &ctx->image_dma_state,
+				       DMA_FROM_DEVICE);
+	if (err)
+		goto err_res;
+	ctx->image_dma_mapped = true;
+
+	err = vfmig_create_mkey(pf_mdev, npages, ctx->image_mkey_in,
+				&ctx->image_mkey);
+	if (err)
+		goto err_res;
+	ctx->image_mkey_created = true;
+
+	err = vfmig_cmd_save_vhca_state(pf_mdev, vhca_id, ctx->image_mkey,
+					npages * PAGE_SIZE, &actual_size);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SAVE_VHCA_STATE vf %u (vhca_id 0x%04x) failed: %d\n",
+			       arg.vf_id, vhca_id, err);
+		goto err_res;
+	}
+	if (!actual_size || actual_size > (u64)npages * PAGE_SIZE) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SAVE_VHCA_STATE returned implausible size %llu for vf %u\n",
+			       actual_size, arg.vf_id);
+		err = -EIO;
+		goto err_res;
+	}
+	ctx->image_size = actual_size;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		err = fd;
+		goto err_res;
+	}
+
+	file = anon_inode_getfile("mlx5_vfmig_save", &mlx5_vfmig_save_fops,
+				  ctx, O_RDONLY | O_CLOEXEC);
+	if (IS_ERR(file)) {
+		err = PTR_ERR(file);
+		goto err_fd;
+	}
+	stream_open(file_inode(file), file);
+
+	arg.save_fd = fd;
+	if (copy_to_user(uarg, &arg, sizeof(arg))) {
+		err = -EFAULT;
+		goto err_file;
+	}
+
+	fd_install(fd, file);
+	mlx5_core_info(pf_mdev,
+		       "vfmig: saved vf %u (vhca_id 0x%04x) state: %llu bytes\n",
+		       arg.vf_id, vhca_id, actual_size);
+	return 0;
+
+err_file:
+	/* fput() runs vfmig_save_release, which frees resources + ctx. */
+	fput(file);
+	put_unused_fd(fd);
+	return err;
+err_fd:
+	put_unused_fd(fd);
+err_res:
+	vfmig_save_release_resources(ctx);
+	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
+	mutex_lock(&vfmig->ctxs_lock);
+	list_del(&ctx->node);
+	mutex_unlock(&vfmig->ctxs_lock);
+	vfmig_pf_put(vfmig);
+	mutex_destroy(&ctx->io_lock);
+	kfree(ctx);
+	return err;
+err_claim:
+	mutex_destroy(&ctx->io_lock);
+	kfree(ctx);
+	return err;
+}
+
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
@@ -630,6 +1272,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_RESUME_VHCA:
 		ret = vfmig_ioc_resume_vhca(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_SAVE_VHCA_STATE:
+		ret = vfmig_ioc_save_vhca_state(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;
@@ -666,6 +1311,8 @@ int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 
 	kref_init(&vfmig->kref);
 	init_rwsem(&vfmig->lock);
+	mutex_init(&vfmig->ctxs_lock);
+	INIT_LIST_HEAD(&vfmig->save_ctxs);
 	vfmig->pf_mdev = pf_mdev;
 
 	vfmig->max_vfs = pf_mdev->priv.sriov.max_vfs;
@@ -710,6 +1357,7 @@ err_cdev:
 err_minor:
 	ida_free(&mlx5_vfmig_minor_ida, minor);
 err_free:
+	mutex_destroy(&vfmig->ctxs_lock);
 	bitmap_free(vfmig->restored);
 	kfree(vfmig);
 	return err;
@@ -718,6 +1366,7 @@ err_free:
 void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig = pf_mdev->priv.vfmig;
+	struct mlx5_vfmig_save_ctx *save_ctx;
 	dev_t devt;
 
 	if (!vfmig)
@@ -725,8 +1374,17 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 
 	pf_mdev->priv.vfmig = NULL;
 
+	/*
+	 * Neuter the device. Tear down open SAVE sessions' firmware
+	 * resources (PD/MKEY/DMA) while pf_mdev is still alive; the page
+	 * lists themselves are mdev-independent and get freed when each fd
+	 * is later closed. The down_write blocks until all in-flight
+	 * readers drop their read locks, after which save_ctxs is stable.
+	 */
 	down_write(&vfmig->lock);
 	vfmig->dead = true;
+	list_for_each_entry(save_ctx, &vfmig->save_ctxs, node)
+		vfmig_save_release_resources(save_ctx);
 	vfmig->pf_mdev = NULL;
 	up_write(&vfmig->lock);
 
