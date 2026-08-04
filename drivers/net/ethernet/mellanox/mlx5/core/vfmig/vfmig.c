@@ -28,6 +28,7 @@
 #include <linux/uaccess.h>
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/driver.h>
+#include <linux/mlx5/vport.h>
 #include <uapi/linux/mlx5_vfmig.h>
 
 #include "mlx5_core.h"
@@ -232,6 +233,106 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	return 0;
 }
 
+/*
+ * Gating capabilities for the VF migratable bit. The PF mdev itself
+ * must report both `migration` and `vhca_resource_manager` -- matches
+ * what mlx5_devlink_port_fn_migratable_set checks before letting
+ * userspace flip the per-VF migratable bit. Returns 0 if supported,
+ * -EOPNOTSUPP otherwise.
+ */
+static int vfmig_check_pf_migration_caps(struct mlx5_core_dev *pf_mdev)
+{
+	if (!MLX5_CAP_GEN(pf_mdev, migration)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: PF firmware does not advertise migration capability\n");
+		return -EOPNOTSUPP;
+	}
+	if (!MLX5_CAP_GEN(pf_mdev, vhca_resource_manager)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: PF firmware does not advertise vhca_resource_manager\n");
+		return -EOPNOTSUPP;
+	}
+
+	return 0;
+}
+
+/*
+ * Pre-bind helper: idempotently set HCA_CAP_2.migratable=1 on @vf_id.
+ * The firmware only accepts this modify-cap while the VF is unbound
+ * (no ENABLE_HCA issued yet); on an already-probed VF it returns
+ * "bad resource state". The bit is intentionally never cleared again:
+ * a VF migration-enabled once stays so for the SR-IOV provisioning.
+ *
+ * The vport number for VF index @vf_id under standard SR-IOV is
+ * @vf_id + 1 (vport 0 is the PF).
+ */
+static int vfmig_set_vf_migratable(struct mlx5_core_dev *pf_mdev, u32 vf_id)
+{
+	int query_sz = MLX5_ST_SZ_BYTES(query_hca_cap_out);
+	u16 vport = vf_id + 1;
+	void *query_ctx;
+	void *hca_caps;
+	int err;
+
+	query_ctx = kzalloc(query_sz, GFP_KERNEL);
+	if (!query_ctx)
+		return -ENOMEM;
+
+	err = mlx5_vport_get_other_func_cap(pf_mdev, vport, query_ctx,
+					    MLX5_CAP_GENERAL_2);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: query GENERAL_2 cap for vf %u (vport %u) failed: %d\n",
+			       vf_id, vport, err);
+		goto out;
+	}
+
+	hca_caps = MLX5_ADDR_OF(query_hca_cap_out, query_ctx, capability);
+	if (MLX5_GET(cmd_hca_cap_2, hca_caps, migratable)) {
+		err = 0;
+		goto out;
+	}
+
+	MLX5_SET(cmd_hca_cap_2, hca_caps, migratable, 1);
+	err = mlx5_vport_set_other_func_cap(pf_mdev, hca_caps, vport,
+					    MLX5_SET_HCA_CAP_OP_MOD_GENERAL_DEVICE2);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: set GENERAL_2.migratable=1 for vf %u (vport %u) failed: %d (VF must be unbound)\n",
+			       vf_id, vport, err);
+		goto out;
+	}
+	mlx5_core_info(pf_mdev,
+		       "vfmig: enabled migratable cap for vf %u (vport %u)\n",
+		       vf_id, vport);
+out:
+	kfree(query_ctx);
+	return err;
+}
+
+static long vfmig_ioc_enable_migratable(struct mlx5_vfmig_pf *vfmig,
+					void __user *uarg)
+{
+	struct mlx5_vfmig_enable_migratable arg;
+	struct mlx5_core_sriov *sriov;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+
+	sriov = &vfmig->pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	err = vfmig_check_pf_migration_caps(vfmig->pf_mdev);
+	if (err)
+		return err;
+
+	return vfmig_set_vf_migratable(vfmig->pf_mdev, arg.vf_id);
+}
+
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
@@ -253,6 +354,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_QUERY_VF:
 		ret = vfmig_ioc_query_vf(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_ENABLE_MIGRATABLE:
+		ret = vfmig_ioc_enable_migratable(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;
