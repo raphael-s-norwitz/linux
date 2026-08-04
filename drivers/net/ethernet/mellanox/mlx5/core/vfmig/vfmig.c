@@ -12,6 +12,8 @@
  * tracking commands off it.
  */
 
+#include <linux/bitmap.h>
+#include <linux/bitops.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/device/class.h>
@@ -47,6 +49,10 @@ static DEFINE_IDA(mlx5_vfmig_minor_ida);
  * @dead:    set once the PF is being removed; ioctls then fail -ENODEV.
  * @cdev:    the /dev/mlx5_vfmig/<bdf> character device.
  * @minor:   minor number allocated from mlx5_vfmig_minor_ida.
+ * @max_vfs: size of @restored in bits (PF's VF capacity at init).
+ * @restored: per-VF "restored" latch, indexed by SR-IOV VF id, read
+ *           back via QUERY_VF. Accessed with atomic bitops; NULL when
+ *           @max_vfs is 0.
  */
 struct mlx5_vfmig_pf {
 	struct kref		kref;
@@ -55,6 +61,8 @@ struct mlx5_vfmig_pf {
 	bool			dead;
 	struct cdev		cdev;
 	int			minor;
+	u16			max_vfs;
+	unsigned long		*restored;
 };
 
 static void vfmig_pf_release(struct kref *kref)
@@ -62,6 +70,7 @@ static void vfmig_pf_release(struct kref *kref)
 	struct mlx5_vfmig_pf *vfmig =
 		container_of(kref, struct mlx5_vfmig_pf, kref);
 
+	bitmap_free(vfmig->restored);
 	ida_free(&mlx5_vfmig_minor_ida, vfmig->minor);
 	kfree(vfmig);
 }
@@ -162,6 +171,43 @@ static long vfmig_ioc_get_vhca_id(struct mlx5_vfmig_pf *vfmig,
 	return 0;
 }
 
+static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
+			       void __user *uarg)
+{
+	struct mlx5_vfmig_query_vf arg;
+	struct mlx5_core_sriov *sriov;
+	u16 vhca_id;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+
+	sriov = &vfmig->pf_mdev->priv.sriov;
+	arg.num_vfs = sriov->num_vfs;
+	arg.reserved = 0;
+
+	if (arg.vf_id >= sriov->num_vfs) {
+		arg.vhca_id = 0;
+		arg.restored = 0;
+		if (copy_to_user(uarg, &arg, sizeof(arg)))
+			return -EFAULT;
+		return -ERANGE;
+	}
+
+	err = vfmig_query_vhca_id(vfmig->pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	arg.vhca_id = vhca_id;
+	arg.restored = (arg.vf_id < vfmig->max_vfs &&
+			test_bit(arg.vf_id, vfmig->restored)) ? 1 : 0;
+
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+
+	return 0;
+}
+
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
@@ -177,6 +223,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	switch (cmd) {
 	case MLX5_VFMIG_IOC_GET_VHCA_ID:
 		ret = vfmig_ioc_get_vhca_id(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_QUERY_VF:
+		ret = vfmig_ioc_query_vf(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;
@@ -215,6 +264,15 @@ int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 	init_rwsem(&vfmig->lock);
 	vfmig->pf_mdev = pf_mdev;
 
+	vfmig->max_vfs = pf_mdev->priv.sriov.max_vfs;
+	if (vfmig->max_vfs) {
+		vfmig->restored = bitmap_zalloc(vfmig->max_vfs, GFP_KERNEL);
+		if (!vfmig->restored) {
+			err = -ENOMEM;
+			goto err_free;
+		}
+	}
+
 	minor = ida_alloc_max(&mlx5_vfmig_minor_ida,
 			      MLX5_VFMIG_MAX_DEVICES - 1, GFP_KERNEL);
 	if (minor < 0) {
@@ -248,6 +306,7 @@ err_cdev:
 err_minor:
 	ida_free(&mlx5_vfmig_minor_ida, minor);
 err_free:
+	bitmap_free(vfmig->restored);
 	kfree(vfmig);
 	return err;
 }

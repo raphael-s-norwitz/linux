@@ -38,4 +38,24 @@ struct mlx5_vfmig_get_vhca_id {
 #define MLX5_VFMIG_IOC_GET_VHCA_ID \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x02, struct mlx5_vfmig_get_vhca_id)
 
+/*
+ * MLX5_VFMIG_IOC_QUERY_VF:
+ *   Diagnostic snapshot of one VF on the owning PF: its live vhca_id
+ *   (queried via QUERY_HCA_CAP(other_function=1)), the "restored" bit
+ *   latched on the PF, and the total number of VFs provisioned.
+ *   Userspace iterates @vf_id 0..num_vfs-1 to enumerate. Returns 0 on
+ *   success, or -ERANGE if @vf_id >= num_vfs (with @num_vfs still filled
+ *   in so callers can size their iteration).
+ */
+struct mlx5_vfmig_query_vf {
+	__u32 vf_id;		/* in  */
+	__u32 num_vfs;		/* out: total VFs provisioned on this PF */
+	__u16 vhca_id;		/* out */
+	__u8  restored;		/* out: 1 if MARK_RESTORED was issued */
+	__u8  reserved;
+};
+
+#define MLX5_VFMIG_IOC_QUERY_VF \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
