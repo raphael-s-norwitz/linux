@@ -352,6 +352,19 @@ static int vfmig_cmd_suspend_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 	return mlx5_cmd_exec_inout(pf_mdev, suspend_vhca, in, out);
 }
 
+static int vfmig_cmd_resume_vhca(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+				 u16 op_mod)
+{
+	u32 out[MLX5_ST_SZ_DW(resume_vhca_out)] = {};
+	u32 in[MLX5_ST_SZ_DW(resume_vhca_in)] = {};
+
+	MLX5_SET(resume_vhca_in, in, opcode, MLX5_CMD_OP_RESUME_VHCA);
+	MLX5_SET(resume_vhca_in, in, vhca_id, vhca_id);
+	MLX5_SET(resume_vhca_in, in, op_mod, op_mod);
+
+	return mlx5_cmd_exec_inout(pf_mdev, resume_vhca, in, out);
+}
+
 /* Park one ladder step deeper from state @s (RUNNING->P2P or P2P->STOP). */
 static int vfmig_dp_suspend_step(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 				 u8 s)
@@ -369,13 +382,30 @@ static int vfmig_dp_suspend_step(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 	return err;
 }
 
+/* Unpark one ladder step shallower from state @s (STOP->P2P or P2P->RUNNING). */
+static int vfmig_dp_resume_step(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
+				u8 s)
+{
+	u16 op_mod = (s == MLX5_VFMIG_DP_STOP) ?
+		MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_RESPONDER :
+		MLX5_RESUME_VHCA_IN_OP_MOD_RESUME_INITIATOR;
+	int err = vfmig_cmd_resume_vhca(pf_mdev, vhca_id, op_mod);
+
+	if (err)
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RESUME_VHCA(%s) vhca_id 0x%04x failed: %d\n",
+			       s == MLX5_VFMIG_DP_STOP ? "RESPONDER" : "INITIATOR",
+			       vhca_id, err);
+	return err;
+}
+
 /*
- * Walk the datapath ladder from @from toward the deeper @to one firmware
- * step at a time, latching the depth actually reached in *@reached. On a
- * step failure the walk stops and *@reached holds the truthful
- * intermediate depth, so the caller can recover with the inverse
- * operation. Returns 0 or the first firmware error; *@reached is always
- * set. The shallower (resume) direction is added by a later patch.
+ * Walk the datapath ladder from @from to @to one firmware step at a time
+ * (deeper via SUSPEND, shallower via RESUME), latching the depth actually
+ * reached in *@reached. On a step failure the walk stops and *@reached
+ * holds the truthful intermediate depth, so the caller can recover with
+ * the inverse operation. Returns 0 or the first firmware error; *@reached
+ * is always set.
  */
 static int vfmig_dp_transition(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 			       u8 from, u8 to, u8 *reached)
@@ -388,6 +418,12 @@ static int vfmig_dp_transition(struct mlx5_core_dev *pf_mdev, u16 vhca_id,
 		if (err)
 			break;
 		s++;
+	}
+	while (s > to) {		/* shallower resume */
+		err = vfmig_dp_resume_step(pf_mdev, vhca_id, s);
+		if (err)
+			break;
+		s--;
 	}
 
 	*reached = s;
@@ -504,6 +540,66 @@ static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
 	return 0;
 }
 
+static long vfmig_ioc_resume_vhca(struct mlx5_vfmig_pf *vfmig,
+				  void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_resume_vhca arg;
+	struct mlx5_core_sriov *sriov;
+	u8 cur, target, reached;
+	u32 dir;
+	u16 vhca_id;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved[0] || arg.reserved[1])
+		return -EINVAL;
+	dir = arg.flags ? arg.flags : MLX5_VFMIG_DIR_FLAG_ALL;
+	if (dir & ~(u32)MLX5_VFMIG_DIR_FLAG_ALL)
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	cur = sriov->vfs_ctx[arg.vf_id].vfmig_dp_state;
+
+	/*
+	 * Map the requested direction(s) onto a target depth: resuming the
+	 * responder revives it (STOP->P2P); resuming the initiator drives all
+	 * the way to RUNNING. An initiator-only resume while still STOP is out
+	 * of order (firmware requires responder-first) -- reject it.
+	 */
+	if ((dir & MLX5_VFMIG_DIR_FLAG_INITIATOR) &&
+	    !(dir & MLX5_VFMIG_DIR_FLAG_RESPONDER) &&
+	    cur == MLX5_VFMIG_DP_STOP)
+		return -EINVAL;
+
+	target = cur;
+	if ((dir & MLX5_VFMIG_DIR_FLAG_RESPONDER) && target > MLX5_VFMIG_DP_P2P)
+		target = MLX5_VFMIG_DP_P2P;
+	if (dir & MLX5_VFMIG_DIR_FLAG_INITIATOR)
+		target = MLX5_VFMIG_DP_RUNNING;
+
+	if (target >= cur)		/* already at or above the target */
+		return 0;
+
+	err = vfmig_query_vhca_id(pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	err = vfmig_dp_transition(pf_mdev, vhca_id, cur, target, &reached);
+	sriov->vfs_ctx[arg.vf_id].vfmig_dp_state = reached;
+	if (err)
+		return err;
+
+	mlx5_core_info(pf_mdev,
+		       "vfmig: resumed vf %u (vhca_id 0x%04x) datapath %u->%u\n",
+		       arg.vf_id, vhca_id, cur, reached);
+	return 0;
+}
+
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
@@ -531,6 +627,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_SUSPEND_VHCA:
 		ret = vfmig_ioc_suspend_vhca(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_RESUME_VHCA:
+		ret = vfmig_ioc_resume_vhca(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;
