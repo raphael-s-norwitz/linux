@@ -48,6 +48,13 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev);
 
 /*
+ * Clear all orchestrator-stamped per-VF UUIDs from the SR-IOV disable
+ * path so the "all-zeros after sriov_numvfs=0" SET_VF_UUID lifecycle
+ * holds even though the vf_uuid array survives the cycle.
+ */
+void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev);
+
+/*
  * Probe-time restore hooks, called from the VF's mlx5_function_enable().
  * mlx5_vfmig_vf_consume_restored() test-and-clears the "restored" latch
  * (returning the staged vhca_id) so the probe can skip INIT_HCA;
@@ -75,6 +82,11 @@ static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 
 static inline void
 mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
+{
+}
+
+static inline void
+mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev)
 {
 }
 

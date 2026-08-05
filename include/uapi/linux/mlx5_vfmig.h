@@ -58,17 +58,35 @@ struct mlx5_vfmig_get_vhca_id {
  * MLX5_VFMIG_IOC_QUERY_VF:
  *   Diagnostic snapshot of one VF on the owning PF: its live vhca_id
  *   (queried via QUERY_HCA_CAP(other_function=1)), the "restored" bit
- *   latched on the PF, and the total number of VFs provisioned.
- *   Userspace iterates @vf_id 0..num_vfs-1 to enumerate. Returns 0 on
- *   success, or -ERANGE if @vf_id >= num_vfs (with @num_vfs still filled
- *   in so callers can size their iteration).
+ *   latched on the PF, the orchestrator-stamped @vf_uuid (if any), and
+ *   the total number of VFs provisioned. Userspace iterates @vf_id
+ *   0..num_vfs-1 to enumerate. Returns 0 on success, or -ERANGE if
+ *   @vf_id >= num_vfs (with @num_vfs still filled in so callers can size
+ *   their iteration; @vhca_id / @restored / @vf_uuid are zeroed).
+ *
+ *   Output fields:
+ *     vhca_id:   live VHCA identifier.
+ *     restored:  1 if MARK_RESTORED was issued (or a LOAD blob staged)
+ *                for this VF, i.e. its next probe should skip INIT_HCA.
+ *     vf_uuid:   16-byte orchestrator-stamped per-VF identity tag set
+ *                via MLX5_VFMIG_IOC_SET_VF_UUID. All-zeros means unset.
+ *                Cleared on SR-IOV teardown (sriov_numvfs=0).
+ *
+ *   ABI note: this struct grew to add @vf_uuid + @reserved_out. The
+ *   encoded ioctl number changes with the struct size (sizeof in the
+ *   _IOWR macro), so old userspace built against the smaller struct gets
+ *   -ENOTTY from a new kernel rather than a partial read.
  */
 struct mlx5_vfmig_query_vf {
 	__u32 vf_id;		/* in  */
 	__u32 num_vfs;		/* out: total VFs provisioned on this PF */
 	__u16 vhca_id;		/* out */
 	__u8  restored;		/* out: 1 if MARK_RESTORED was issued */
-	__u8  reserved;
+	__u8  reserved;		/* out: reserved, zeroed */
+	__u8  vf_uuid[16];	/* out: orchestrator-stamped UUID,
+				 *      all-zeros if unset
+				 */
+	__u8  reserved_out[8];	/* out: zeroed */
 };
 
 #define MLX5_VFMIG_IOC_QUERY_VF \
@@ -260,5 +278,53 @@ struct mlx5_vfmig_load_state {
 
 #define MLX5_VFMIG_IOC_LOAD_VHCA_STATE \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x04, struct mlx5_vfmig_load_state)
+
+/*
+ * MLX5_VFMIG_IOC_SET_VF_UUID:
+ *   Stamp the orchestrator's 16-byte UUID onto VF @vf_id's per-VF slot.
+ *   Read back via MLX5_VFMIG_IOC_QUERY_VF on either the source or the
+ *   destination host. This is the orchestrator's handle on "this VF
+ *   carries this workload's identity"; it is the only identity tag CRIU's
+ *   dump and restore paths consult when binding a saved-state image to a
+ *   destination VF, because neither @vhca_id (per-PF allocator, unstable
+ *   across SAVE/LOAD) nor @vf_id (per-PF slot, may differ source vs
+ *   destination) is a workload-stable identifier.
+ *
+ *   The orchestrator (the SR-IOV provisioning layer) is the intended
+ *   caller, on both hosts, before the workload binds the VF and before
+ *   any LOAD_VHCA_STATE. CRIU never writes a UUID -- both dump and
+ *   restore only READ @vf_uuid via QUERY_VF.
+ *
+ *   Lifecycle:
+ *     - Initial state on sriov_numvfs=N: all-zeros (unset).
+ *     - SET_VF_UUID(vf_id, U) first call:      @vf_uuid := U.
+ *     - SET_VF_UUID(vf_id, U) repeat (same U): no-op, returns 0.
+ *     - SET_VF_UUID(vf_id, V), V != U, U != 0: -EBUSY, unchanged. Guards
+ *         against re-tagging a slot that already carries an identity.
+ *     - sriov_numvfs=0 / PF unload:            all-zeros (torn down).
+ *
+ *   "Set once until teardown": to repurpose a vf_id slot for a different
+ *   workload, cycle sriov_numvfs=0 -> N first (the same cycle that already
+ *   tears down the slot's other per-VF resources). Idempotent re-stamps
+ *   with the same UUID need no teardown.
+ *
+ *   Errors:
+ *     -EFAULT  copy_from_user.
+ *     -EINVAL  @vf_id out of range, @reserved non-zero, or @vf_uuid
+ *              all-zeros (all-zeros is the "unset" sentinel and is
+ *              rejected as a write).
+ *     -EBUSY   a different non-zero UUID is already set on @vf_id.
+ *     -ENODEV  PF is gone.
+ */
+struct mlx5_vfmig_set_vf_uuid {
+	__u32 vf_id;		/* in  */
+	__u32 reserved;		/* in: must be 0 */
+	__u8  vf_uuid[16];	/* in: orchestrator-supplied 16-byte
+				 *     UUID; must not be all-zeros.
+				 */
+};
+
+#define MLX5_VFMIG_IOC_SET_VF_UUID \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x12, struct mlx5_vfmig_set_vf_uuid)
 
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */
