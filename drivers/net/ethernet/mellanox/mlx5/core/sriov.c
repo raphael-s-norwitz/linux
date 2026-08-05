@@ -140,6 +140,13 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 	 */
 	mlx5_vfmig_pf_drop_pending_loads(dev);
 
+	/*
+	 * Clear orchestrator-stamped per-VF UUIDs so the SET_VF_UUID
+	 * "all-zeros after sriov_numvfs=0" lifecycle holds across the cycle
+	 * that the vf_uuid array (indexed by VF id) otherwise survives.
+	 */
+	mlx5_vfmig_pf_drop_vf_uuids(dev);
+
 	for (vf = num_vfs - 1; vf >= 0; vf--) {
 		if (!sriov->vfs_ctx[vf].enabled)
 			continue;

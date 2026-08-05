@@ -34,6 +34,7 @@
 #include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <linux/uuid.h>
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/driver.h>
 #include <linux/mlx5/vport.h>
@@ -112,8 +113,12 @@ struct mlx5_vfmig_vf_load {
  * @pending_load: per-VF staged LOAD_VHCA_STATE slots, indexed by VF id.
  *           A non-NULL entry is applied (and freed) by the VF's next
  *           probe. Mutated under @ctxs_lock. NULL array when @max_vfs 0.
- * @ctxs_lock: mutex protecting @save_ctxs / @load_ctxs list mutations
- *           and @pending_load slot install/take.
+ * @vf_uuid: per-VF orchestrator-stamped identity tag, indexed by VF id.
+ *           Stamped via SET_VF_UUID, read back via QUERY_VF, cleared on
+ *           SR-IOV teardown. Mutated under @ctxs_lock. NULL when
+ *           @max_vfs is 0.
+ * @ctxs_lock: mutex protecting @save_ctxs / @load_ctxs list mutations,
+ *           @pending_load slot install/take, and @vf_uuid stamping.
  * @save_ctxs: open SAVE_VHCA_STATE sessions (struct mlx5_vfmig_save_ctx).
  * @load_ctxs: open LOAD_VHCA_STATE sessions (struct mlx5_vfmig_load_ctx).
  */
@@ -127,6 +132,7 @@ struct mlx5_vfmig_pf {
 	u16			max_vfs;
 	unsigned long		*restored;
 	struct mlx5_vfmig_vf_load **pending_load;
+	uuid_t			*vf_uuid;
 	struct mutex		ctxs_lock; /* guards save_ctxs/load_ctxs */
 	struct list_head	save_ctxs;
 	struct list_head	load_ctxs;
@@ -142,6 +148,7 @@ static void vfmig_pf_release(struct kref *kref)
 	mutex_destroy(&vfmig->ctxs_lock);
 	bitmap_free(vfmig->restored);
 	kfree(vfmig->pending_load);
+	kfree(vfmig->vf_uuid);
 	ida_free(&mlx5_vfmig_minor_ida, vfmig->minor);
 	kfree(vfmig);
 }
@@ -280,10 +287,12 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	sriov = &vfmig->pf_mdev->priv.sriov;
 	arg.num_vfs = sriov->num_vfs;
 	arg.reserved = 0;
+	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
 
 	if (arg.vf_id >= sriov->num_vfs) {
 		arg.vhca_id = 0;
 		arg.restored = 0;
+		export_uuid(arg.vf_uuid, &uuid_null);
 		if (copy_to_user(uarg, &arg, sizeof(arg)))
 			return -EFAULT;
 		return -ERANGE;
@@ -297,10 +306,67 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	arg.restored = (arg.vf_id < vfmig->max_vfs &&
 			test_bit(arg.vf_id, vfmig->restored)) ? 1 : 0;
 
+	/* Serialise the 16-byte read against a concurrent SET_VF_UUID. */
+	mutex_lock(&vfmig->ctxs_lock);
+	if (arg.vf_id < vfmig->max_vfs)
+		export_uuid(arg.vf_uuid, &vfmig->vf_uuid[arg.vf_id]);
+	else
+		export_uuid(arg.vf_uuid, &uuid_null);
+	mutex_unlock(&vfmig->ctxs_lock);
+
 	if (copy_to_user(uarg, &arg, sizeof(arg)))
 		return -EFAULT;
 
 	return 0;
+}
+
+/*
+ * MLX5_VFMIG_IOC_SET_VF_UUID: stamp the orchestrator's 16-byte identity
+ * tag onto VF @vf_id. Set-once until SR-IOV teardown: a first stamp
+ * records the UUID, a same-UUID re-stamp is an idempotent no-op, and a
+ * different-UUID stamp is rejected -EBUSY (guards against re-tagging a
+ * slot that already carries a workload identity). uuid_null is the
+ * "unset" sentinel and is rejected as a write.
+ */
+static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
+				  void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_set_vf_uuid arg;
+	struct mlx5_core_sriov *sriov;
+	uuid_t new_uuid;
+	uuid_t *slot;
+	int err = 0;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+	import_uuid(&new_uuid, arg.vf_uuid);
+	if (uuid_is_null(&new_uuid))
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs || arg.vf_id >= vfmig->max_vfs)
+		return -EINVAL;
+
+	slot = &vfmig->vf_uuid[arg.vf_id];
+
+	mutex_lock(&vfmig->ctxs_lock);
+	if (uuid_is_null(slot)) {
+		uuid_copy(slot, &new_uuid);
+		mlx5_core_info(pf_mdev, "vfmig: SET_VF_UUID vf %u stamped\n",
+			       arg.vf_id);
+	} else if (uuid_equal(slot, &new_uuid)) {
+		/* Idempotent same-UUID re-stamp; no log line. */
+	} else {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SET_VF_UUID vf %u rejected: a different UUID is already stamped\n",
+			       arg.vf_id);
+		err = -EBUSY;
+	}
+	mutex_unlock(&vfmig->ctxs_lock);
+	return err;
 }
 
 /*
@@ -2031,6 +2097,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case MLX5_VFMIG_IOC_QUERY_VF:
 		ret = vfmig_ioc_query_vf(vfmig, uarg);
 		break;
+	case MLX5_VFMIG_IOC_SET_VF_UUID:
+		ret = vfmig_ioc_set_vf_uuid(vfmig, uarg);
+		break;
 	case MLX5_VFMIG_IOC_ENABLE_MIGRATABLE:
 		ret = vfmig_ioc_enable_migratable(vfmig, uarg);
 		break;
@@ -2265,6 +2334,43 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
 	vfmig_pf_put(vfmig);
 }
 
+/* Zero every per-VF vf_uuid slot. Caller holds vfmig->lock. */
+static void vfmig_drop_vf_uuids_locked(struct mlx5_vfmig_pf *vfmig)
+{
+	u32 i;
+
+	mutex_lock(&vfmig->ctxs_lock);
+	for (i = 0; i < vfmig->max_vfs; i++)
+		uuid_copy(&vfmig->vf_uuid[i], &uuid_null);
+	mutex_unlock(&vfmig->ctxs_lock);
+}
+
+/*
+ * Clear all stamped vf_uuids from mlx5_device_disable_sriov(): the
+ * vf_uuid array is indexed by VF id and survives an sriov_numvfs cycle,
+ * so a tag stamped for one VF generation must be cleared before the slot
+ * can be repurposed -- otherwise a SET_VF_UUID with the next workload's
+ * identity would hit the -EBUSY "different UUID already set" guard with
+ * no in-kernel clear path. No-op on VFs / before pf_init.
+ */
+void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev)
+{
+	struct mlx5_vfmig_pf *vfmig;
+
+	if (!pf_mdev || mlx5_core_is_vf(pf_mdev))
+		return;
+	vfmig = pf_mdev->priv.vfmig;
+	if (!vfmig)
+		return;
+
+	vfmig_pf_get(vfmig);
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_drop_vf_uuids_locked(vfmig);
+	up_read(&vfmig->lock);
+	vfmig_pf_put(vfmig);
+}
+
 int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig;
@@ -2298,6 +2404,13 @@ int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 					      sizeof(*vfmig->pending_load),
 					      GFP_KERNEL);
 		if (!vfmig->pending_load) {
+			err = -ENOMEM;
+			goto err_free;
+		}
+		vfmig->vf_uuid = kcalloc(vfmig->max_vfs,
+					 sizeof(*vfmig->vf_uuid),
+					 GFP_KERNEL);
+		if (!vfmig->vf_uuid) {
 			err = -ENOMEM;
 			goto err_free;
 		}
@@ -2339,6 +2452,7 @@ err_free:
 	mutex_destroy(&vfmig->ctxs_lock);
 	bitmap_free(vfmig->restored);
 	kfree(vfmig->pending_load);
+	kfree(vfmig->vf_uuid);
 	kfree(vfmig);
 	return err;
 }
