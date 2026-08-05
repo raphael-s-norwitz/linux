@@ -55,6 +55,14 @@ void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev);
 
 /*
+ * Free all per-VF IOVA arenas from the SR-IOV disable path, after the
+ * VFs are torn down. The iova_dom array survives an sriov_numvfs cycle,
+ * so an arena reserved for one VF generation must not leak into the
+ * next.
+ */
+void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev);
+
+/*
  * Probe-time restore hooks, called from the VF's mlx5_function_enable().
  * mlx5_vfmig_vf_consume_restored() test-and-clears the "restored" latch
  * (returning the staged vhca_id) so the probe can skip INIT_HCA;
@@ -87,6 +95,11 @@ mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
 
 static inline void
 mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev)
+{
+}
+
+static inline void
+mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
 {
 }
 
