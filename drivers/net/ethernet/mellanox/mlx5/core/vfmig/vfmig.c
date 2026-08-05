@@ -82,8 +82,9 @@ struct vfmig_wire_header {
  * @restored: per-VF "restored" latch, indexed by SR-IOV VF id. Set via
  *           MARK_RESTORED, read back via QUERY_VF. Accessed with atomic
  *           bitops; NULL when @max_vfs is 0.
- * @ctxs_lock: mutex protecting @save_ctxs list mutations.
+ * @ctxs_lock: mutex protecting @save_ctxs / @load_ctxs list mutations.
  * @save_ctxs: open SAVE_VHCA_STATE sessions (struct mlx5_vfmig_save_ctx).
+ * @load_ctxs: open LOAD_VHCA_STATE sessions (struct mlx5_vfmig_load_ctx).
  */
 struct mlx5_vfmig_pf {
 	struct kref		kref;
@@ -94,8 +95,9 @@ struct mlx5_vfmig_pf {
 	int			minor;
 	u16			max_vfs;
 	unsigned long		*restored;
-	struct mutex		ctxs_lock; /* guards save_ctxs mutations */
+	struct mutex		ctxs_lock; /* guards save_ctxs/load_ctxs */
 	struct list_head	save_ctxs;
+	struct list_head	load_ctxs;
 };
 
 static void vfmig_pf_release(struct kref *kref)
@@ -104,6 +106,7 @@ static void vfmig_pf_release(struct kref *kref)
 		container_of(kref, struct mlx5_vfmig_pf, kref);
 
 	WARN_ON(!list_empty(&vfmig->save_ctxs));
+	WARN_ON(!list_empty(&vfmig->load_ctxs));
 	mutex_destroy(&vfmig->ctxs_lock);
 	bitmap_free(vfmig->restored);
 	ida_free(&mlx5_vfmig_minor_ida, vfmig->minor);
@@ -1078,6 +1081,9 @@ static const struct file_operations mlx5_vfmig_save_fops = {
 	.release	= vfmig_save_release,
 };
 
+static bool vfmig_vf_id_load_busy_locked(struct mlx5_vfmig_pf *vfmig,
+					 u32 vf_id);
+
 /* True iff @vf_id already has an open SAVE session. ctxs_lock held. */
 static bool vfmig_vf_id_save_busy_locked(struct mlx5_vfmig_pf *vfmig, u32 vf_id)
 {
@@ -1087,6 +1093,17 @@ static bool vfmig_vf_id_save_busy_locked(struct mlx5_vfmig_pf *vfmig, u32 vf_id)
 		if (s->vf_id == vf_id)
 			return true;
 	return false;
+}
+
+/*
+ * True iff @vf_id has any open SAVE or LOAD session. SAVE and LOAD are
+ * mutually exclusive per VF so a session claims the vf_id for its whole
+ * lifetime. ctxs_lock held.
+ */
+static bool vfmig_vf_id_busy_locked(struct mlx5_vfmig_pf *vfmig, u32 vf_id)
+{
+	return vfmig_vf_id_save_busy_locked(vfmig, vf_id) ||
+	       vfmig_vf_id_load_busy_locked(vfmig, vf_id);
 }
 
 /*
@@ -1147,9 +1164,9 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	ctx->vhca_id = vhca_id;
 	ctx->flags = arg.flags;
 
-	/* Claim vf_id atomically vs other SAVE sessions. */
+	/* Claim vf_id atomically vs other SAVE/LOAD sessions. */
 	mutex_lock(&vfmig->ctxs_lock);
-	if (vfmig_vf_id_save_busy_locked(vfmig, ctx->vf_id)) {
+	if (vfmig_vf_id_busy_locked(vfmig, ctx->vf_id)) {
 		mutex_unlock(&vfmig->ctxs_lock);
 		err = -EBUSY;
 		goto err_claim;
@@ -1317,6 +1334,533 @@ err_claim:
 	return err;
 }
 
+/* -------- LOAD_VHCA_STATE: per-fd state buffer ------------------------- */
+
+/*
+ * Synchronous LOAD_VHCA_STATE. @size is the payload byte count the
+ * firmware should ingest from the MTT-mapped @mkey.
+ */
+static int vfmig_cmd_load_vhca_state(struct mlx5_core_dev *pf_mdev,
+				     u16 vhca_id, u32 mkey, size_t size)
+{
+	u32 out[MLX5_ST_SZ_DW(load_vhca_state_out)] = {};
+	u32 in[MLX5_ST_SZ_DW(load_vhca_state_in)] = {};
+
+	MLX5_SET(load_vhca_state_in, in, opcode, MLX5_CMD_OP_LOAD_VHCA_STATE);
+	MLX5_SET(load_vhca_state_in, in, op_mod, 0);
+	MLX5_SET(load_vhca_state_in, in, vhca_id, vhca_id);
+	MLX5_SET(load_vhca_state_in, in, mkey, mkey);
+	MLX5_SET(load_vhca_state_in, in, size, size);
+
+	return mlx5_cmd_exec_inout(pf_mdev, load_vhca_state, in, out);
+}
+
+/* Parser states for the write() FSM. */
+enum vfmig_load_state {
+	VFMIG_LS_READ_HEADER = 0,	/* accumulating the 16-byte header */
+	VFMIG_LS_PREP_IMAGE,		/* allocate staging for the payload */
+	VFMIG_LS_READ_IMAGE,		/* accumulating the FW_DATA payload */
+	VFMIG_LS_LOAD_IMAGE,		/* payload complete, run LOAD */
+	VFMIG_LS_DONE,			/* loaded; reject trailing bytes */
+};
+
+/*
+ * Per-LOAD-fd context, hung off vfmig->load_ctxs. Mirrors the SAVE ctx
+ * but in the write direction (DMA_TO_DEVICE): the write() FSM ingests one
+ * FW_DATA record, stages it into DMA pages + an MTT MKEY, and runs
+ * LOAD_VHCA_STATE once the payload is complete.
+ */
+struct mlx5_vfmig_load_ctx {
+	struct list_head node;		/* on vfmig->load_ctxs */
+	struct mlx5_vfmig_pf *vfmig;	/* holds a kref */
+	struct mutex io_lock;		/* serializes concurrent write()s */
+	u32 vf_id;
+	u16 vhca_id;
+
+	enum vfmig_load_state state;
+	u8 hdr_buf[sizeof(struct vfmig_wire_header)];
+	u32 hdr_filled;			/* header bytes accumulated */
+	u64 record_size;		/* FW_DATA payload size from header */
+	u64 image_filled;		/* payload bytes staged so far */
+	bool loaded;			/* LOAD_VHCA_STATE has run */
+
+	/* Firmware-tied resources, mutated under vfmig->lock. */
+	bool resources_freed;
+	bool pd_allocated;
+	u32 pdn;
+	bool image_dma_mapped;
+	bool image_mkey_created;
+	struct page **image_pages;
+	u32 image_npages;
+	u32 *image_mkey_in;
+	u32 image_mkey;
+	struct dma_iova_state image_dma_state;
+};
+
+/* True iff @vf_id already has an open LOAD session. ctxs_lock held. */
+static bool vfmig_vf_id_load_busy_locked(struct mlx5_vfmig_pf *vfmig,
+					 u32 vf_id)
+{
+	struct mlx5_vfmig_load_ctx *l;
+
+	list_for_each_entry(l, &vfmig->load_ctxs, node)
+		if (l->vf_id == vf_id)
+			return true;
+	return false;
+}
+
+/* Accumulate up to @want header bytes; returns bytes taken or -EFAULT. */
+static ssize_t vfmig_load_consume_header(struct mlx5_vfmig_load_ctx *ctx,
+					 const char __user *ubuf, size_t want)
+{
+	size_t need = sizeof(ctx->hdr_buf) - ctx->hdr_filled;
+	size_t take = min(need, want);
+
+	if (!take)
+		return 0;
+	if (copy_from_user(ctx->hdr_buf + ctx->hdr_filled, ubuf, take))
+		return -EFAULT;
+	ctx->hdr_filled += take;
+	return take;
+}
+
+/* Copy @want payload bytes from user into the staging pages at image_filled. */
+static ssize_t vfmig_load_consume_image(struct mlx5_vfmig_load_ctx *ctx,
+					const char __user *ubuf, size_t want)
+{
+	size_t copied = 0;
+
+	while (want) {
+		size_t page_off = ctx->image_filled & (PAGE_SIZE - 1);
+		u32 page_idx = ctx->image_filled >> PAGE_SHIFT;
+		size_t chunk = min_t(size_t, want, PAGE_SIZE - page_off);
+		u8 *to;
+
+		if (page_idx >= ctx->image_npages)
+			return copied ? (ssize_t)copied : -EINVAL;
+
+		to = kmap_local_page(ctx->image_pages[page_idx]);
+		if (copy_from_user(to + page_off, ubuf, chunk)) {
+			kunmap_local(to);
+			return copied ? (ssize_t)copied : -EFAULT;
+		}
+		kunmap_local(to);
+
+		ctx->image_filled += chunk;
+		ubuf += chunk;
+		want -= chunk;
+		copied += chunk;
+	}
+	return copied;
+}
+
+/*
+ * Allocate the staging buffer (@want_npages pages) + MTT MKEY the firmware
+ * will read for LOAD_VHCA_STATE. The PD was allocated in the ioctl handler.
+ * Caller holds vfmig->lock for read.
+ */
+static int vfmig_load_prepare_image(struct mlx5_vfmig_load_ctx *ctx,
+				    u32 want_npages)
+{
+	struct mlx5_core_dev *pf_mdev = ctx->vfmig->pf_mdev;
+	int err;
+
+	if (WARN_ON(!pf_mdev))
+		return -ENODEV;
+
+	err = vfmig_alloc_pages(&ctx->image_pages, want_npages);
+	if (err)
+		return err;
+	ctx->image_npages = want_npages;
+
+	ctx->image_mkey_in = vfmig_alloc_mkey_in(want_npages, ctx->pdn);
+	if (!ctx->image_mkey_in) {
+		err = -ENOMEM;
+		goto err_pages;
+	}
+
+	err = vfmig_register_dma_pages(pf_mdev, want_npages, ctx->image_pages,
+				       ctx->image_mkey_in,
+				       &ctx->image_dma_state, DMA_TO_DEVICE);
+	if (err)
+		goto err_mkey_in;
+	ctx->image_dma_mapped = true;
+
+	err = vfmig_create_mkey(pf_mdev, want_npages, ctx->image_mkey_in,
+				&ctx->image_mkey);
+	if (err)
+		goto err_dma;
+	ctx->image_mkey_created = true;
+	return 0;
+
+err_dma:
+	vfmig_unregister_dma_pages(pf_mdev, want_npages, ctx->image_mkey_in,
+				   &ctx->image_dma_state, DMA_TO_DEVICE);
+	ctx->image_dma_mapped = false;
+err_mkey_in:
+	kvfree(ctx->image_mkey_in);
+	ctx->image_mkey_in = NULL;
+err_pages:
+	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
+	ctx->image_pages = NULL;
+	ctx->image_npages = 0;
+	return err;
+}
+
+/* Validate the parsed 16-byte header. Only a single FW_DATA record is OK. */
+static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
+{
+	struct vfmig_wire_header *hdr =
+		(struct vfmig_wire_header *)ctx->hdr_buf;
+	u64 record_size = le64_to_cpu(hdr->record_size);
+	u32 flags = le32_to_cpu(hdr->flags);
+	u32 tag = le32_to_cpu(hdr->tag);
+
+	if (tag != VFMIG_WIRE_TAG_FW_DATA || flags) {
+		mlx5_core_warn(ctx->vfmig->pf_mdev,
+			       "vfmig: vf %u: unsupported LOAD record (tag 0x%x flags 0x%x)\n",
+			       ctx->vf_id, tag, flags);
+		return -EOPNOTSUPP;
+	}
+	if (ctx->loaded) {
+		mlx5_core_warn(ctx->vfmig->pf_mdev,
+			       "vfmig: vf %u: multiple FW_DATA records per LOAD session not supported\n",
+			       ctx->vf_id);
+		return -EINVAL;
+	}
+	if (!record_size || record_size > VFMIG_MAX_SAVE_SIZE)
+		return -EINVAL;
+
+	ctx->record_size = record_size;
+	ctx->image_filled = 0;
+	ctx->state = VFMIG_LS_PREP_IMAGE;
+	return 0;
+}
+
+/* Install the staged payload into the (suspended) VHCA. */
+static int vfmig_load_run_load(struct mlx5_vfmig_load_ctx *ctx)
+{
+	struct mlx5_core_dev *pf_mdev = ctx->vfmig->pf_mdev;
+	int err;
+
+	if (WARN_ON(!ctx->image_mkey_created))
+		return -EINVAL;
+
+	err = vfmig_cmd_load_vhca_state(pf_mdev, ctx->vhca_id, ctx->image_mkey,
+					ctx->record_size);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: LOAD_VHCA_STATE vf %u (vhca_id 0x%04x) failed: %d\n",
+			       ctx->vf_id, ctx->vhca_id, err);
+		return err;
+	}
+
+	ctx->loaded = true;
+	ctx->state = VFMIG_LS_DONE;
+	mlx5_core_info(pf_mdev,
+		       "vfmig: loaded vf %u (vhca_id 0x%04x) state: %llu bytes\n",
+		       ctx->vf_id, ctx->vhca_id, ctx->record_size);
+	return 0;
+}
+
+/*
+ * Advance the parser one step, consuming from [*ubuf, *ubuf+*left). Some
+ * transitions consume zero bytes but are mandatory work, so the caller
+ * loops on @progressed rather than on @left.
+ */
+static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
+			   const char __user **ubuf, size_t *left,
+			   bool *progressed)
+{
+	u32 want_npages;
+	ssize_t n;
+	int err;
+
+	switch (ctx->state) {
+	case VFMIG_LS_READ_HEADER:
+		n = vfmig_load_consume_header(ctx, *ubuf, *left);
+		if (n < 0)
+			return n;
+		*ubuf += n;
+		*left -= n;
+		*progressed = n > 0;
+		if (ctx->hdr_filled == sizeof(ctx->hdr_buf))
+			return vfmig_load_dispatch_header(ctx);
+		return 0;
+	case VFMIG_LS_PREP_IMAGE:
+		want_npages = max_t(u32, 1,
+				    DIV_ROUND_UP(ctx->record_size, PAGE_SIZE));
+		err = vfmig_load_prepare_image(ctx, want_npages);
+		if (err)
+			return err;
+		ctx->state = VFMIG_LS_READ_IMAGE;
+		*progressed = true;
+		return 0;
+	case VFMIG_LS_READ_IMAGE: {
+		size_t want = min_t(size_t, *left,
+				    ctx->record_size - ctx->image_filled);
+
+		if (want) {
+			n = vfmig_load_consume_image(ctx, *ubuf, want);
+			if (n < 0)
+				return n;
+			*ubuf += n;
+			*left -= n;
+			*progressed = n > 0;
+		}
+		if (ctx->image_filled == ctx->record_size) {
+			ctx->state = VFMIG_LS_LOAD_IMAGE;
+			*progressed = true;
+		}
+		return 0;
+	}
+	case VFMIG_LS_LOAD_IMAGE:
+		err = vfmig_load_run_load(ctx);
+		if (err)
+			return err;
+		*progressed = true;
+		return 0;
+	case VFMIG_LS_DONE:
+	default:
+		/* A complete blob was already loaded; trailing bytes are junk. */
+		if (*left)
+			return -EINVAL;
+		return 0;
+	}
+}
+
+static ssize_t vfmig_load_write(struct file *filp, const char __user *ubuf,
+				size_t count, loff_t *ppos)
+{
+	struct mlx5_vfmig_load_ctx *ctx = filp->private_data;
+	struct mlx5_vfmig_pf *vfmig = ctx->vfmig;
+	const char __user *cursor = ubuf;
+	size_t left = count;
+	ssize_t produced;
+	bool progressed;
+	int err = 0;
+
+	if (!count)
+		return 0;
+
+	mutex_lock(&ctx->io_lock);
+	down_read(&vfmig->lock);
+	if (vfmig->dead || ctx->resources_freed) {
+		err = -ENODEV;
+		goto out;
+	}
+
+	/* Drive the FSM until it stops making progress (not until left==0). */
+	for (;;) {
+		progressed = false;
+		err = vfmig_load_step(ctx, &cursor, &left, &progressed);
+		if (err || !progressed)
+			break;
+	}
+out:
+	up_read(&vfmig->lock);
+	mutex_unlock(&ctx->io_lock);
+
+	produced = (ssize_t)(count - left);
+	if (!produced && err)
+		return err;
+	return produced;	/* stream_open() => ppos is NULL, leave it */
+}
+
+/*
+ * Drop the firmware-tied resources held by @ctx. Idempotent via
+ * @resources_freed. Called from release() (pf_mdev alive) or pf_cleanup()
+ * (before pf_mdev is NULLed). The image page list is host memory and is
+ * freed separately in release(). Caller holds vfmig->lock.
+ */
+static void vfmig_load_release_resources(struct mlx5_vfmig_load_ctx *ctx)
+{
+	struct mlx5_core_dev *pf_mdev = ctx->vfmig->pf_mdev;
+
+	if (ctx->resources_freed)
+		return;
+	ctx->resources_freed = true;
+
+	if (!pf_mdev)
+		return;
+
+	if (ctx->image_mkey_created) {
+		mlx5_core_destroy_mkey(pf_mdev, ctx->image_mkey);
+		ctx->image_mkey_created = false;
+	}
+	if (ctx->image_dma_mapped) {
+		vfmig_unregister_dma_pages(pf_mdev, ctx->image_npages,
+					   ctx->image_mkey_in,
+					   &ctx->image_dma_state,
+					   DMA_TO_DEVICE);
+		ctx->image_dma_mapped = false;
+	}
+	kvfree(ctx->image_mkey_in);
+	ctx->image_mkey_in = NULL;
+
+	if (ctx->pd_allocated) {
+		mlx5_core_dealloc_pd(pf_mdev, ctx->pdn);
+		ctx->pd_allocated = false;
+	}
+}
+
+static int vfmig_load_release(struct inode *inode, struct file *filp)
+{
+	struct mlx5_vfmig_load_ctx *ctx = filp->private_data;
+	struct mlx5_vfmig_pf *vfmig = ctx->vfmig;
+
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_load_release_resources(ctx);
+	up_read(&vfmig->lock);
+
+	mutex_lock(&vfmig->ctxs_lock);
+	list_del(&ctx->node);
+	mutex_unlock(&vfmig->ctxs_lock);
+
+	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
+	mutex_destroy(&ctx->io_lock);
+	vfmig_pf_put(vfmig);
+	kfree(ctx);
+	return 0;
+}
+
+static const struct file_operations mlx5_vfmig_load_fops = {
+	.owner		= THIS_MODULE,
+	.write		= vfmig_load_write,
+	.release	= vfmig_load_release,
+};
+
+/*
+ * Set up a LOAD session on a VF already quiesced to STOP: resolve vhca_id,
+ * allocate a PD, and hand back a write-only anon-inode fd. The staging
+ * buffer + MKEY are allocated lazily once write() sees the record size,
+ * and LOAD_VHCA_STATE runs when the payload completes. Caller holds
+ * vfmig->lock for read.
+ */
+static long vfmig_ioc_load_vhca_state(struct mlx5_vfmig_pf *vfmig,
+				      void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_load_state arg;
+	struct mlx5_vfmig_load_ctx *ctx;
+	struct mlx5_core_sriov *sriov;
+	bool migratable = false;
+	struct file *file;
+	u16 vhca_id;
+	int fd, err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.flags || arg.reserved)
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+
+	/* Firmware rejects LOAD unless the VHCA is fully suspended to STOP. */
+	if (sriov->vfs_ctx[arg.vf_id].vfmig_dp_state != MLX5_VFMIG_DP_STOP) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u must be suspended to STOP before LOAD\n",
+			       arg.vf_id);
+		return -EINVAL;
+	}
+
+	err = vfmig_check_pf_migration_caps(pf_mdev);
+	if (err)
+		return err;
+
+	err = vfmig_query_vf_migratable(pf_mdev, arg.vf_id, &migratable);
+	if (err)
+		return err;
+	if (!migratable) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u is not migration-enabled\n",
+			       arg.vf_id);
+		return -EOPNOTSUPP;
+	}
+
+	err = vfmig_query_vhca_id(pf_mdev, arg.vf_id + 1, &vhca_id);
+	if (err)
+		return err;
+
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&ctx->node);
+	mutex_init(&ctx->io_lock);
+	ctx->vf_id = arg.vf_id;
+	ctx->vhca_id = vhca_id;
+	ctx->state = VFMIG_LS_READ_HEADER;
+
+	/* Claim vf_id atomically vs other SAVE/LOAD sessions. */
+	mutex_lock(&vfmig->ctxs_lock);
+	if (vfmig_vf_id_busy_locked(vfmig, ctx->vf_id)) {
+		mutex_unlock(&vfmig->ctxs_lock);
+		err = -EBUSY;
+		goto err_claim;
+	}
+	vfmig_pf_get(vfmig);
+	ctx->vfmig = vfmig;
+	list_add(&ctx->node, &vfmig->load_ctxs);
+	mutex_unlock(&vfmig->ctxs_lock);
+
+	err = mlx5_core_alloc_pd(pf_mdev, &ctx->pdn);
+	if (err)
+		goto err_res;
+	ctx->pd_allocated = true;
+
+	fd = get_unused_fd_flags(O_CLOEXEC);
+	if (fd < 0) {
+		err = fd;
+		goto err_res;
+	}
+
+	file = anon_inode_getfile("mlx5_vfmig_load", &mlx5_vfmig_load_fops,
+				  ctx, O_WRONLY | O_CLOEXEC);
+	if (IS_ERR(file)) {
+		err = PTR_ERR(file);
+		goto err_fd;
+	}
+	stream_open(file_inode(file), file);
+
+	arg.load_fd = fd;
+	if (copy_to_user(uarg, &arg, sizeof(arg))) {
+		err = -EFAULT;
+		goto err_file;
+	}
+
+	fd_install(fd, file);
+	mlx5_core_info(pf_mdev,
+		       "vfmig: LOAD session opened for vf %u (vhca_id 0x%04x)\n",
+		       arg.vf_id, vhca_id);
+	return 0;
+
+err_file:
+	/* fput() runs vfmig_load_release, which frees resources + ctx. */
+	fput(file);
+	put_unused_fd(fd);
+	return err;
+err_fd:
+	put_unused_fd(fd);
+err_res:
+	vfmig_load_release_resources(ctx);
+	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
+	mutex_lock(&vfmig->ctxs_lock);
+	list_del(&ctx->node);
+	mutex_unlock(&vfmig->ctxs_lock);
+	vfmig_pf_put(vfmig);
+	mutex_destroy(&ctx->io_lock);
+	kfree(ctx);
+	return err;
+err_claim:
+	mutex_destroy(&ctx->io_lock);
+	kfree(ctx);
+	return err;
+}
+
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
@@ -1350,6 +1894,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_SAVE_VHCA_STATE:
 		ret = vfmig_ioc_save_vhca_state(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_LOAD_VHCA_STATE:
+		ret = vfmig_ioc_load_vhca_state(vfmig, uarg);
 		break;
 	default:
 		ret = -ENOTTY;
@@ -1388,6 +1935,7 @@ int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 	init_rwsem(&vfmig->lock);
 	mutex_init(&vfmig->ctxs_lock);
 	INIT_LIST_HEAD(&vfmig->save_ctxs);
+	INIT_LIST_HEAD(&vfmig->load_ctxs);
 	vfmig->pf_mdev = pf_mdev;
 
 	vfmig->max_vfs = pf_mdev->priv.sriov.max_vfs;
@@ -1442,6 +1990,7 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig = pf_mdev->priv.vfmig;
 	struct mlx5_vfmig_save_ctx *save_ctx;
+	struct mlx5_vfmig_load_ctx *load_ctx;
 	dev_t devt;
 
 	if (!vfmig)
@@ -1450,16 +1999,19 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 	pf_mdev->priv.vfmig = NULL;
 
 	/*
-	 * Neuter the device. Tear down open SAVE sessions' firmware
+	 * Neuter the device. Tear down open SAVE/LOAD sessions' firmware
 	 * resources (PD/MKEY/DMA) while pf_mdev is still alive; the page
 	 * lists themselves are mdev-independent and get freed when each fd
 	 * is later closed. The down_write blocks until all in-flight
-	 * readers drop their read locks, after which save_ctxs is stable.
+	 * readers/writers drop their read locks, after which the session
+	 * lists are stable.
 	 */
 	down_write(&vfmig->lock);
 	vfmig->dead = true;
 	list_for_each_entry(save_ctx, &vfmig->save_ctxs, node)
 		vfmig_save_release_resources(save_ctx);
+	list_for_each_entry(load_ctx, &vfmig->load_ctxs, node)
+		vfmig_load_release_resources(load_ctx);
 	vfmig->pf_mdev = NULL;
 	up_write(&vfmig->lock);
 
