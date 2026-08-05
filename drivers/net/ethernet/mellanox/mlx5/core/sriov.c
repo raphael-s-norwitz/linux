@@ -147,6 +147,18 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 	 */
 	mlx5_vfmig_pf_drop_vf_uuids(dev);
 
+	/*
+	 * Backstop free of per-VF vfmig IOVA domains for the driver-unload
+	 * path (mlx5_sriov_detach() -> here), where the VFs are disabled
+	 * without going through mlx5_sriov_disable(). The VFs still exist as
+	 * PCI devices here, so each domain releases its arena reservation
+	 * back to the VF's still-live managed DMA-IOMMU domain before the VF
+	 * goes away. Idempotent: on the sriov_numvfs=0 path
+	 * mlx5_sriov_disable() has already freed the domains after
+	 * pci_disable_sriov(), so this is a no-op there.
+	 */
+	mlx5_vfmig_pf_drop_iova_domains(dev);
+
 	for (vf = num_vfs - 1; vf >= 0; vf--) {
 		if (!sriov->vfs_ctx[vf].enabled)
 			continue;
@@ -222,7 +234,15 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	struct devlink *devlink = priv_to_devlink(dev);
 	int num_vfs = pci_num_vf(dev->pdev);
 
+	/*
+	 * Free any per-VF vfmig IOVA arenas after pci_disable_sriov() has
+	 * removed the VFs. Each arena is a fixed reservation inside the VF's
+	 * own managed DMA-IOMMU domain, reclaimed automatically when the VF
+	 * (and its domain) go away, so there is no ordering hazard against
+	 * the VF teardown -- we just free the bookkeeping structs here.
+	 */
 	pci_disable_sriov(pdev);
+	mlx5_vfmig_pf_drop_iova_domains(dev);
 	devl_lock(devlink);
 	mlx5_device_disable_sriov(dev, num_vfs, true, num_vf_change);
 	devl_unlock(devlink);

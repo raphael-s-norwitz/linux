@@ -42,6 +42,7 @@
 
 #include "mlx5_core.h"
 #include "vfmig.h"
+#include "vfmig_iova.h"
 
 /* Char-device major/minor range shared by all per-PF vfmig cdevs. */
 #define MLX5_VFMIG_MAX_DEVICES 256
@@ -117,8 +118,16 @@ struct mlx5_vfmig_vf_load {
  *           Stamped via SET_VF_UUID, read back via QUERY_VF, cleared on
  *           SR-IOV teardown. Mutated under @ctxs_lock. NULL when
  *           @max_vfs is 0.
+ * @iova_dom: per-VF deterministic IOVA domain, indexed by VF id. A
+ *           non-NULL entry means the VF is "tracked": a fixed-IOVA
+ *           arena is reserved on its managed DMA-IOMMU domain (see
+ *           vfmig_iova.c). Installed
+ *           via SET_TRACKED, read back as @tracked via QUERY_VF, torn
+ *           down on SR-IOV teardown / PF unload. Mutated under
+ *           @ctxs_lock. NULL array when @max_vfs is 0.
  * @ctxs_lock: mutex protecting @save_ctxs / @load_ctxs list mutations,
- *           @pending_load slot install/take, and @vf_uuid stamping.
+ *           @pending_load slot install/take, @vf_uuid stamping, and
+ *           @iova_dom slot publish/take.
  * @save_ctxs: open SAVE_VHCA_STATE sessions (struct mlx5_vfmig_save_ctx).
  * @load_ctxs: open LOAD_VHCA_STATE sessions (struct mlx5_vfmig_load_ctx).
  */
@@ -133,6 +142,7 @@ struct mlx5_vfmig_pf {
 	unsigned long		*restored;
 	struct mlx5_vfmig_vf_load **pending_load;
 	uuid_t			*vf_uuid;
+	struct vfmig_iova_domain **iova_dom;
 	struct mutex		ctxs_lock; /* guards save_ctxs/load_ctxs */
 	struct list_head	save_ctxs;
 	struct list_head	load_ctxs;
@@ -149,6 +159,7 @@ static void vfmig_pf_release(struct kref *kref)
 	bitmap_free(vfmig->restored);
 	kfree(vfmig->pending_load);
 	kfree(vfmig->vf_uuid);
+	kfree(vfmig->iova_dom);
 	ida_free(&mlx5_vfmig_minor_ida, vfmig->minor);
 	kfree(vfmig);
 }
@@ -286,7 +297,7 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 
 	sriov = &vfmig->pf_mdev->priv.sriov;
 	arg.num_vfs = sriov->num_vfs;
-	arg.reserved = 0;
+	arg.tracked = 0;
 	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
 
 	if (arg.vf_id >= sriov->num_vfs) {
@@ -306,12 +317,17 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	arg.restored = (arg.vf_id < vfmig->max_vfs &&
 			test_bit(arg.vf_id, vfmig->restored)) ? 1 : 0;
 
-	/* Serialise the 16-byte read against a concurrent SET_VF_UUID. */
+	/*
+	 * Serialise the 16-byte read against a concurrent SET_VF_UUID and
+	 * the @tracked read against a concurrent SET_TRACKED publish/take.
+	 */
 	mutex_lock(&vfmig->ctxs_lock);
-	if (arg.vf_id < vfmig->max_vfs)
+	if (arg.vf_id < vfmig->max_vfs) {
 		export_uuid(arg.vf_uuid, &vfmig->vf_uuid[arg.vf_id]);
-	else
+		arg.tracked = vfmig->iova_dom[arg.vf_id] ? 1 : 0;
+	} else {
 		export_uuid(arg.vf_uuid, &uuid_null);
+	}
 	mutex_unlock(&vfmig->ctxs_lock);
 
 	if (copy_to_user(uarg, &arg, sizeof(arg)))
@@ -366,6 +382,147 @@ static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
 		err = -EBUSY;
 	}
 	mutex_unlock(&vfmig->ctxs_lock);
+	return err;
+}
+
+/*
+ * Resolve VF @vf_id (SR-IOV index under @pf_pdev) to its pci_dev,
+ * returning a held reference (drop with pci_dev_put()). We can't derive
+ * the VF's BDF directly (pci_iov_virtfn_bus() is not exported to
+ * modules, only the ..._devfn variant), so walk the PCI device list and
+ * match on (physfn, pci_iov_vf_id). O(num_pci_devs) on a slow ioctl
+ * path, which is fine. Returns NULL if no matching VF is present.
+ */
+static struct pci_dev *vfmig_get_vf_pdev(struct pci_dev *pf_pdev, u32 vf_id)
+{
+	struct pci_dev *iter = NULL;
+
+	for_each_pci_dev(iter) {
+		if (iter->is_virtfn &&
+		    iter->physfn == pf_pdev &&
+		    pci_iov_vf_id(iter) == (int)vf_id)
+			return iter;	/* for_each_pci_dev kept the ref */
+	}
+	return NULL;
+}
+
+/*
+ * MLX5_VFMIG_IOC_SET_TRACKED: couple a per-VF deterministic IOVA domain
+ * to VF @vf_id. The domain pointer in iova_dom[vf_id] IS the "tracked"
+ * state -- non-NULL means a fixed-IOVA arena is reserved on the VF's
+ * managed DMA-IOMMU domain (see vfmig_iova.c).
+ *
+ * The VF must be unbound: we hold the VF pci_dev's device_lock to read
+ * ->dev.driver atomically with the reserve/release, so the state and any
+ * concurrent driver probe/remove see consistent ordering. On enable we
+ * create the domain (reserve the arena), then publish the pointer under
+ * ctxs_lock; on disable we take the pointer under ctxs_lock and NULL it.
+ * The domain is always created/destroyed outside ctxs_lock (the iommu
+ * core takes group locks and may sleep) but the pointer publish/take is
+ * under it, matching the QUERY_VF @tracked read.
+ *
+ * Idempotent toggles (already in the requested state) are silent no-ops.
+ * The "already N, no-op" line is mlx5_core_info on purpose: a SET_TRACKED
+ * that silently no-ops is the classic symptom of userspace run against a
+ * stale mlx5_core.ko, and a default-visible breadcrumb makes the version
+ * skew easy to spot.
+ */
+static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
+				  void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct vfmig_iova_domain *new_dom = NULL;
+	struct vfmig_iova_domain *old_dom = NULL;
+	struct mlx5_vfmig_set_tracked arg;
+	struct mlx5_core_sriov *sriov;
+	struct pci_dev *vf_pdev;
+	bool desired, tracked;
+	int err = 0;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.flags || arg.reserved)
+		return -EINVAL;
+	if (arg.enable > 1)
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs || arg.vf_id >= vfmig->max_vfs)
+		return -EINVAL;
+
+	desired = (arg.enable == 1);
+
+	mutex_lock(&vfmig->ctxs_lock);
+	tracked = vfmig->iova_dom[arg.vf_id];
+	mutex_unlock(&vfmig->ctxs_lock);
+
+	if (tracked == desired) {
+		mlx5_core_info(pf_mdev,
+			       "vfmig: SET_TRACKED vf %u: already %d, no-op\n",
+			       arg.vf_id, desired);
+		return 0;
+	}
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SET_TRACKED vf %u: VF pci_dev lookup failed\n",
+			       arg.vf_id);
+		return -ENODEV;
+	}
+
+	device_lock(&vf_pdev->dev);
+	if (vf_pdev->dev.driver) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SET_TRACKED vf %u rejected: VF is bound to %s (must be unbound first)\n",
+			       arg.vf_id, vf_pdev->dev.driver->name);
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
+	if (desired) {
+		err = vfmig_iova_domain_create(vf_pdev, arg.vf_id, &new_dom);
+		if (err) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SET_TRACKED vf %u: iova_domain_create failed: %d\n",
+				       arg.vf_id, err);
+			goto out_unlock;
+		}
+		mutex_lock(&vfmig->ctxs_lock);
+		/*
+		 * Belt-and-suspenders: a domain already parked here with
+		 * our earlier tracked==0 read is a state-machine bug.
+		 * Detect, stash it for destruction, don't leak.
+		 */
+		if (WARN_ON_ONCE(vfmig->iova_dom[arg.vf_id]))
+			old_dom = vfmig->iova_dom[arg.vf_id];
+		vfmig->iova_dom[arg.vf_id] = new_dom;
+		mutex_unlock(&vfmig->ctxs_lock);
+		mlx5_core_info(pf_mdev,
+			       "vfmig: vf %u tracked=1, iova domain attached\n",
+			       arg.vf_id);
+	} else {
+		mutex_lock(&vfmig->ctxs_lock);
+		old_dom = vfmig->iova_dom[arg.vf_id];
+		vfmig->iova_dom[arg.vf_id] = NULL;
+		mutex_unlock(&vfmig->ctxs_lock);
+		mlx5_core_info(pf_mdev,
+			       "vfmig: vf %u tracked=0, iova domain detaching\n",
+			       arg.vf_id);
+	}
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+
+	/*
+	 * Destroy the old domain outside device_lock: domain_destroy
+	 * detaches via iommu_detach_device (iommu group locks) and frees
+	 * the domain, none of which benefits from holding device_lock and
+	 * avoids any device-lock vs iommu-group ordering hazards.
+	 */
+	if (old_dom)
+		vfmig_iova_domain_destroy(old_dom);
 	return err;
 }
 
@@ -2100,6 +2257,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case MLX5_VFMIG_IOC_SET_VF_UUID:
 		ret = vfmig_ioc_set_vf_uuid(vfmig, uarg);
 		break;
+	case MLX5_VFMIG_IOC_SET_TRACKED:
+		ret = vfmig_ioc_set_tracked(vfmig, uarg);
+		break;
 	case MLX5_VFMIG_IOC_ENABLE_MIGRATABLE:
 		ret = vfmig_ioc_enable_migratable(vfmig, uarg);
 		break;
@@ -2371,6 +2531,57 @@ void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev)
 	vfmig_pf_put(vfmig);
 }
 
+/*
+ * Detach + free every attached per-VF IOVA domain and clear the array.
+ * Caller holds vfmig->lock; ctxs_lock is taken to unpublish each slot,
+ * then dropped around the sleepable vfmig_iova_domain_destroy() (which
+ * detaches via iommu_detach_device and may take iommu-group locks).
+ */
+static void vfmig_drop_iova_domains_locked(struct mlx5_vfmig_pf *vfmig)
+{
+	u32 i;
+
+	mutex_lock(&vfmig->ctxs_lock);
+	for (i = 0; i < vfmig->max_vfs; i++) {
+		struct vfmig_iova_domain *dom = vfmig->iova_dom[i];
+
+		if (!dom)
+			continue;
+		vfmig->iova_dom[i] = NULL;
+		mutex_unlock(&vfmig->ctxs_lock);
+		vfmig_iova_domain_destroy(dom);
+		mutex_lock(&vfmig->ctxs_lock);
+	}
+	mutex_unlock(&vfmig->ctxs_lock);
+}
+
+/*
+ * Free all per-VF IOVA domains from mlx5_device_disable_sriov(), which
+ * runs BEFORE pci_disable_sriov() tears the VFs down. Each domain's fixed
+ * IOVA reservation must be released while its VF still exists, so the
+ * DMA-IOVA core frees it against the live managed domain rather than
+ * leaking the range. The iova_dom array is indexed by VF id and survives
+ * an sriov_numvfs cycle, so an arena reserved for one VF generation must
+ * not leak into the next. No-op on VFs / before pf_init.
+ */
+void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
+{
+	struct mlx5_vfmig_pf *vfmig;
+
+	if (!pf_mdev || mlx5_core_is_vf(pf_mdev))
+		return;
+	vfmig = pf_mdev->priv.vfmig;
+	if (!vfmig)
+		return;
+
+	vfmig_pf_get(vfmig);
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_drop_iova_domains_locked(vfmig);
+	up_read(&vfmig->lock);
+	vfmig_pf_put(vfmig);
+}
+
 int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig;
@@ -2414,6 +2625,13 @@ int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 			err = -ENOMEM;
 			goto err_free;
 		}
+		vfmig->iova_dom = kcalloc(vfmig->max_vfs,
+					  sizeof(*vfmig->iova_dom),
+					  GFP_KERNEL);
+		if (!vfmig->iova_dom) {
+			err = -ENOMEM;
+			goto err_free;
+		}
 	}
 
 	minor = ida_alloc_max(&mlx5_vfmig_minor_ida,
@@ -2453,6 +2671,7 @@ err_free:
 	bitmap_free(vfmig->restored);
 	kfree(vfmig->pending_load);
 	kfree(vfmig->vf_uuid);
+	kfree(vfmig->iova_dom);
 	kfree(vfmig);
 	return err;
 }
@@ -2490,6 +2709,14 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 	 * pf_mdev is still valid, i.e. before the NULL assignment below.
 	 */
 	vfmig_drop_pending_loads_locked(vfmig);
+
+	/*
+	 * Backstop: any per-VF IOVA domains are normally torn down at the
+	 * SR-IOV disable that precedes PF unload (mlx5_sriov_detach ->
+	 * mlx5_vfmig_pf_drop_iova_domains), while the VFs are still alive.
+	 * Clear here too so a domain never outlives the PF.
+	 */
+	vfmig_drop_iova_domains_locked(vfmig);
 
 	vfmig->pf_mdev = NULL;
 	up_write(&vfmig->lock);
