@@ -1096,9 +1096,14 @@ static void mlx5_cleanup_once(struct mlx5_core_dev *dev)
 	mlx5_devcom_unregister_device(dev->priv.devc);
 }
 
-static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeout)
+static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeout,
+				bool *restored_out)
 {
+	u16 restored_vhca_id = 0;
 	int err;
+
+	if (restored_out)
+		*restored_out = false;
 
 	mlx5_core_info(dev, "firmware version: %d.%d.%d\n", fw_rev_maj(dev),
 		       fw_rev_min(dev), fw_rev_sub(dev));
@@ -1129,6 +1134,45 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 
 	dev->caps.embedded_cpu = mlx5_read_embedded_cpu(dev);
 	mlx5_cmd_set_state(dev, MLX5_CMDIF_STATE_UP);
+
+	/*
+	 * vfmig restored-VF bring-up.
+	 *
+	 * A VF whose host-side LOAD_VHCA_STATE blob was staged before this
+	 * probe (see drivers/.../vfmig/vfmig.c) takes a different arc: the
+	 * PF already ENABLE_HCA'd this VHCA during sriov_numvfs, and any
+	 * VHCA-side command that mutates state off the saved-blob shape
+	 * (ENABLE_HCA(self), SET_ISSI, boot pages, INIT_HCA) makes the
+	 * firmware reject the subsequent LOAD. So skip them and apply the
+	 * staged blob here instead.
+	 *
+	 * NOTE: on a native (non-VFIO, non-VM) probe without deterministic
+	 * IOVAs the destination's own command ring is left non-functional
+	 * after LOAD -- the blob captured the source's host-ownership view
+	 * of that ring. The bring-up therefore proceeds far enough to apply
+	 * LOAD and record the finding, then fails loudly in
+	 * mlx5_function_open()'s QUERY_HCA_CAP. Making a restored VF fully
+	 * usable requires the deterministic-IOVA work (host-page replay)
+	 * tracked separately.
+	 */
+	if (mlx5_vfmig_vf_consume_restored(dev, &restored_vhca_id)) {
+		if (restored_out)
+			*restored_out = true;
+
+		err = mlx5_vfmig_vf_apply_pending_load(dev);
+		if (err) {
+			mlx5_core_err(dev,
+				      "vfmig: apply LOAD_VHCA_STATE failed for vhca_id 0x%04x: %d\n",
+				      restored_vhca_id, err);
+			goto err_cmd_cleanup;
+		}
+
+		mlx5_start_health_poll(dev);
+		mlx5_core_info(dev,
+			       "vfmig: VF (vhca_id 0x%04x) restored; ENABLE_HCA/SET_ISSI/boot-pages/INIT_HCA skipped\n",
+			       restored_vhca_id);
+		return 0;
+	}
 
 	err = mlx5_core_enable_hca(dev, 0);
 	if (err) {
@@ -1179,9 +1223,19 @@ static void mlx5_function_disable(struct mlx5_core_dev *dev, bool boot)
 	mlx5_cmd_disable(dev);
 }
 
-static int mlx5_function_open(struct mlx5_core_dev *dev)
+static int mlx5_function_open(struct mlx5_core_dev *dev, bool restored)
 {
 	int err;
+
+	/*
+	 * A restored VF's caps/pages/queues all come from the LOAD blob
+	 * already applied in mlx5_function_enable(). Skip every command
+	 * that would re-mutate VHCA state (set_hca_ctrl, set_hca_cap,
+	 * boot pages, INIT_HCA); mlx5_query_hca_caps() still runs so the
+	 * kernel learns the post-restore cap layout.
+	 */
+	if (restored)
+		goto post_init_hca;
 
 	err = set_hca_ctrl(dev);
 	if (err) {
@@ -1207,6 +1261,7 @@ static int mlx5_function_open(struct mlx5_core_dev *dev)
 		return err;
 	}
 
+post_init_hca:
 	mlx5_set_driver_version(dev);
 
 	err = mlx5_query_hca_caps(dev);
@@ -1233,13 +1288,14 @@ static int mlx5_function_close(struct mlx5_core_dev *dev)
 
 static int mlx5_function_setup(struct mlx5_core_dev *dev, bool boot, u64 timeout)
 {
+	bool restored = false;
 	int err;
 
-	err = mlx5_function_enable(dev, boot, timeout);
+	err = mlx5_function_enable(dev, boot, timeout, &restored);
 	if (err)
 		return err;
 
-	err = mlx5_function_open(dev);
+	err = mlx5_function_open(dev, restored);
 	if (err)
 		mlx5_function_disable(dev, boot);
 	return err;
@@ -1653,12 +1709,13 @@ static int mlx5_query_hca_caps_light(struct mlx5_core_dev *dev)
 int mlx5_init_one_light(struct mlx5_core_dev *dev)
 {
 	struct devlink *devlink = priv_to_devlink(dev);
+	u64 timeout = mlx5_tout_ms(dev, FW_PRE_INIT_TIMEOUT);
 	int err;
 
 	devl_lock(devlink);
 	devl_register(devlink);
 	dev->state = MLX5_DEVICE_STATE_UP;
-	err = mlx5_function_enable(dev, true, mlx5_tout_ms(dev, FW_PRE_INIT_TIMEOUT));
+	err = mlx5_function_enable(dev, true, timeout, NULL);
 	if (err) {
 		mlx5_core_warn(dev, "mlx5_function_enable err=%d\n", err);
 		goto out;

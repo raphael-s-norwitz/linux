@@ -40,6 +40,24 @@
 int  mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev);
 void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev);
 
+/*
+ * Drop staged-but-unconsumed LOAD slots from mlx5_device_disable_sriov():
+ * the pending_load array survives an sriov_numvfs cycle, but a slot left
+ * staged for a torn-down VF generation must not apply to the next one.
+ */
+void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev);
+
+/*
+ * Probe-time restore hooks, called from the VF's mlx5_function_enable().
+ * mlx5_vfmig_vf_consume_restored() test-and-clears the "restored" latch
+ * (returning the staged vhca_id) so the probe can skip INIT_HCA;
+ * mlx5_vfmig_vf_apply_pending_load() applies any staged LOAD_VHCA_STATE
+ * blob for the VF (suspend -> LOAD -> resume) via its PF mdev.
+ */
+bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *vf_dev,
+				    u16 *vhca_id_out);
+int  mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev);
+
 /* Module init/exit hooks for the cdev region. */
 int  mlx5_vfmig_module_init(void);
 void mlx5_vfmig_module_exit(void);
@@ -53,6 +71,22 @@ static inline int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 
 static inline void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 {
+}
+
+static inline void
+mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
+{
+}
+
+static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *vf_dev,
+						  u16 *vhca_id_out)
+{
+	return false;
+}
+
+static inline int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
+{
+	return 0;
 }
 
 static inline int mlx5_vfmig_module_init(void)

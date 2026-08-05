@@ -222,29 +222,34 @@ struct mlx5_vfmig_save_state {
 
 /*
  * MLX5_VFMIG_IOC_LOAD_VHCA_STATE:
- *   Open a write-only data session that installs a previously-saved state
- *   blob into VF @vf_id via LOAD_VHCA_STATE. It is the inverse of
- *   SAVE_VHCA_STATE and consumes the exact byte stream SAVE produced.
+ *   Open a write-only data session that stages a previously-saved state
+ *   blob for VF @vf_id. It is the inverse of SAVE_VHCA_STATE and consumes
+ *   the exact byte stream SAVE produced.
  *
- *   The VF must be migration-enabled (see ENABLE_MIGRATABLE) and already
- *   quiesced to STOP via MLX5_VFMIG_IOC_SUSPEND_VHCA -- firmware rejects a
- *   load into a VHCA that is not fully suspended. LOAD does not itself
- *   touch the datapath state; RESUME_VHCA the VF afterwards.
+ *   The VF must be migration-enabled (see ENABLE_MIGRATABLE). Unlike a
+ *   direct LOAD_VHCA_STATE, no VHCA suspend is required (or performed) at
+ *   ioctl time: the blob is only *staged* here. The actual
+ *   LOAD_VHCA_STATE runs from the VF's next mlx5_core probe, which
+ *   suspends the freshly-enabled VHCA (RUNNING -> STOP), issues the load
+ *   and resumes it. The VF must therefore be unbound from its driver
+ *   while a blob is staged and then (re-)bound to apply it.
  *
  *   The ioctl returns @load_fd, a write-only anon-inode fd. Userspace
  *   write()s the blob to it (any chunk size; partial writes are fine).
  *   The stream is a 16-byte FW_DATA record header (record_size, flags=0,
  *   tag=0) followed by that many payload bytes; once the full payload is
- *   received the driver stages it into DMA pages + MKEY and runs
- *   LOAD_VHCA_STATE. Exactly one FW_DATA record is supported; trailing
- *   bytes are rejected. Closing @load_fd frees the firmware resources.
+ *   received the driver stages it into DMA pages + MKEY. Exactly one
+ *   FW_DATA record is supported; trailing bytes are rejected. Closing
+ *   @load_fd after a complete blob hands the staged pages to the VF's
+ *   pending-load slot (and latches "restored"); closing it early frees
+ *   everything with no lasting effect.
  *
  *   Returns 0 with @load_fd populated on success; -EINVAL if @vf_id is out
- *   of range, the VF is not at STOP, or @flags / @reserved are non-zero;
- *   -EOPNOTSUPP if the VF is not migration-enabled; -EBUSY if a save or
- *   load session already exists for this vf_id; -ENODEV if the PF is gone.
- *   write() errors surface -EPROTO/-EINVAL for a malformed stream or a
- *   negative firmware error if LOAD_VHCA_STATE fails.
+ *   of range or @flags / @reserved are non-zero; -EOPNOTSUPP if the VF is
+ *   not migration-enabled; -EBUSY if a save or load session already exists
+ *   for this vf_id; -ENODEV if the PF is gone. write() errors surface
+ *   -EPROTO/-EINVAL for a malformed stream. Any firmware error from the
+ *   deferred LOAD_VHCA_STATE surfaces in the VF probe (dmesg), not here.
  */
 struct mlx5_vfmig_load_state {
 	__u32 vf_id;	/* in  */

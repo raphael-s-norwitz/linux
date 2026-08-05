@@ -30,6 +30,7 @@
 #include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/pci.h>
 #include <linux/rwsem.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -69,6 +70,30 @@ struct vfmig_wire_header {
 
 #define VFMIG_WIRE_TAG_FW_DATA		0
 
+/*
+ * Detached, fully-staged LOAD_VHCA_STATE payload waiting for the next
+ * mlx5_core probe of a VF to apply it. Populated when a LOAD anon-inode
+ * fd is closed after a complete blob was written; the firmware-tied
+ * resources (PD/MKEY/DMA mapping) and the backing pages are transferred
+ * out of the per-fd load_ctx into here so they outlive the fd. Consumed
+ * (and destroyed) by mlx5_vfmig_vf_apply_pending_load() from the VF's
+ * probe path in mlx5_function_enable(). See vfmig_vf_load_destroy().
+ */
+struct mlx5_vfmig_vf_load {
+	u32 vf_id;
+	u16 vhca_id;
+	u32 pdn;
+	bool pd_allocated;
+	u32 *mkey_in;		/* alloc_mkey_in() buffer; NULL if no MKEY */
+	u32 mkey;
+	bool mkey_created;
+	bool dma_mapped;
+	struct dma_iova_state dma_state;
+	struct page **pages;
+	u32 npages;
+	u64 record_size;	/* bytes inside @pages the FW should consume */
+};
+
 /**
  * struct mlx5_vfmig_pf - per-PF vfmig control-plane state
  * @kref:    refcount; drops the last reference from an open fd or the
@@ -78,11 +103,17 @@ struct vfmig_wire_header {
  * @dead:    set once the PF is being removed; ioctls then fail -ENODEV.
  * @cdev:    the /dev/mlx5_vfmig/<bdf> character device.
  * @minor:   minor number allocated from mlx5_vfmig_minor_ida.
- * @max_vfs: size of @restored in bits (PF's VF capacity at init).
+ * @max_vfs: size of @restored / @pending_load (PF's VF capacity at init).
  * @restored: per-VF "restored" latch, indexed by SR-IOV VF id. Set via
- *           MARK_RESTORED, read back via QUERY_VF. Accessed with atomic
- *           bitops; NULL when @max_vfs is 0.
- * @ctxs_lock: mutex protecting @save_ctxs / @load_ctxs list mutations.
+ *           MARK_RESTORED or when a LOAD fd stages a complete blob, read
+ *           back via QUERY_VF, and consumed by the VF's next probe to
+ *           skip INIT_HCA. Accessed with atomic bitops; NULL when
+ *           @max_vfs is 0.
+ * @pending_load: per-VF staged LOAD_VHCA_STATE slots, indexed by VF id.
+ *           A non-NULL entry is applied (and freed) by the VF's next
+ *           probe. Mutated under @ctxs_lock. NULL array when @max_vfs 0.
+ * @ctxs_lock: mutex protecting @save_ctxs / @load_ctxs list mutations
+ *           and @pending_load slot install/take.
  * @save_ctxs: open SAVE_VHCA_STATE sessions (struct mlx5_vfmig_save_ctx).
  * @load_ctxs: open LOAD_VHCA_STATE sessions (struct mlx5_vfmig_load_ctx).
  */
@@ -95,6 +126,7 @@ struct mlx5_vfmig_pf {
 	int			minor;
 	u16			max_vfs;
 	unsigned long		*restored;
+	struct mlx5_vfmig_vf_load **pending_load;
 	struct mutex		ctxs_lock; /* guards save_ctxs/load_ctxs */
 	struct list_head	save_ctxs;
 	struct list_head	load_ctxs;
@@ -109,6 +141,7 @@ static void vfmig_pf_release(struct kref *kref)
 	WARN_ON(!list_empty(&vfmig->load_ctxs));
 	mutex_destroy(&vfmig->ctxs_lock);
 	bitmap_free(vfmig->restored);
+	kfree(vfmig->pending_load);
 	ida_free(&mlx5_vfmig_minor_ida, vfmig->minor);
 	kfree(vfmig);
 }
@@ -1367,8 +1400,12 @@ enum vfmig_load_state {
 /*
  * Per-LOAD-fd context, hung off vfmig->load_ctxs. Mirrors the SAVE ctx
  * but in the write direction (DMA_TO_DEVICE): the write() FSM ingests one
- * FW_DATA record, stages it into DMA pages + an MTT MKEY, and runs
- * LOAD_VHCA_STATE once the payload is complete.
+ * FW_DATA record and stages it into DMA pages + an MTT MKEY. The
+ * LOAD_VHCA_STATE firmware command does NOT run here -- at LOAD-ioctl
+ * time the destination VHCA has not been re-enabled by a probe yet, so
+ * the command would be a no-op. Instead, once the payload is complete
+ * the resources are transferred, on fd close, into the PF's per-VF
+ * pending_load slot, where the VF's next mlx5_core probe applies them.
  */
 struct mlx5_vfmig_load_ctx {
 	struct list_head node;		/* on vfmig->load_ctxs */
@@ -1382,7 +1419,8 @@ struct mlx5_vfmig_load_ctx {
 	u32 hdr_filled;			/* header bytes accumulated */
 	u64 record_size;		/* FW_DATA payload size from header */
 	u64 image_filled;		/* payload bytes staged so far */
-	bool loaded;			/* LOAD_VHCA_STATE has run */
+	bool image_staged;		/* complete blob staged, ready to hand off */
+	bool image_transferred;		/* resources moved into pending_load slot */
 
 	/* Firmware-tied resources, mutated under vfmig->lock. */
 	bool resources_freed;
@@ -1522,7 +1560,7 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 			       ctx->vf_id, tag, flags);
 		return -EOPNOTSUPP;
 	}
-	if (ctx->loaded) {
+	if (ctx->image_staged) {
 		mlx5_core_warn(ctx->vfmig->pf_mdev,
 			       "vfmig: vf %u: multiple FW_DATA records per LOAD session not supported\n",
 			       ctx->vf_id);
@@ -1537,29 +1575,74 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 	return 0;
 }
 
-/* Install the staged payload into the (suspended) VHCA. */
+/*
+ * Free a per-VF pending_load slot's firmware-tied resources plus its
+ * backing pages. @pf_mdev MUST be alive (the FW commands need a working
+ * cmd ring); callers guarantee this via vfmig->lock / the vfmig kref.
+ */
+static void vfmig_vf_load_destroy(struct mlx5_core_dev *pf_mdev,
+				  struct mlx5_vfmig_vf_load *load)
+{
+	if (!load)
+		return;
+
+	if (load->mkey_created)
+		mlx5_core_destroy_mkey(pf_mdev, load->mkey);
+	if (load->dma_mapped)
+		vfmig_unregister_dma_pages(pf_mdev, load->npages,
+					   load->mkey_in, &load->dma_state,
+					   DMA_TO_DEVICE);
+	kvfree(load->mkey_in);
+	if (load->pd_allocated)
+		mlx5_core_dealloc_pd(pf_mdev, load->pdn);
+	vfmig_free_pages(load->pages, load->npages);
+	kfree(load);
+}
+
+/*
+ * Install @load into the per-VF slot at pending_load[vf_id] and set the
+ * restored latch so the next probe both applies the LOAD and skips
+ * INIT_HCA. Returns -EBUSY if a slot is already staged for this VF (the
+ * caller then still owns @load). Caller holds vfmig->ctxs_lock.
+ */
+static int vfmig_install_pending_load_locked(struct mlx5_vfmig_pf *vfmig,
+					     struct mlx5_vfmig_vf_load *load)
+{
+	if (load->vf_id >= vfmig->max_vfs)
+		return -EINVAL;
+	if (vfmig->pending_load[load->vf_id])
+		return -EBUSY;
+
+	vfmig->pending_load[load->vf_id] = load;
+	set_bit(load->vf_id, vfmig->restored);
+	return 0;
+}
+
+/*
+ * Mark the completed blob as staged. Does NOT issue LOAD_VHCA_STATE: the
+ * destination VHCA has not been re-enabled by a probe yet, so the command
+ * would be a no-op. release() hands the staged resources to the per-VF
+ * pending_load slot, from where the VF's next mlx5_core probe applies
+ * them. Exactly one FW_DATA record is supported; reject a second.
+ */
 static int vfmig_load_run_load(struct mlx5_vfmig_load_ctx *ctx)
 {
 	struct mlx5_core_dev *pf_mdev = ctx->vfmig->pf_mdev;
-	int err;
 
 	if (WARN_ON(!ctx->image_mkey_created))
 		return -EINVAL;
-
-	err = vfmig_cmd_load_vhca_state(pf_mdev, ctx->vhca_id, ctx->image_mkey,
-					ctx->record_size);
-	if (err) {
+	if (ctx->image_staged) {
 		mlx5_core_warn(pf_mdev,
-			       "vfmig: LOAD_VHCA_STATE vf %u (vhca_id 0x%04x) failed: %d\n",
-			       ctx->vf_id, ctx->vhca_id, err);
-		return err;
+			       "vfmig: vf %u (vhca_id 0x%04x): multiple FW_DATA records per LOAD session not supported\n",
+			       ctx->vf_id, ctx->vhca_id);
+		return -EINVAL;
 	}
 
-	ctx->loaded = true;
+	ctx->image_staged = true;
 	ctx->state = VFMIG_LS_DONE;
-	mlx5_core_info(pf_mdev,
-		       "vfmig: loaded vf %u (vhca_id 0x%04x) state: %llu bytes\n",
-		       ctx->vf_id, ctx->vhca_id, ctx->record_size);
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: staged vf %u (vhca_id 0x%04x) state: %llu bytes; applies on next probe\n",
+		      ctx->vf_id, ctx->vhca_id, ctx->record_size);
 	return 0;
 }
 
@@ -1667,23 +1750,10 @@ out:
 	return produced;	/* stream_open() => ppos is NULL, leave it */
 }
 
-/*
- * Drop the firmware-tied resources held by @ctx. Idempotent via
- * @resources_freed. Called from release() (pf_mdev alive) or pf_cleanup()
- * (before pf_mdev is NULLed). The image page list is host memory and is
- * freed separately in release(). Caller holds vfmig->lock.
- */
-static void vfmig_load_release_resources(struct mlx5_vfmig_load_ctx *ctx)
+/* Free @ctx's firmware-tied resources in place (no hand-off). */
+static void vfmig_load_drop_resources(struct mlx5_vfmig_load_ctx *ctx,
+				      struct mlx5_core_dev *pf_mdev)
 {
-	struct mlx5_core_dev *pf_mdev = ctx->vfmig->pf_mdev;
-
-	if (ctx->resources_freed)
-		return;
-	ctx->resources_freed = true;
-
-	if (!pf_mdev)
-		return;
-
 	if (ctx->image_mkey_created) {
 		mlx5_core_destroy_mkey(pf_mdev, ctx->image_mkey);
 		ctx->image_mkey_created = false;
@@ -1704,6 +1774,88 @@ static void vfmig_load_release_resources(struct mlx5_vfmig_load_ctx *ctx)
 	}
 }
 
+/*
+ * Release the firmware-tied resources held by @ctx. Idempotent via
+ * @resources_freed. Called from release() (pf_mdev alive) or pf_cleanup()
+ * (before pf_mdev is NULLed). Caller holds vfmig->lock.
+ *
+ * On the happy path -- a complete blob was staged and the PF is still
+ * live -- the resources are transferred into the PF's per-VF
+ * pending_load slot rather than freed, so the next probe can apply the
+ * LOAD. @image_transferred then suppresses the page free in release().
+ * Otherwise (partial/empty write, or PF going away) everything is freed.
+ */
+static void vfmig_load_release_resources(struct mlx5_vfmig_load_ctx *ctx)
+{
+	struct mlx5_vfmig_pf *vfmig = ctx->vfmig;
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_vf_load *load;
+	int err;
+
+	if (ctx->resources_freed)
+		return;
+	ctx->resources_freed = true;
+
+	if (!pf_mdev)
+		return;
+
+	/* Nothing staged, or PF tearing down: just free in place. */
+	if (!ctx->image_staged || vfmig->dead) {
+		vfmig_load_drop_resources(ctx, pf_mdev);
+		return;
+	}
+
+	load = kzalloc(sizeof(*load), GFP_KERNEL);
+	if (!load) {
+		/* Can't stage without a slot; drop the blob (no lasting effect). */
+		vfmig_load_drop_resources(ctx, pf_mdev);
+		return;
+	}
+
+	load->vf_id = ctx->vf_id;
+	load->vhca_id = ctx->vhca_id;
+	load->pdn = ctx->pdn;
+	load->pd_allocated = ctx->pd_allocated;
+	load->mkey_in = ctx->image_mkey_in;
+	load->mkey = ctx->image_mkey;
+	load->mkey_created = ctx->image_mkey_created;
+	load->dma_mapped = ctx->image_dma_mapped;
+	load->dma_state = ctx->image_dma_state;
+	load->pages = ctx->image_pages;
+	load->npages = ctx->image_npages;
+	load->record_size = ctx->record_size;
+
+	mutex_lock(&vfmig->ctxs_lock);
+	err = vfmig_install_pending_load_locked(vfmig, load);
+	mutex_unlock(&vfmig->ctxs_lock);
+
+	/*
+	 * Either way the resources now belong to @load: on success the
+	 * slot owns them until the next probe; on failure we free @load
+	 * (which frees them). Detach from @ctx so release() won't double
+	 * free the pages.
+	 */
+	ctx->image_transferred = true;
+	ctx->pd_allocated = false;
+	ctx->image_mkey_in = NULL;
+	ctx->image_mkey_created = false;
+	ctx->image_dma_mapped = false;
+	ctx->image_pages = NULL;
+	ctx->image_npages = 0;
+
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u (vhca_id 0x%04x): install pending_load failed: %d\n",
+			       ctx->vf_id, ctx->vhca_id, err);
+		vfmig_vf_load_destroy(pf_mdev, load);
+		return;
+	}
+
+	mlx5_core_info(pf_mdev,
+		       "vfmig: staged %llu bytes of LOAD state for vf %u (vhca_id 0x%04x); next probe will apply\n",
+		       ctx->record_size, ctx->vf_id, ctx->vhca_id);
+}
+
 static int vfmig_load_release(struct inode *inode, struct file *filp)
 {
 	struct mlx5_vfmig_load_ctx *ctx = filp->private_data;
@@ -1718,7 +1870,9 @@ static int vfmig_load_release(struct inode *inode, struct file *filp)
 	list_del(&ctx->node);
 	mutex_unlock(&vfmig->ctxs_lock);
 
-	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
+	/* Pages were handed to the pending_load slot iff transferred. */
+	if (!ctx->image_transferred)
+		vfmig_free_pages(ctx->image_pages, ctx->image_npages);
 	mutex_destroy(&ctx->io_lock);
 	vfmig_pf_put(vfmig);
 	kfree(ctx);
@@ -1732,11 +1886,13 @@ static const struct file_operations mlx5_vfmig_load_fops = {
 };
 
 /*
- * Set up a LOAD session on a VF already quiesced to STOP: resolve vhca_id,
- * allocate a PD, and hand back a write-only anon-inode fd. The staging
- * buffer + MKEY are allocated lazily once write() sees the record size,
- * and LOAD_VHCA_STATE runs when the payload completes. Caller holds
- * vfmig->lock for read.
+ * Set up a LOAD session for @vf_id: resolve vhca_id, allocate a PD, and
+ * hand back a write-only anon-inode fd. The staging buffer + MKEY are
+ * allocated lazily once write() sees the record size. Closing the fd
+ * after a complete blob stages it into the VF's pending_load slot; the
+ * VF's next mlx5_core probe suspends the freshly-enabled VHCA, issues
+ * LOAD_VHCA_STATE and resumes it. No VHCA suspend is required (or
+ * performed) at ioctl time. Caller holds vfmig->lock for read.
  */
 static long vfmig_ioc_load_vhca_state(struct mlx5_vfmig_pf *vfmig,
 				      void __user *uarg)
@@ -1758,14 +1914,6 @@ static long vfmig_ioc_load_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	sriov = &pf_mdev->priv.sriov;
 	if (arg.vf_id >= sriov->num_vfs)
 		return -EINVAL;
-
-	/* Firmware rejects LOAD unless the VHCA is fully suspended to STOP. */
-	if (sriov->vfs_ctx[arg.vf_id].vfmig_dp_state != MLX5_VFMIG_DP_STOP) {
-		mlx5_core_warn(pf_mdev,
-			       "vfmig: vf %u must be suspended to STOP before LOAD\n",
-			       arg.vf_id);
-		return -EINVAL;
-	}
 
 	err = vfmig_check_pf_migration_caps(pf_mdev);
 	if (err)
@@ -1916,6 +2064,207 @@ static const struct file_operations mlx5_vfmig_fops = {
 	.compat_ioctl	= compat_ptr_ioctl,
 };
 
+/* -------- probe-time restore hooks (called from mlx5_core main.c) ------- */
+
+/*
+ * Test-and-clear the restored latch for the VF backed by @vf_dev, and
+ * report the vhca_id of any staged LOAD. Called once from the VF's
+ * mlx5_function_enable(); a true return tells the probe to skip INIT_HCA
+ * (and, if a slot is staged, to call mlx5_vfmig_vf_apply_pending_load()).
+ */
+bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *vf_dev,
+				    u16 *vhca_id_out)
+{
+	struct pci_dev *vf_pdev = vf_dev->pdev;
+	struct mlx5_core_dev *pf_mdev;
+	struct mlx5_vfmig_pf *vfmig;
+	bool restored = false;
+	int vf_id;
+
+	if (!vf_pdev || !vf_pdev->is_virtfn)
+		return false;
+	vf_id = pci_iov_vf_id(vf_pdev);
+	if (vf_id < 0)
+		return false;
+
+	pf_mdev = mlx5_vf_get_core_dev(vf_pdev);
+	if (!pf_mdev)
+		return false;
+
+	vfmig = pf_mdev->priv.vfmig;
+	if (vfmig && (u32)vf_id < vfmig->max_vfs &&
+	    test_and_clear_bit(vf_id, vfmig->restored)) {
+		struct mlx5_vfmig_vf_load *load;
+
+		mutex_lock(&vfmig->ctxs_lock);
+		load = vfmig->pending_load[vf_id];
+		if (vhca_id_out)
+			*vhca_id_out = load ? load->vhca_id : 0;
+		mutex_unlock(&vfmig->ctxs_lock);
+		restored = true;
+	}
+
+	mlx5_vf_put_core_dev(pf_mdev);
+	return restored;
+}
+
+/* Detach @vf_id's staged LOAD slot. Caller holds vfmig->ctxs_lock. */
+static struct mlx5_vfmig_vf_load *
+vfmig_take_pending_load_locked(struct mlx5_vfmig_pf *vfmig, u32 vf_id)
+{
+	struct mlx5_vfmig_vf_load *load;
+
+	if (vf_id >= vfmig->max_vfs)
+		return NULL;
+
+	load = vfmig->pending_load[vf_id];
+	vfmig->pending_load[vf_id] = NULL;
+	return load;
+}
+
+/*
+ * Apply the LOAD blob staged for the VF backed by @vf_dev, if any.
+ * Called from the VF's mlx5_function_enable() right after the VHCA has
+ * been (re-)enabled by the PF -- i.e. while the FW considers it RUNNING.
+ * LOAD_VHCA_STATE is only valid on a fully-suspended VHCA, so walk
+ * RUNNING -> STOP first, run LOAD, then walk STOP -> RUNNING so the
+ * QUERY_ADAPTER the probe issues next has a live VHCA. A missing slot is
+ * not an error (returns 0): a bare MARK_RESTORED sets the latch without
+ * staging a blob.
+ */
+int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
+{
+	struct pci_dev *vf_pdev = vf_dev->pdev;
+	struct mlx5_core_dev *pf_mdev;
+	struct mlx5_vfmig_vf_load *load;
+	struct mlx5_vfmig_pf *vfmig;
+	u8 reached;
+	int vf_id;
+	int err = 0;
+
+	if (!vf_pdev || !vf_pdev->is_virtfn)
+		return 0;
+	vf_id = pci_iov_vf_id(vf_pdev);
+	if (vf_id < 0)
+		return 0;
+
+	pf_mdev = mlx5_vf_get_core_dev(vf_pdev);
+	if (!pf_mdev)
+		return 0;
+
+	vfmig = pf_mdev->priv.vfmig;
+	if (!vfmig) {
+		mlx5_vf_put_core_dev(pf_mdev);
+		return 0;
+	}
+
+	/*
+	 * Pin the vfmig context so its locks survive a racing pf_cleanup;
+	 * the PF mdev itself is pinned by mlx5_vf_get_core_dev().
+	 */
+	vfmig_pf_get(vfmig);
+	down_read(&vfmig->lock);
+	if (vfmig->dead)
+		goto out_unlock;
+
+	mutex_lock(&vfmig->ctxs_lock);
+	load = vfmig_take_pending_load_locked(vfmig, vf_id);
+	mutex_unlock(&vfmig->ctxs_lock);
+	if (!load)
+		goto out_unlock;
+
+	mlx5_core_dbg(pf_mdev,
+		      "vfmig: apply pending LOAD: vf %u vhca_id 0x%04x mkey 0x%08x size %llu\n",
+		      load->vf_id, load->vhca_id, load->mkey, load->record_size);
+
+	err = vfmig_dp_transition(pf_mdev, load->vhca_id, MLX5_VFMIG_DP_RUNNING,
+				  MLX5_VFMIG_DP_STOP, &reached);
+	if (err)
+		goto out_destroy;
+
+	err = vfmig_cmd_load_vhca_state(pf_mdev, load->vhca_id, load->mkey,
+					load->record_size);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: LOAD_VHCA_STATE vf %u (vhca_id 0x%04x) size %llu failed: %d\n",
+			       load->vf_id, load->vhca_id, load->record_size,
+			       err);
+		goto out_destroy;
+	}
+
+	err = vfmig_dp_transition(pf_mdev, load->vhca_id, MLX5_VFMIG_DP_STOP,
+				  MLX5_VFMIG_DP_RUNNING, &reached);
+	if (!err)
+		mlx5_core_info(pf_mdev,
+			       "vfmig: applied %llu bytes of LOAD state to vf %u (vhca_id 0x%04x); resumed\n",
+			       load->record_size, load->vf_id, load->vhca_id);
+
+out_destroy:
+	vfmig_vf_load_destroy(pf_mdev, load);
+out_unlock:
+	up_read(&vfmig->lock);
+	vfmig_pf_put(vfmig);
+	mlx5_vf_put_core_dev(pf_mdev);
+	return err;
+}
+
+/*
+ * Destroy every staged-but-unconsumed pending_load slot and clear the
+ * restored latch it set. pf_mdev must be alive (FW resource teardown).
+ * Caller holds vfmig->lock; ctxs_lock is taken here and dropped around
+ * the sleepable vfmig_vf_load_destroy() (which issues FW commands).
+ */
+static void vfmig_drop_pending_loads_locked(struct mlx5_vfmig_pf *vfmig)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	u32 i;
+
+	if (!pf_mdev)
+		return;
+
+	mutex_lock(&vfmig->ctxs_lock);
+	for (i = 0; i < vfmig->max_vfs; i++) {
+		struct mlx5_vfmig_vf_load *load = vfmig->pending_load[i];
+
+		if (!load)
+			continue;
+		vfmig->pending_load[i] = NULL;
+		clear_bit(i, vfmig->restored);
+		mutex_unlock(&vfmig->ctxs_lock);
+		mlx5_core_dbg(pf_mdev,
+			      "vfmig: dropping unconsumed pending_load for vf %u (vhca_id 0x%04x)\n",
+			      i, load->vhca_id);
+		vfmig_vf_load_destroy(pf_mdev, load);
+		mutex_lock(&vfmig->ctxs_lock);
+	}
+	mutex_unlock(&vfmig->ctxs_lock);
+}
+
+/*
+ * Drop all staged LOAD slots from mlx5_device_disable_sriov(): the
+ * pending_load array and restored bitmap are indexed by VF id and
+ * survive an sriov_numvfs cycle, but the vhca_ids the slots reference do
+ * not, so a slot left staged for a torn-down VF generation must not be
+ * applied to the next one. No-op on VFs / before pf_init.
+ */
+void mlx5_vfmig_pf_drop_pending_loads(struct mlx5_core_dev *pf_mdev)
+{
+	struct mlx5_vfmig_pf *vfmig;
+
+	if (!pf_mdev || mlx5_core_is_vf(pf_mdev))
+		return;
+	vfmig = pf_mdev->priv.vfmig;
+	if (!vfmig)
+		return;
+
+	vfmig_pf_get(vfmig);
+	down_read(&vfmig->lock);
+	if (!vfmig->dead)
+		vfmig_drop_pending_loads_locked(vfmig);
+	up_read(&vfmig->lock);
+	vfmig_pf_put(vfmig);
+}
+
 int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig;
@@ -1942,6 +2291,13 @@ int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 	if (vfmig->max_vfs) {
 		vfmig->restored = bitmap_zalloc(vfmig->max_vfs, GFP_KERNEL);
 		if (!vfmig->restored) {
+			err = -ENOMEM;
+			goto err_free;
+		}
+		vfmig->pending_load = kcalloc(vfmig->max_vfs,
+					      sizeof(*vfmig->pending_load),
+					      GFP_KERNEL);
+		if (!vfmig->pending_load) {
 			err = -ENOMEM;
 			goto err_free;
 		}
@@ -1982,6 +2338,7 @@ err_minor:
 err_free:
 	mutex_destroy(&vfmig->ctxs_lock);
 	bitmap_free(vfmig->restored);
+	kfree(vfmig->pending_load);
 	kfree(vfmig);
 	return err;
 }
@@ -2012,6 +2369,14 @@ void mlx5_vfmig_pf_cleanup(struct mlx5_core_dev *pf_mdev)
 		vfmig_save_release_resources(save_ctx);
 	list_for_each_entry(load_ctx, &vfmig->load_ctxs, node)
 		vfmig_load_release_resources(load_ctx);
+
+	/*
+	 * Drop any staged-but-unconsumed LOAD slots. These hold PF-tied
+	 * firmware resources (PD/MKEY/DMA) that must be released while
+	 * pf_mdev is still valid, i.e. before the NULL assignment below.
+	 */
+	vfmig_drop_pending_loads_locked(vfmig);
+
 	vfmig->pf_mdev = NULL;
 	up_write(&vfmig->lock);
 
