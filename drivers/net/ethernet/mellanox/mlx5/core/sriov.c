@@ -36,6 +36,7 @@
 #include "mlx5_core.h"
 #include "mlx5_irq.h"
 #include "eswitch.h"
+#include "vfmig/vfmig.h"
 
 static int sriov_restore_guids(struct mlx5_core_dev *dev, int vf, u16 func_id)
 {
@@ -130,6 +131,14 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 	bool wait_for_vf_pages = true;
 	int err;
 	int vf;
+
+	/*
+	 * Drop any vfmig pending_load slots before we tear down the VF
+	 * generation they were staged for: the pending_load array survives
+	 * across sriov_numvfs cycles but the vhca_ids those slots reference
+	 * do not. PF mdev is still alive here so PD/MKEY/DMA teardown is OK.
+	 */
+	mlx5_vfmig_pf_drop_pending_loads(dev);
 
 	for (vf = num_vfs - 1; vf >= 0; vf--) {
 		if (!sriov->vfs_ctx[vf].enabled)
