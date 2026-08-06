@@ -42,6 +42,7 @@
 #include <linux/mlx5/fs.h>
 #include <linux/mlx5/driver.h>
 #include "lib/devcom.h"
+#include "vfmig/vfmig_iova.h"
 
 extern uint mlx5_core_debug_mask;
 
@@ -220,6 +221,18 @@ int mlx5_core_get_caps_mode(struct mlx5_core_dev *dev, enum mlx5_cap_type cap_ty
 int mlx5_query_hca_caps(struct mlx5_core_dev *dev);
 int mlx5_query_board_id(struct mlx5_core_dev *dev);
 int mlx5_query_module_num(struct mlx5_core_dev *dev, int *module_num);
+
+/*
+ * Slot-aware variant of mlx5_frag_buf_alloc_node, internal to
+ * mlx5_core. Lets in-tree call sites (eq.c, wq.c) route their frag
+ * buffers into a per-purpose vfmig IOVA slot instead of the legacy
+ * path the exported wrapper uses. The slot is stamped onto @buf so
+ * mlx5_frag_buf_free routes the symmetric free without an
+ * exported-ABI change.
+ */
+int mlx5_frag_buf_alloc_node_slot(struct mlx5_core_dev *dev, int size,
+				  struct mlx5_frag_buf *buf, int node,
+				  enum vfmig_iova_slot slot);
 int mlx5_cmd_init(struct mlx5_core_dev *dev);
 void mlx5_cmd_cleanup(struct mlx5_core_dev *dev);
 int mlx5_cmd_enable(struct mlx5_core_dev *dev);

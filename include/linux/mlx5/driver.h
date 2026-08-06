@@ -364,6 +364,16 @@ struct mlx5_frag_buf {
 	int			npages;
 	int			size;
 	u8			page_shift;
+	/*
+	 * Internal use by the vfmig deterministic-IOVA allocator: the
+	 * enum vfmig_iova_slot the backing pages were allocated from.
+	 * Set by mlx5_frag_buf_alloc_node[_slot]; read by
+	 * mlx5_frag_buf_free to route the symmetric free back to the
+	 * same slot. 0 (== VFMIG_SLOT_INVALID) means the legacy
+	 * dma_alloc_coherent path, matching untracked VFs / PFs and
+	 * not-yet-converted callers.
+	 */
+	u8			vfmig_slot;
 };
 
 struct mlx5_frag_buf_ctrl {
