@@ -240,9 +240,9 @@ int  vfmig_iova_for_each(struct vfmig_iova_domain *dom,
  * @slot and memcpy @len bytes of @contents into it. Must run before the
  * destination VF probes (so its allocator re-claims the replayed pages
  * with the source's contents). @iova must fall inside @slot's window
- * (cross-checked against the destination's own partitioning). Returns 0,
- * or a negative errno (-ERANGE on a slot/IOVA mismatch, -EEXIST on a
- * duplicate IOVA, etc).
+ * (cross-checked against the destination's own partitioning) and @dom
+ * must not yet be drift-armed. Returns 0, or a negative errno
+ * (-ERANGE on a slot/IOVA mismatch, -EEXIST on a duplicate IOVA, etc).
  */
 int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 			    enum vfmig_iova_slot slot, u64 instance_key,
@@ -256,6 +256,16 @@ int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
  * HOST_PAGE records have been replayed. Safe with @dom == NULL.
  */
 void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom);
+
+/*
+ * Freeze @dom's replayed footprint: record that replay is complete so
+ * subsequent alloc_slot() calls can diagnose drift between the
+ * destination's claim sequence and the source's recorded one. Called
+ * once at the end of a LOAD after the wire manifest CRC has verified.
+ * Diagnostic only (logs the per-slot replay counts); safe with
+ * @dom == NULL.
+ */
+void vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom);
 
 #else /* !CONFIG_MLX5_VFMIG */
 

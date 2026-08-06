@@ -87,6 +87,24 @@ struct vfmig_iova_domain {
 
 	struct list_head     pages;	/* of vfmig_iova_page, sorted */
 	unsigned int	     n_pages;
+
+	/*
+	 * Host-page replay accounting (LOAD/destination side).
+	 *
+	 * @expected_count[s] is the number of HOST_PAGE records replayed
+	 * into slot s by vfmig_iova_replay_page(); it records the source
+	 * VF's footprint in that slot at SAVE time.
+	 *
+	 * @drift_armed is flipped once by vfmig_iova_arm_drift_detection()
+	 * after a LOAD has replayed every promised record. While armed,
+	 * alloc_slot() diagnoses (logs) a mismatch between the caller's
+	 * resolved instance_key and the replayed entry it re-claims, so a
+	 * destination-side allocation-sequence drift from the source is
+	 * visible in dmesg. Both are zero on a fresh / SET_TRACKED-but-not-
+	 * LOADed domain, where alloc_slot behaves exactly as before slice 8.
+	 */
+	u32		     expected_count[VFMIG_IOVA_NR_SLOTS];
+	bool		     drift_armed;
 };
 
 static inline u64
@@ -430,6 +448,7 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 	struct vfmig_iova_page *p;
 	size_t aligned;
 	u64 iova, slot_end;
+	u64 caller_key;
 	int err;
 
 	if (!dom || !iova_out || !vaddr_out || size == 0)
@@ -445,8 +464,11 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 	 * Auto-assign instance_key if the caller passed 0. Per-slot
 	 * counter, so adding allocations in another slot doesn't perturb
 	 * this slot's keys. Caller-pinned (non-zero) keys are recorded
-	 * as-is and don't bump the counter.
+	 * as-is and don't bump the counter. @caller_key remembers the
+	 * pre-resolution value so the drift diagnostic can tell a 0/auto
+	 * caller from a pinned one.
 	 */
+	caller_key = instance_key;
 	if (instance_key == 0)
 		instance_key = ++dom->next_auto_key[slot];
 
@@ -481,6 +503,23 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 			err = -EINVAL;
 			goto out_unlock;
 		}
+		/*
+		 * Diagnostic only: once drift detection is armed (LOAD
+		 * finished replaying), a resolved-key mismatch means the
+		 * destination's pinned/auto allocation sequence in this
+		 * slot diverged from the source's. Log it but still
+		 * re-claim the page -- strict -EPROTO enforcement (and the
+		 * kcoherent fallback for legitimate post-restore growth)
+		 * arrives with the USER_PAGE work.
+		 */
+		if (dom->drift_armed && p->instance_key != instance_key)
+			dev_warn_ratelimited(&dom->vf_pdev->dev,
+				"vfmig_iova: vf %u slot %u DRIFT: caller key %s (resolved 0x%llx) but replayed entry at IOVA 0x%llx carries key 0x%llx\n",
+				dom->vf_id, slot,
+				caller_key == 0 ? "0/auto" : "pinned",
+				(unsigned long long)instance_key,
+				(unsigned long long)iova,
+				(unsigned long long)p->instance_key);
 		p->slot		= slot;
 		p->instance_key	= instance_key;
 		dom->cursor[slot] = iova + aligned;
@@ -580,12 +619,24 @@ int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 
 	mutex_lock(&dom->lock);
 
+	/*
+	 * Replay after arming is anomalous: the LOAD path arms exactly
+	 * once, after every promised HOST_PAGE record has been replayed. A
+	 * late replay would grow expected_count[] after the footprint was
+	 * declared frozen. Refuse it.
+	 */
+	if (WARN_ON_ONCE(dom->drift_armed)) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
 	err = vfmig_iova_install_page_locked(dom, slot, instance_key,
 					     (u64)iova, len, GFP_KERNEL, &p);
 	if (err)
 		goto out_unlock;
 
 	memcpy(p->vaddr, contents, len);
+	dom->expected_count[slot]++;
 
 	/*
 	 * Push the slot cursor past the highest replayed IOVA so a later
@@ -611,6 +662,32 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 		dom->cursor[s] = vfmig_iova_slot_base(dom,
 						      (enum vfmig_iova_slot)s);
 		dom->next_auto_key[s] = 0;
+	}
+	mutex_unlock(&dom->lock);
+}
+
+void vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom)
+{
+	unsigned int s;
+	u32 total = 0;
+
+	if (!dom)
+		return;
+	mutex_lock(&dom->lock);
+	if (!dom->drift_armed) {
+		dom->drift_armed = true;
+		for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++)
+			total += dom->expected_count[s];
+		dev_info(&dom->vf_pdev->dev,
+			 "vfmig_iova: vf %u drift detection armed (replays: cmd_ring=%u fw_page=%u eq_buf=%u frag_buf=%u db_page=%u dma_coherent=%u, total=%u)\n",
+			 dom->vf_id,
+			 dom->expected_count[VFMIG_SLOT_CMD_RING],
+			 dom->expected_count[VFMIG_SLOT_FW_PAGE],
+			 dom->expected_count[VFMIG_SLOT_EQ_BUF],
+			 dom->expected_count[VFMIG_SLOT_FRAG_BUF],
+			 dom->expected_count[VFMIG_SLOT_DB_PAGE],
+			 dom->expected_count[VFMIG_SLOT_DMA_COHERENT],
+			 total);
 	}
 	mutex_unlock(&dom->lock);
 }
