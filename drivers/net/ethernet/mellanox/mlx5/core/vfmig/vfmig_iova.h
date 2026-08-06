@@ -80,12 +80,16 @@ struct vfmig_iova_domain;
  *                          separate so adding or removing an EQ on the
  *                          destination cannot shift the IOVAs of other
  *                          consumers (see create_map_eq / eq.c).
+ *   VFMIG_SLOT_FRAG_BUF -- work-queue frag buffers (RQ/SQ/CQ rings),
+ *                          allocated by the mlx5_wq_*_create helpers
+ *                          (wq.c).
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
 	VFMIG_SLOT_CMD_RING	= 1,
 	VFMIG_SLOT_FW_PAGE	= 2,
 	VFMIG_SLOT_EQ_BUF	= 3,
+	VFMIG_SLOT_FRAG_BUF	= 4,
 	VFMIG_SLOT_NR,		/* count; drives VFMIG_IOVA_NR_SLOTS */
 };
 
