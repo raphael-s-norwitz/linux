@@ -76,11 +76,16 @@ struct vfmig_iova_domain;
  *   VFMIG_SLOT_FW_PAGE  -- FW-owned pages handed over via MANAGE_PAGES
  *                          OP_GIVE (boot/init/dynamic), one allocation
  *                          per page (see alloc_system_page).
+ *   VFMIG_SLOT_EQ_BUF   -- EQ frag buffers (async/cmd/comp EQs). Kept
+ *                          separate so adding or removing an EQ on the
+ *                          destination cannot shift the IOVAs of other
+ *                          consumers (see create_map_eq / eq.c).
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
 	VFMIG_SLOT_CMD_RING	= 1,
 	VFMIG_SLOT_FW_PAGE	= 2,
+	VFMIG_SLOT_EQ_BUF	= 3,
 	VFMIG_SLOT_NR,		/* count; drives VFMIG_IOVA_NR_SLOTS */
 };
 

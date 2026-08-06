@@ -274,8 +274,18 @@ create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
 
 	eq->cons_index = 0;
 
-	err = mlx5_frag_buf_alloc_node(dev, wq_get_byte_sz(log_eq_size, log_eq_stride),
-				       &eq->frag_buf, dev->priv.numa_node);
+	/*
+	 * EQ frag buffers go in their own vfmig IOVA slot so addition or
+	 * removal of an EQ on the destination doesn't shift the IOVAs of
+	 * other consumers. On an untracked VF / PF the slot is ignored
+	 * and the legacy dma_alloc_coherent path runs unchanged.
+	 */
+	err = mlx5_frag_buf_alloc_node_slot(dev,
+					    wq_get_byte_sz(log_eq_size,
+							   log_eq_stride),
+					    &eq->frag_buf,
+					    dev->priv.numa_node,
+					    VFMIG_SLOT_EQ_BUF);
 	if (err)
 		return err;
 
