@@ -85,6 +85,13 @@ struct vfmig_iova_domain;
  *                          (wq.c).
  *   VFMIG_SLOT_DB_PAGE  -- doorbell pgdir pages (mlx5_db_alloc_node /
  *                          mlx5_alloc_db_pgdir, alloc.c).
+ *   VFMIG_SLOT_DMA_COHERENT -- catch-all for coherent host buffers not
+ *                          routed to a per-purpose slot: the exported
+ *                          mlx5_frag_buf_alloc_node() ABI used by
+ *                          mlx5_ib / vfio_pci_mlx5 / vdpa. With this
+ *                          slot every coherent allocation on a tracked
+ *                          VF's probe path routes through the allocator,
+ *                          so a fresh tracked VF can bind.
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
@@ -93,6 +100,7 @@ enum vfmig_iova_slot {
 	VFMIG_SLOT_EQ_BUF	= 3,
 	VFMIG_SLOT_FRAG_BUF	= 4,
 	VFMIG_SLOT_DB_PAGE	= 5,
+	VFMIG_SLOT_DMA_COHERENT	= 6,
 	VFMIG_SLOT_NR,		/* count; drives VFMIG_IOVA_NR_SLOTS */
 };
 

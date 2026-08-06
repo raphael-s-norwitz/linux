@@ -456,8 +456,13 @@ int mlx5_frag_buf_pools_init(struct mlx5_core_dev *dev)
 	return 0;
 }
 
-int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
-			     struct mlx5_frag_buf *buf, int node)
+/*
+ * Upstream pooled allocation path. Used for untracked VFs / PFs and any
+ * VFMIG_SLOT_INVALID request; on a tracked VF the slot-aware callers
+ * bypass this (see mlx5_frag_buf_alloc_node_slot).
+ */
+static int mlx5_frag_buf_alloc_node_pool(struct mlx5_core_dev *dev, int size,
+					 struct mlx5_frag_buf *buf, int node)
 {
 	struct mlx5_dma_pool *pool;
 	int pool_idx;
@@ -494,7 +499,6 @@ int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(mlx5_frag_buf_alloc_node);
 
 /*
  * Slot-aware variant of mlx5_frag_buf_alloc_node, used by in-tree
@@ -518,7 +522,7 @@ int mlx5_frag_buf_alloc_node_slot(struct mlx5_core_dev *dev, int size,
 	int i;
 
 	if (!dev->cmd.vfmig_iova_dom || slot == VFMIG_SLOT_INVALID)
-		return mlx5_frag_buf_alloc_node(dev, size, buf, node);
+		return mlx5_frag_buf_alloc_node_pool(dev, size, buf, node);
 
 	buf->size = size;
 	buf->npages = DIV_ROUND_UP(size, PAGE_SIZE);
@@ -560,12 +564,32 @@ err_out:
 	return -ENOMEM;
 }
 
+/*
+ * Backward-compat wrapper preserving the exported ABI used by mlx5_ib /
+ * vfio_pci_mlx5 / vdpa. These callers are not converted to a per-purpose
+ * slot, so they route through the DMA_COHERENT catch-all: on a tracked
+ * VF that draws each frag from the per-VF deterministic IOVA allocator
+ * (bypassing the shared dma pool, see mlx5_frag_buf_alloc_node_slot),
+ * while untracked VFs / PFs fall through to the normal pooled path.
+ * In-tree mlx5_core code should call mlx5_frag_buf_alloc_node_slot
+ * directly with a per-purpose slot.
+ */
+int mlx5_frag_buf_alloc_node(struct mlx5_core_dev *dev, int size,
+			     struct mlx5_frag_buf *buf, int node)
+{
+	return mlx5_frag_buf_alloc_node_slot(dev, size, buf, node,
+					     VFMIG_SLOT_DMA_COHERENT);
+}
+EXPORT_SYMBOL_GPL(mlx5_frag_buf_alloc_node);
+
 void mlx5_frag_buf_free(struct mlx5_core_dev *dev, struct mlx5_frag_buf *buf)
 {
 	/*
-	 * Slot-routed bufs (mlx5_frag_buf_alloc_node_slot on a tracked VF)
+	 * Slot-routed bufs (mlx5_frag_buf_alloc_node_slot on a tracked VF,
+	 * including the DMA_COHERENT catch-all from the exported wrapper)
 	 * bypass the dma pool, so release them frag-by-frag through the
-	 * symmetric slot-aware free rather than the pool path.
+	 * symmetric slot-aware free rather than the pool path. vfmig_slot
+	 * is stamped at alloc time, so it unambiguously selects the path.
 	 */
 	if (buf->vfmig_slot != VFMIG_SLOT_INVALID) {
 		enum vfmig_iova_slot slot = buf->vfmig_slot;
