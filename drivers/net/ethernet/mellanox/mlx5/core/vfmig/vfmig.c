@@ -16,6 +16,7 @@
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/cdev.h>
+#include <linux/crc32.h>
 #include <linux/device.h>
 #include <linux/device/class.h>
 #include <linux/dma-mapping.h>
@@ -71,6 +72,54 @@ struct vfmig_wire_header {
 };
 
 #define VFMIG_WIRE_TAG_FW_DATA		0
+
+/*
+ * vfmig-private wire records prefixing the FW_DATA payload on a tracked
+ * VF's SAVE stream. A tracked source's blob is:
+ *
+ *   [STREAM_HEADER]  1x  { magic, version, num_pages, manifest_crc32 }
+ *   [HOST_PAGE]      Nx  one per deterministic-IOVA registry entry, in
+ *                        IOVA-ascending order, carrying page contents
+ *   [FW_DATA]        1x  the SAVE_VHCA_STATE firmware blob
+ *
+ * The HOST_PAGE records are replayed into the destination's per-VF IOVA
+ * domain (vfmig_iova_replay_page) BEFORE the FW_DATA blob is staged, so
+ * every IOVA the restored FW state references already maps to a page
+ * carrying the source's contents. Without this a migrated VF's cmd ring
+ * (and every other control-plane structure) would point at fresh zeroed
+ * pages and the VF would fail to bring up after LOAD.
+ *
+ * An untracked source emits only the FW_DATA record (num_pages == 0,
+ * no STREAM_HEADER / HOST_PAGE prefix); such a blob stays byte-compatible
+ * with the pre-slice-8 wire format.
+ *
+ * Magic "VMIG" / tags "HS" (host-stream) and "HB" (host-buffer) are well
+ * clear of the VFIO mlx5 {0, 1} tag range. Neither is OPTIONAL: a
+ * HOST_PAGE-bearing blob fed to a parser that does not understand the tag
+ * must fail loudly, because silently dropping the IOVA payload would
+ * yield a successful LOAD followed by a dead VHCA.
+ */
+#define VFMIG_WIRE_MAGIC		0x564D4947 /* "VMIG" little-endian */
+#define VFMIG_STREAM_VERSION		1
+#define VFMIG_WIRE_TAG_STREAM_HEADER	0x4853
+#define VFMIG_WIRE_TAG_HOST_PAGE	0x4842
+#define VFMIG_HOST_PAGE_MAX_LEN		(16ULL << 20)
+
+struct vfmig_stream_header {
+	__le32 magic;
+	__le32 version;
+	__le64 num_pages;
+	__le32 manifest_crc32;
+	__le32 reserved;
+};
+
+struct vfmig_host_page_record {
+	__le32 slot_id;
+	__le32 flags;
+	__le64 instance_key;
+	__le64 iova;
+	__le64 len;
+};
 
 /*
  * Detached, fully-staged LOAD_VHCA_STATE payload waiting for the next
@@ -1614,6 +1663,10 @@ static int vfmig_cmd_load_vhca_state(struct mlx5_core_dev *pf_mdev,
 /* Parser states for the write() FSM. */
 enum vfmig_load_state {
 	VFMIG_LS_READ_HEADER = 0,	/* accumulating the 16-byte header */
+	VFMIG_LS_STREAM_HDR_READ,	/* reading the 24-byte stream header */
+	VFMIG_LS_HP_READ_SUBHDR,	/* reading a HOST_PAGE sub-header */
+	VFMIG_LS_HP_READ_DATA,		/* reading a HOST_PAGE's page contents */
+	VFMIG_LS_HP_REPLAY,		/* replaying the HOST_PAGE into the domain */
 	VFMIG_LS_PREP_IMAGE,		/* allocate staging for the payload */
 	VFMIG_LS_READ_IMAGE,		/* accumulating the FW_DATA payload */
 	VFMIG_LS_LOAD_IMAGE,		/* payload complete, run LOAD */
@@ -1640,10 +1693,53 @@ struct mlx5_vfmig_load_ctx {
 	enum vfmig_load_state state;
 	u8 hdr_buf[sizeof(struct vfmig_wire_header)];
 	u32 hdr_filled;			/* header bytes accumulated */
-	u64 record_size;		/* FW_DATA payload size from header */
+	u64 record_size;		/* current record's payload size */
 	u64 image_filled;		/* payload bytes staged so far */
 	bool image_staged;		/* complete blob staged, ready to hand off */
 	bool image_transferred;		/* resources moved into pending_load slot */
+
+	/*
+	 * Destination VF's deterministic IOVA domain, captured from
+	 * vfmig->iova_dom[vf_id] at LOAD-ioctl time. NULL iff the
+	 * destination was not SET_TRACKED'd before LOAD; a HOST_PAGE-bearing
+	 * blob against a NULL domain is a userspace ordering bug and is
+	 * rejected by the parser. The SET_TRACKED{enable=0}/sriov_disable/
+	 * pf_unbind teardown paths all require the VF unbound, and LOAD is
+	 * only useful while the VF is unbound, so the captured pointer stays
+	 * live for the fd's lifetime.
+	 */
+	struct vfmig_iova_domain *iova_dom;
+
+	/*
+	 * Stream-header bookkeeping. The very first record of any vfmig blob
+	 * MUST be a STREAM_HEADER; it pins @hp_expected (num_pages) and
+	 * @manifest_crc_want. @manifest_crc_have accumulates the per-record
+	 * identity fold and is checked once @hp_seen == @hp_expected.
+	 */
+	bool stream_hdr_seen;
+	u8   stream_hdr_buf[sizeof(struct vfmig_stream_header)];
+	u32  stream_hdr_filled;
+	u64  hp_expected;
+	u64  hp_seen;
+	u32  manifest_crc_want;
+	u32  manifest_crc_have;
+	bool records_finalized;		/* manifest CRC verified (once) */
+	bool cursor_reset_done;		/* reset_cursor called at release (once) */
+
+	/*
+	 * Per-HOST_PAGE-record scratch (valid only in the VFMIG_LS_HP_*
+	 * states). @hp_contents is kvmalloc'd in HP_READ_SUBHDR, filled in
+	 * HP_READ_DATA, consumed + freed in HP_REPLAY (and unconditionally
+	 * on fd close, to handle a partial mid-record close).
+	 */
+	u8  hp_subhdr_buf[sizeof(struct vfmig_host_page_record)];
+	u32 hp_subhdr_filled;
+	enum vfmig_iova_slot hp_slot;
+	u64 hp_instance_key;
+	u64 hp_iova;
+	u64 hp_len;
+	void *hp_contents;
+	u64 hp_filled;
 
 	/* Firmware-tied resources, mutated under vfmig->lock. */
 	bool resources_freed;
@@ -1768,7 +1864,36 @@ err_pages:
 	return err;
 }
 
-/* Validate the parsed 16-byte header. Only a single FW_DATA record is OK. */
+/*
+ * Once every HOST_PAGE record the STREAM_HEADER promised has been
+ * replayed, verify the running manifest CRC matches what the source
+ * pinned. Latched by @records_finalized; a no-op until
+ * hp_seen == hp_expected.
+ */
+static int vfmig_load_maybe_finalize_records(struct mlx5_vfmig_load_ctx *ctx)
+{
+	if (ctx->records_finalized)
+		return 0;
+	if (ctx->hp_seen != ctx->hp_expected)
+		return 0;
+
+	if (ctx->manifest_crc_have != ctx->manifest_crc_want) {
+		mlx5_core_warn(ctx->vfmig->pf_mdev,
+			       "vfmig: vf %u: manifest CRC mismatch (have 0x%08x, want 0x%08x); HOST_PAGE identity stream corrupted\n",
+			       ctx->vf_id, ctx->manifest_crc_have,
+			       ctx->manifest_crc_want);
+		return -EPROTO;
+	}
+	ctx->records_finalized = true;
+	return 0;
+}
+
+/*
+ * Validate the parsed 16-byte wire header and dispatch to the record's
+ * body reader. The first record of a blob must be a STREAM_HEADER;
+ * thereafter HOST_PAGE records (if any) precede a single terminating
+ * FW_DATA record.
+ */
 static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 {
 	struct vfmig_wire_header *hdr =
@@ -1777,25 +1902,85 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 	u32 flags = le32_to_cpu(hdr->flags);
 	u32 tag = le32_to_cpu(hdr->tag);
 
-	if (tag != VFMIG_WIRE_TAG_FW_DATA || flags) {
+	if (flags) {
 		mlx5_core_warn(ctx->vfmig->pf_mdev,
-			       "vfmig: vf %u: unsupported LOAD record (tag 0x%x flags 0x%x)\n",
+			       "vfmig: vf %u: LOAD record tag 0x%x sets reserved flags 0x%x\n",
 			       ctx->vf_id, tag, flags);
 		return -EOPNOTSUPP;
 	}
-	if (ctx->image_staged) {
-		mlx5_core_warn(ctx->vfmig->pf_mdev,
-			       "vfmig: vf %u: multiple FW_DATA records per LOAD session not supported\n",
-			       ctx->vf_id);
-		return -EINVAL;
-	}
-	if (!record_size || record_size > VFMIG_MAX_SAVE_SIZE)
+	if (record_size > VFMIG_MAX_SAVE_SIZE)
 		return -EINVAL;
 
 	ctx->record_size = record_size;
-	ctx->image_filled = 0;
-	ctx->state = VFMIG_LS_PREP_IMAGE;
-	return 0;
+	ctx->hdr_filled = 0;
+
+	/*
+	 * A tracked source always leads with a STREAM_HEADER (then its
+	 * HOST_PAGE records, then FW_DATA). A legacy / untracked source
+	 * emits a bare FW_DATA record with no prefix: accept that too so
+	 * untracked save/load round-trips keep working. A HOST_PAGE record
+	 * without a preceding STREAM_HEADER falls through to hp_expected==0
+	 * and is rejected below as "beyond declared num_pages".
+	 */
+	switch (tag) {
+	case VFMIG_WIRE_TAG_STREAM_HEADER:
+		if (ctx->stream_hdr_seen) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: duplicate STREAM_HEADER\n",
+				       ctx->vf_id);
+			return -EPROTO;
+		}
+		if (record_size != sizeof(struct vfmig_stream_header))
+			return -EPROTO;
+		ctx->stream_hdr_filled = 0;
+		ctx->state = VFMIG_LS_STREAM_HDR_READ;
+		return 0;
+	case VFMIG_WIRE_TAG_HOST_PAGE:
+		if (!ctx->iova_dom) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_PAGE record but destination not SET_TRACKED'd; aborting LOAD\n",
+				       ctx->vf_id);
+			return -EINVAL;
+		}
+		if (record_size < sizeof(struct vfmig_host_page_record))
+			return -EINVAL;
+		if (ctx->hp_seen >= ctx->hp_expected) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_PAGE record beyond declared num_pages=%llu\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hp_expected);
+			return -EPROTO;
+		}
+		ctx->hp_subhdr_filled = 0;
+		ctx->hp_filled = 0;
+		ctx->state = VFMIG_LS_HP_READ_SUBHDR;
+		return 0;
+	case VFMIG_WIRE_TAG_FW_DATA:
+		if (ctx->image_staged) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: multiple FW_DATA records per LOAD session not supported\n",
+				       ctx->vf_id);
+			return -EINVAL;
+		}
+		if (ctx->hp_seen != ctx->hp_expected) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: FW_DATA before all HOST_PAGE records (%llu / %llu); aborting\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hp_seen,
+				       (unsigned long long)ctx->hp_expected);
+			return -EPROTO;
+		}
+		if (!record_size)
+			return -EINVAL;
+		ctx->image_filled = 0;
+		ctx->state = VFMIG_LS_PREP_IMAGE;
+		return 0;
+	default:
+		mlx5_core_warn(ctx->vfmig->pf_mdev,
+			       "vfmig: vf %u: unsupported LOAD record tag 0x%x\n",
+			       ctx->vf_id, tag);
+		return -EOPNOTSUPP;
+	}
 }
 
 /*
@@ -1893,6 +2078,237 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 		if (ctx->hdr_filled == sizeof(ctx->hdr_buf))
 			return vfmig_load_dispatch_header(ctx);
 		return 0;
+	case VFMIG_LS_STREAM_HDR_READ: {
+		size_t need = sizeof(ctx->stream_hdr_buf) -
+			      ctx->stream_hdr_filled;
+		size_t take = min(need, *left);
+		struct vfmig_stream_header sh;
+
+		if (take) {
+			if (copy_from_user(ctx->stream_hdr_buf +
+						   ctx->stream_hdr_filled,
+					   *ubuf, take))
+				return -EFAULT;
+			ctx->stream_hdr_filled += take;
+			*ubuf += take;
+			*left -= take;
+			*progressed = true;
+		}
+		if (ctx->stream_hdr_filled < sizeof(ctx->stream_hdr_buf))
+			return 0;
+
+		memcpy(&sh, ctx->stream_hdr_buf, sizeof(sh));
+		if (le32_to_cpu(sh.magic) != VFMIG_WIRE_MAGIC) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: stream header magic 0x%x != 0x%x\n",
+				       ctx->vf_id, le32_to_cpu(sh.magic),
+				       VFMIG_WIRE_MAGIC);
+			return -EPROTO;
+		}
+		if (le32_to_cpu(sh.version) != VFMIG_STREAM_VERSION) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: stream version %u unsupported (this kernel: %u)\n",
+				       ctx->vf_id, le32_to_cpu(sh.version),
+				       VFMIG_STREAM_VERSION);
+			return -EOPNOTSUPP;
+		}
+
+		ctx->hp_expected	= le64_to_cpu(sh.num_pages);
+		ctx->manifest_crc_want	= le32_to_cpu(sh.manifest_crc32);
+		ctx->manifest_crc_have	= 0;
+		ctx->hp_seen		= 0;
+		ctx->records_finalized	= false;
+		ctx->stream_hdr_seen	= true;
+
+		/*
+		 * A source that recorded HOST_PAGE records needs a tracked
+		 * destination to replay them into. Reject the mismatch here
+		 * rather than at the first record.
+		 */
+		if (ctx->hp_expected && !ctx->iova_dom) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: stream declares %llu HOST_PAGE records but destination not SET_TRACKED'd\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hp_expected);
+			return -EINVAL;
+		}
+
+		/*
+		 * Zero-record stream: no replays will arrive, so the manifest
+		 * CRC (folded over zero bytes on the SAVE side) must be the
+		 * crc32_le initial value of 0. Verify + arm now, since
+		 * HP_REPLAY's finalize will never be reached.
+		 */
+		if (ctx->hp_expected == 0) {
+			if (ctx->manifest_crc_want != 0) {
+				mlx5_core_warn(ctx->vfmig->pf_mdev,
+					       "vfmig: vf %u: 0 records but non-zero manifest CRC 0x%08x\n",
+					       ctx->vf_id,
+					       ctx->manifest_crc_want);
+				return -EPROTO;
+			}
+			ctx->records_finalized = true;
+		}
+
+		ctx->state = VFMIG_LS_READ_HEADER;
+		*progressed = true;
+		return 0;
+	}
+	case VFMIG_LS_HP_READ_SUBHDR: {
+		size_t need = sizeof(ctx->hp_subhdr_buf) -
+			      ctx->hp_subhdr_filled;
+		size_t take = min(need, *left);
+		struct vfmig_host_page_record subhdr;
+		u64 declared_payload;
+		u32 hp_flags;
+		u32 slot_id;
+
+		if (take) {
+			if (copy_from_user(ctx->hp_subhdr_buf +
+						   ctx->hp_subhdr_filled,
+					   *ubuf, take))
+				return -EFAULT;
+			ctx->hp_subhdr_filled += take;
+			*ubuf += take;
+			*left -= take;
+			*progressed = true;
+		}
+		if (ctx->hp_subhdr_filled < sizeof(ctx->hp_subhdr_buf))
+			return 0;
+
+		memcpy(&subhdr, ctx->hp_subhdr_buf, sizeof(subhdr));
+		slot_id			= le32_to_cpu(subhdr.slot_id);
+		hp_flags		= le32_to_cpu(subhdr.flags);
+		ctx->hp_instance_key	= le64_to_cpu(subhdr.instance_key);
+		ctx->hp_iova		= le64_to_cpu(subhdr.iova);
+		ctx->hp_len		= le64_to_cpu(subhdr.len);
+
+		if (hp_flags) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_PAGE flags=0x%x set (reserved, must be 0)\n",
+				       ctx->vf_id, hp_flags);
+			return -EOPNOTSUPP;
+		}
+		if (slot_id <= VFMIG_SLOT_INVALID || slot_id >= VFMIG_SLOT_NR) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_PAGE slot_id %u out of range\n",
+				       ctx->vf_id, slot_id);
+			return -EPROTO;
+		}
+		ctx->hp_slot = (enum vfmig_iova_slot)slot_id;
+
+		declared_payload = ctx->record_size -
+				   sizeof(struct vfmig_host_page_record);
+		if (ctx->hp_len != declared_payload ||
+		    ctx->hp_len == 0 ||
+		    ctx->hp_len > VFMIG_HOST_PAGE_MAX_LEN ||
+		    !IS_ALIGNED(ctx->hp_len, VFMIG_IOVA_GRANULE) ||
+		    !IS_ALIGNED(ctx->hp_iova, VFMIG_IOVA_GRANULE)) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: malformed HOST_PAGE iova=0x%llx len=%llu (rec=%llu)\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hp_iova,
+				       (unsigned long long)ctx->hp_len,
+				       (unsigned long long)ctx->record_size);
+			return -EINVAL;
+		}
+
+		ctx->hp_contents = kvmalloc(ctx->hp_len, GFP_KERNEL);
+		if (!ctx->hp_contents)
+			return -ENOMEM;
+		ctx->hp_filled = 0;
+		ctx->state = VFMIG_LS_HP_READ_DATA;
+		*progressed = true;
+		return 0;
+	}
+	case VFMIG_LS_HP_READ_DATA: {
+		size_t need = ctx->hp_len - ctx->hp_filled;
+		size_t take = min(need, *left);
+
+		if (take) {
+			if (copy_from_user((u8 *)ctx->hp_contents +
+						   ctx->hp_filled,
+					   *ubuf, take))
+				return -EFAULT;
+			ctx->hp_filled += take;
+			*ubuf += take;
+			*left -= take;
+			*progressed = true;
+		}
+		if (ctx->hp_filled == ctx->hp_len) {
+			ctx->state = VFMIG_LS_HP_REPLAY;
+			*progressed = true;
+		}
+		return 0;
+	}
+	case VFMIG_LS_HP_REPLAY: {
+		struct vfmig_host_page_record subhdr;
+
+		err = vfmig_iova_replay_page(ctx->iova_dom, ctx->hp_slot,
+					     ctx->hp_instance_key,
+					     ctx->hp_iova, ctx->hp_contents,
+					     ctx->hp_len);
+		kvfree(ctx->hp_contents);
+		ctx->hp_contents = NULL;
+		if (err) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: replay_page(slot=%u key=0x%llx iova=0x%llx len=%llu) failed: %d\n",
+				       ctx->vf_id, ctx->hp_slot,
+				       (unsigned long long)ctx->hp_instance_key,
+				       (unsigned long long)ctx->hp_iova,
+				       (unsigned long long)ctx->hp_len, err);
+			return err;
+		}
+
+		/*
+		 * Fold this record's identity tuple into the running manifest
+		 * CRC, re-encoding from ctx->hp_* so the hashed bytes match
+		 * the SAVE side exactly regardless of struct padding.
+		 */
+		subhdr.slot_id	    = cpu_to_le32(ctx->hp_slot);
+		subhdr.flags	    = 0;
+		subhdr.instance_key = cpu_to_le64(ctx->hp_instance_key);
+		subhdr.iova	    = cpu_to_le64(ctx->hp_iova);
+		subhdr.len	    = cpu_to_le64(ctx->hp_len);
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.slot_id,
+				 sizeof(subhdr.slot_id));
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.flags,
+				 sizeof(subhdr.flags));
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.instance_key,
+				 sizeof(subhdr.instance_key));
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.iova,
+				 sizeof(subhdr.iova));
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.len,
+				 sizeof(subhdr.len));
+
+		ctx->hp_seen++;
+		mlx5_core_dbg(ctx->vfmig->pf_mdev,
+			      "vfmig: vf %u: replayed HOST_PAGE %llu/%llu slot=%u iova=0x%llx len=%llu\n",
+			      ctx->vf_id,
+			      (unsigned long long)ctx->hp_seen,
+			      (unsigned long long)ctx->hp_expected,
+			      ctx->hp_slot,
+			      (unsigned long long)ctx->hp_iova,
+			      (unsigned long long)ctx->hp_len);
+
+		err = vfmig_load_maybe_finalize_records(ctx);
+		if (err)
+			return err;
+
+		ctx->state = VFMIG_LS_READ_HEADER;
+		*progressed = true;
+		return 0;
+	}
 	case VFMIG_LS_PREP_IMAGE:
 		want_npages = max_t(u32, 1,
 				    DIV_ROUND_UP(ctx->record_size, PAGE_SIZE));
@@ -2085,8 +2501,23 @@ static int vfmig_load_release(struct inode *inode, struct file *filp)
 	struct mlx5_vfmig_pf *vfmig = ctx->vfmig;
 
 	down_read(&vfmig->lock);
-	if (!vfmig->dead)
+	if (!vfmig->dead) {
 		vfmig_load_release_resources(ctx);
+		/*
+		 * With every promised HOST_PAGE replayed and the FW_DATA blob
+		 * staged, rewind the domain's per-slot bump cursors so the
+		 * destination VF's next probe re-claims the replayed pages
+		 * (carrying the source's contents) from each slot base in the
+		 * same order the source allocated them. Once per fd; only on
+		 * the staged-blob path (a partial/aborted LOAD leaves the
+		 * cursors alone).
+		 */
+		if (ctx->iova_dom && ctx->image_staged &&
+		    !ctx->cursor_reset_done) {
+			vfmig_iova_reset_cursor(ctx->iova_dom);
+			ctx->cursor_reset_done = true;
+		}
+	}
 	up_read(&vfmig->lock);
 
 	mutex_lock(&vfmig->ctxs_lock);
@@ -2096,6 +2527,8 @@ static int vfmig_load_release(struct inode *inode, struct file *filp)
 	/* Pages were handed to the pending_load slot iff transferred. */
 	if (!ctx->image_transferred)
 		vfmig_free_pages(ctx->image_pages, ctx->image_npages);
+	/* Free a HOST_PAGE payload left over from a partial mid-record close. */
+	kvfree(ctx->hp_contents);
 	mutex_destroy(&ctx->io_lock);
 	vfmig_pf_put(vfmig);
 	kfree(ctx);
@@ -2175,6 +2608,13 @@ static long vfmig_ioc_load_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	}
 	vfmig_pf_get(vfmig);
 	ctx->vfmig = vfmig;
+	/*
+	 * Capture the destination's IOVA domain (if SET_TRACKED'd) for
+	 * HOST_PAGE replay. NULL for an untracked destination; the parser
+	 * then rejects any HOST_PAGE-bearing blob. Guarded by ctxs_lock,
+	 * the same lock that publishes/takes iova_dom slots.
+	 */
+	ctx->iova_dom = vfmig->iova_dom[ctx->vf_id];
 	list_add(&ctx->node, &vfmig->load_ctxs);
 	mutex_unlock(&vfmig->ctxs_lock);
 

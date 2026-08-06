@@ -103,6 +103,26 @@ vfmig_iova_slot_end(const struct vfmig_iova_domain *dom,
 	return dom->base + (u64)(slot + 1) * VFMIG_IOVA_SLOT_BYTES;
 }
 
+/*
+ * Inverse of vfmig_iova_slot_base(): which slot does @iova fall into, or
+ * VFMIG_SLOT_INVALID if it is outside the deterministic slot range (below
+ * dom->base, or at/above the top of the per-VF window). Used by replay to
+ * cross-check that a wire record's claimed slot agrees with the
+ * destination's own IOVA partitioning.
+ */
+static enum vfmig_iova_slot
+vfmig_iova_slot_from_iova(const struct vfmig_iova_domain *dom, u64 iova)
+{
+	u64 idx;
+
+	if (iova < dom->base || iova >= dom->base + VFMIG_IOVA_PER_VF)
+		return VFMIG_SLOT_INVALID;
+	idx = (iova - dom->base) / VFMIG_IOVA_SLOT_BYTES;
+	if (idx <= VFMIG_SLOT_INVALID || idx >= VFMIG_SLOT_NR)
+		return VFMIG_SLOT_INVALID;
+	return (enum vfmig_iova_slot)idx;
+}
+
 /* dom->lock held. Returns the entry mapped at exactly @iova, or NULL. */
 static struct vfmig_iova_page *
 vfmig_iova_find_locked(struct vfmig_iova_domain *dom, u64 iova)
@@ -441,6 +461,35 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 		goto out_unlock;
 	}
 
+	/*
+	 * Lookup-or-alloc at the per-slot cursor. An entry already mapped
+	 * at @iova came from a prior vfmig_iova_replay_page(): the
+	 * destination's probe is re-claiming a page the source snapshotted,
+	 * so hand back the replayed page (which carries the source's
+	 * contents) instead of installing a fresh zeroed one -- this is
+	 * what makes a *migrated* VF's cmd ring / FW pages / EQ buffers
+	 * functional after LOAD. The size must match the source's
+	 * allocation at this slot position; a mismatch is a determinism
+	 * break, not a page we can safely hand back.
+	 */
+	p = vfmig_iova_find_locked(dom, iova);
+	if (p) {
+		if (p->len != aligned) {
+			dev_warn(&dom->vf_pdev->dev,
+				 "vfmig_iova: vf %u slot %u replay/alloc size mismatch at IOVA 0x%llx: replayed %zu, requested %zu\n",
+				 dom->vf_id, slot, iova, p->len, aligned);
+			err = -EINVAL;
+			goto out_unlock;
+		}
+		p->slot		= slot;
+		p->instance_key	= instance_key;
+		dom->cursor[slot] = iova + aligned;
+		*iova_out  = p->iova;
+		*vaddr_out = p->vaddr;
+		err = 0;
+		goto out_unlock;
+	}
+
 	err = vfmig_iova_install_page_locked(dom, slot, instance_key,
 					     iova, aligned, gfp, &p);
 	if (err)
@@ -493,5 +542,75 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 	vfmig_iova_destroy_page_locked(dom, p, true);
 
 out_unlock:
+	mutex_unlock(&dom->lock);
+}
+
+int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
+			   enum vfmig_iova_slot slot, u64 instance_key,
+			   dma_addr_t iova, const void *contents, size_t len)
+{
+	struct vfmig_iova_page *p;
+	enum vfmig_iova_slot iova_slot;
+	int err;
+
+	if (!dom || !contents)
+		return -EINVAL;
+	if (slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_NR) {
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: vf %u replay: slot %u out of range\n",
+			 dom->vf_id, slot);
+		return -EINVAL;
+	}
+
+	/*
+	 * Cross-check that the wire-claimed slot agrees with the slot the
+	 * destination's own IOVA partitioning assigns to @iova. A mismatch
+	 * means source and destination disagree about the slot layout
+	 * (wire-incompatible CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB / slot set):
+	 * the determinism guarantee is broken, so refuse rather than
+	 * install at an unexpected slot.
+	 */
+	iova_slot = vfmig_iova_slot_from_iova(dom, (u64)iova);
+	if (iova_slot != slot) {
+		dev_warn(&dom->vf_pdev->dev,
+			 "vfmig_iova: vf %u replay: wire claims slot %u for IOVA 0x%llx but destination maps it to slot %u\n",
+			 dom->vf_id, slot, (u64)iova, iova_slot);
+		return -ERANGE;
+	}
+
+	mutex_lock(&dom->lock);
+
+	err = vfmig_iova_install_page_locked(dom, slot, instance_key,
+					     (u64)iova, len, GFP_KERNEL, &p);
+	if (err)
+		goto out_unlock;
+
+	memcpy(p->vaddr, contents, len);
+
+	/*
+	 * Push the slot cursor past the highest replayed IOVA so a later
+	 * vfmig_iova_reset_cursor() rewinds to the slot base, and so that
+	 * absent a reset fresh allocs still don't collide with replays.
+	 */
+	if ((u64)iova + len > dom->cursor[slot])
+		dom->cursor[slot] = (u64)iova + len;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
+{
+	unsigned int s;
+
+	if (!dom)
+		return;
+	mutex_lock(&dom->lock);
+	for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++) {
+		dom->cursor[s] = vfmig_iova_slot_base(dom,
+						      (enum vfmig_iova_slot)s);
+		dom->next_auto_key[s] = 0;
+	}
 	mutex_unlock(&dom->lock);
 }

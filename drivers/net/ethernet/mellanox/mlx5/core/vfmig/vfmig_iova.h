@@ -213,6 +213,29 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 			  enum vfmig_iova_slot slot,
 			  dma_addr_t iova, size_t size);
 
+/*
+ * Replay one HOST_PAGE record into @dom on the LOAD/destination side:
+ * install a backing page at the wire-provided deterministic @iova in
+ * @slot and memcpy @len bytes of @contents into it. Must run before the
+ * destination VF probes (so its allocator re-claims the replayed pages
+ * with the source's contents). @iova must fall inside @slot's window
+ * (cross-checked against the destination's own partitioning). Returns 0,
+ * or a negative errno (-ERANGE on a slot/IOVA mismatch, -EEXIST on a
+ * duplicate IOVA, etc).
+ */
+int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
+			    enum vfmig_iova_slot slot, u64 instance_key,
+			    dma_addr_t iova, const void *contents, size_t len);
+
+/*
+ * Rewind every per-slot bump cursor to its slot base (and per-slot
+ * auto-key counters to 0) so the destination VF's probe re-claims the
+ * replayed pages from the bottom of each slot in the same order the
+ * source allocated them. Called once at LOAD-fd release, after all
+ * HOST_PAGE records have been replayed. Safe with @dom == NULL.
+ */
+void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom);
+
 #else /* !CONFIG_MLX5_VFMIG */
 
 /*
