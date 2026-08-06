@@ -83,6 +83,8 @@ struct vfmig_iova_domain;
  *   VFMIG_SLOT_FRAG_BUF -- work-queue frag buffers (RQ/SQ/CQ rings),
  *                          allocated by the mlx5_wq_*_create helpers
  *                          (wq.c).
+ *   VFMIG_SLOT_DB_PAGE  -- doorbell pgdir pages (mlx5_db_alloc_node /
+ *                          mlx5_alloc_db_pgdir, alloc.c).
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
@@ -90,6 +92,7 @@ enum vfmig_iova_slot {
 	VFMIG_SLOT_FW_PAGE	= 2,
 	VFMIG_SLOT_EQ_BUF	= 3,
 	VFMIG_SLOT_FRAG_BUF	= 4,
+	VFMIG_SLOT_DB_PAGE	= 5,
 	VFMIG_SLOT_NR,		/* count; drives VFMIG_IOVA_NR_SLOTS */
 };
 

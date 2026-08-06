@@ -54,6 +54,14 @@ struct mlx5_db_pgdir {
 	unsigned long	       *bitmap;
 	__be32		       *db_page;
 	dma_addr_t		db_dma;
+	/*
+	 * The vfmig deterministic-IOVA slot the backing db_page came
+	 * from, recorded at alloc time so the symmetric free routes back
+	 * to the same slot. On a tracked VF this is VFMIG_SLOT_DB_PAGE;
+	 * on an untracked VF / PF it stays 0 (VFMIG_SLOT_INVALID) and the
+	 * free path falls through to dma_free_coherent.
+	 */
+	enum vfmig_iova_slot	vfmig_slot;
 };
 
 struct mlx5_dma_pool {
@@ -612,9 +620,15 @@ static struct mlx5_db_pgdir *mlx5_alloc_db_pgdir(struct mlx5_core_dev *dev,
 
 	bitmap_fill(pgdir->bitmap, db_per_page);
 
+	/*
+	 * Doorbell pgdir pages get their own IOVA slot so allocating or
+	 * freeing a pgdir never perturbs the IOVAs of the EQ (EQ_BUF) or
+	 * WQ (FRAG_BUF) frag buffers.
+	 */
+	pgdir->vfmig_slot = VFMIG_SLOT_DB_PAGE;
 	pgdir->db_page = mlx5_dma_zalloc_coherent_node(dev, PAGE_SIZE,
 						       &pgdir->db_dma, node,
-						       VFMIG_SLOT_INVALID);
+						       pgdir->vfmig_slot);
 	if (!pgdir->db_page) {
 		bitmap_free(pgdir->bitmap);
 		kfree(pgdir);
@@ -687,8 +701,10 @@ void mlx5_db_free(struct mlx5_core_dev *dev, struct mlx5_db *db)
 	__set_bit(db->index, db->u.pgdir->bitmap);
 
 	if (bitmap_full(db->u.pgdir->bitmap, db_per_page)) {
-		dma_free_coherent(mlx5_core_dma_dev(dev), PAGE_SIZE,
-				  db->u.pgdir->db_page, db->u.pgdir->db_dma);
+		mlx5_dma_free_coherent_node(dev, PAGE_SIZE,
+					    db->u.pgdir->db_page,
+					    db->u.pgdir->db_dma,
+					    db->u.pgdir->vfmig_slot);
 		list_del(&db->u.pgdir->list);
 		bitmap_free(db->u.pgdir->bitmap);
 		kfree(db->u.pgdir);
