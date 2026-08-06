@@ -1201,8 +1201,18 @@ struct mlx5_vfmig_save_ctx {
 	u32 image_mkey;
 	struct dma_iova_state image_dma_state;
 
+	/*
+	 * Wire prefix (STREAM_HEADER + HOST_PAGE records) snapshotted from
+	 * the source VF's vfmig_iova_domain at SAVE-ioctl time into one
+	 * contiguous kvmalloc'd buffer, so the read() path stays a simple
+	 * byte-cursor walk. NULL / 0 when the source VF was untracked, in
+	 * which case the wire stream is just the FW_DATA record.
+	 */
+	void *host_pages_buf;
+	u64 host_pages_size;
+
 	u64 image_size;			/* bytes the firmware wrote */
-	u64 read_pos;			/* cursor over [FW_DATA hdr | payload] */
+	u64 read_pos;			/* cursor over [host pages | FW_DATA] */
 };
 
 /* Build the on-wire FW_DATA header for ctx->image_size into @hdr. */
@@ -1212,6 +1222,159 @@ static void vfmig_save_build_header(struct mlx5_vfmig_save_ctx *ctx,
 	hdr->record_size = cpu_to_le64(ctx->image_size);
 	hdr->flags = cpu_to_le32(0);
 	hdr->tag = cpu_to_le32(VFMIG_WIRE_TAG_FW_DATA);
+}
+
+/* Pass-1 for vfmig_iova_for_each: sum on-wire footprint + count entries. */
+struct vfmig_save_hp_size_ctx {
+	u64 total;
+	u64 count;
+};
+
+static int vfmig_save_hp_count_cb(enum vfmig_iova_slot slot, u64 instance_key,
+				  dma_addr_t iova, const void *vaddr,
+				  size_t len, void *ctx)
+{
+	struct vfmig_save_hp_size_ctx *sc = ctx;
+
+	sc->total += sizeof(struct vfmig_wire_header) +
+		     sizeof(struct vfmig_host_page_record) + len;
+	sc->count++;
+	return 0;
+}
+
+/*
+ * Pass-2 for vfmig_iova_for_each: serialize one HOST_PAGE record (wire
+ * header + sub-header + page contents) into @ctx->buf at @ctx->cursor and
+ * fold the record's identity tuple into the running manifest CRC. The
+ * destination recomputes the same fold and checks it against the value
+ * the STREAM_HEADER advertises.
+ */
+struct vfmig_save_hp_emit_ctx {
+	u8 *buf;
+	u64 capacity;
+	u64 cursor;
+	u32 crc;
+};
+
+static int vfmig_save_hp_emit_cb(enum vfmig_iova_slot slot, u64 instance_key,
+				 dma_addr_t iova, const void *vaddr,
+				 size_t len, void *ctx)
+{
+	struct vfmig_save_hp_emit_ctx *ec = ctx;
+	struct vfmig_wire_header hdr;
+	struct vfmig_host_page_record sub;
+	u64 record_size = sizeof(sub) + len;
+	u64 need = sizeof(hdr) + record_size;
+
+	if (ec->cursor + need > ec->capacity)
+		return -EOVERFLOW;
+
+	hdr.record_size = cpu_to_le64(record_size);
+	hdr.flags	= 0;
+	hdr.tag		= cpu_to_le32(VFMIG_WIRE_TAG_HOST_PAGE);
+	memcpy(ec->buf + ec->cursor, &hdr, sizeof(hdr));
+	ec->cursor += sizeof(hdr);
+
+	sub.slot_id	 = cpu_to_le32(slot);
+	sub.flags	 = 0;
+	sub.instance_key = cpu_to_le64(instance_key);
+	sub.iova	 = cpu_to_le64(iova);
+	sub.len		 = cpu_to_le64(len);
+	memcpy(ec->buf + ec->cursor, &sub, sizeof(sub));
+	ec->cursor += sizeof(sub);
+
+	/*
+	 * Fold the on-wire identity tuple into the manifest CRC field by
+	 * field (not memcpy(&sub)) so the hash covers exactly the bytes the
+	 * destination sees, regardless of any struct padding.
+	 */
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.slot_id,
+			   sizeof(sub.slot_id));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.flags,
+			   sizeof(sub.flags));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.instance_key,
+			   sizeof(sub.instance_key));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.iova,
+			   sizeof(sub.iova));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.len,
+			   sizeof(sub.len));
+
+	memcpy(ec->buf + ec->cursor, vaddr, len);
+	ec->cursor += len;
+	return 0;
+}
+
+/*
+ * Snapshot the source VF's vfmig_iova_domain registry into @ctx's wire
+ * prefix (STREAM_HEADER + N HOST_PAGE records). Owned by
+ * @ctx->host_pages_buf / @ctx->host_pages_size. The whole prefix is
+ * emitted even for a tracked source with zero entries, so the LOAD parser
+ * can always rely on STREAM_HEADER being the first record. A NULL @dom
+ * (untracked source) leaves both fields zero (FW_DATA-only stream).
+ *
+ * Safe to walk the registry lock-free-of-mutation because the source VF
+ * is SUSPEND_VHCA'd for the whole SAVE.
+ */
+static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
+					   struct vfmig_iova_domain *dom)
+{
+	struct vfmig_save_hp_size_ctx sc = {};
+	struct vfmig_save_hp_emit_ctx ec;
+	struct vfmig_wire_header sh_hdr;
+	struct vfmig_stream_header sh_payload;
+	const u64 sh_total = sizeof(sh_hdr) + sizeof(sh_payload);
+	u64 buf_total;
+	int err;
+
+	if (!dom)
+		return 0;
+
+	err = vfmig_iova_for_each(dom, vfmig_save_hp_count_cb, &sc);
+	if (err)
+		return err;
+
+	buf_total = sh_total + sc.total;
+	ctx->host_pages_buf = kvmalloc(buf_total, GFP_KERNEL);
+	if (!ctx->host_pages_buf)
+		return -ENOMEM;
+
+	/*
+	 * Emit HOST_PAGE records first (into the tail of the buffer) so the
+	 * manifest CRC is known before the STREAM_HEADER that advertises it
+	 * is serialized into the head.
+	 */
+	ec.buf	    = (u8 *)ctx->host_pages_buf + sh_total;
+	ec.capacity = sc.total;
+	ec.cursor   = 0;
+	ec.crc	    = 0;
+	err = vfmig_iova_for_each(dom, vfmig_save_hp_emit_cb, &ec);
+	if (err)
+		goto err_free;
+	if (WARN_ON(ec.cursor != sc.total)) {
+		err = -EIO;
+		goto err_free;
+	}
+
+	sh_hdr.record_size = cpu_to_le64(sizeof(sh_payload));
+	sh_hdr.flags	   = 0;
+	sh_hdr.tag	   = cpu_to_le32(VFMIG_WIRE_TAG_STREAM_HEADER);
+	memcpy(ctx->host_pages_buf, &sh_hdr, sizeof(sh_hdr));
+
+	sh_payload.magic	  = cpu_to_le32(VFMIG_WIRE_MAGIC);
+	sh_payload.version	  = cpu_to_le32(VFMIG_STREAM_VERSION);
+	sh_payload.num_pages	  = cpu_to_le64(sc.count);
+	sh_payload.manifest_crc32 = cpu_to_le32(ec.crc);
+	sh_payload.reserved	  = 0;
+	memcpy((u8 *)ctx->host_pages_buf + sizeof(sh_hdr),
+	       &sh_payload, sizeof(sh_payload));
+
+	ctx->host_pages_size = buf_total;
+	return 0;
+
+err_free:
+	kvfree(ctx->host_pages_buf);
+	ctx->host_pages_buf = NULL;
+	return err;
 }
 
 /*
@@ -1224,18 +1387,33 @@ static void vfmig_save_build_header(struct mlx5_vfmig_save_ctx *ctx,
 static ssize_t vfmig_save_drain(struct mlx5_vfmig_save_ctx *ctx,
 				char __user *ubuf, size_t count)
 {
+	const u64 HP_SZ  = ctx->host_pages_size;
 	const u64 HDR_SZ = sizeof(struct vfmig_wire_header);
-	const u64 total  = HDR_SZ + ctx->image_size;
+	const u64 FW_OFF = HP_SZ + HDR_SZ;
+	const u64 total  = FW_OFF + ctx->image_size;
 	size_t copied = 0;
 	ssize_t err = 0;
 
 	if (ctx->read_pos >= total)
 		return 0;
 
-	/* FW_DATA wire header. */
-	if (ctx->read_pos < HDR_SZ && count) {
-		struct vfmig_wire_header hdr;
+	/* STREAM_HEADER + HOST_PAGE prefix (empty for an untracked source). */
+	if (ctx->read_pos < HP_SZ && count) {
 		u64 hoff = ctx->read_pos;
+		size_t want = min_t(size_t, count, HP_SZ - hoff);
+
+		if (copy_to_user(ubuf, (u8 *)ctx->host_pages_buf + hoff, want))
+			return -EFAULT;
+		ctx->read_pos += want;
+		ubuf += want;
+		count -= want;
+		copied += want;
+	}
+
+	/* FW_DATA wire header. */
+	if (ctx->read_pos >= HP_SZ && ctx->read_pos < FW_OFF && count) {
+		struct vfmig_wire_header hdr;
+		u64 hoff = ctx->read_pos - HP_SZ;
 		size_t want = min_t(size_t, count, HDR_SZ - hoff);
 
 		vfmig_save_build_header(ctx, &hdr);
@@ -1249,7 +1427,7 @@ static ssize_t vfmig_save_drain(struct mlx5_vfmig_save_ctx *ctx,
 
 	/* FW payload pages. */
 	while (count && ctx->read_pos < total) {
-		u64 payload_off = ctx->read_pos - HDR_SZ;
+		u64 payload_off = ctx->read_pos - FW_OFF;
 		u32 page_idx = payload_off >> PAGE_SHIFT;
 		size_t page_off = payload_off & (PAGE_SIZE - 1);
 		size_t want = min3((size_t)(total - ctx->read_pos), count,
@@ -1373,6 +1551,7 @@ static int vfmig_save_release(struct inode *inode, struct file *filp)
 	list_del(&ctx->node);
 	mutex_unlock(&vfmig->ctxs_lock);
 
+	kvfree(ctx->host_pages_buf);
 	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
 	mutex_destroy(&ctx->io_lock);
 	vfmig_pf_put(vfmig);
@@ -1583,6 +1762,23 @@ static long vfmig_ioc_save_vhca_state(struct mlx5_vfmig_pf *vfmig,
 	}
 	ctx->image_size = actual_size;
 
+	/*
+	 * If the source VF is tracked, snapshot its deterministic-IOVA
+	 * domain into the STREAM_HEADER + HOST_PAGE wire prefix now, while
+	 * the VHCA is suspended (so the registry is stable). An untracked
+	 * source leaves host_pages_size == 0 and the stream is FW_DATA-only.
+	 */
+	mutex_lock(&vfmig->ctxs_lock);
+	err = vfmig_save_build_host_pages_buf(ctx,
+					      vfmig->iova_dom[arg.vf_id]);
+	mutex_unlock(&vfmig->ctxs_lock);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: vf %u: building HOST_PAGE prefix failed: %d\n",
+			       arg.vf_id, err);
+		goto err_res;
+	}
+
 	fd = get_unused_fd_flags(O_CLOEXEC);
 	if (fd < 0) {
 		err = fd;
@@ -1625,6 +1821,7 @@ err_res:
 	 */
 	ctx->flags &= ~MLX5_VFMIG_SAVE_FLAG_KEEP_SUSPENDED;
 	vfmig_save_release_resources(ctx);
+	kvfree(ctx->host_pages_buf);
 	vfmig_free_pages(ctx->image_pages, ctx->image_npages);
 	mutex_lock(&vfmig->ctxs_lock);
 	list_del(&ctx->node);

@@ -214,6 +214,27 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 			  dma_addr_t iova, size_t size);
 
 /*
+ * Callback for vfmig_iova_for_each(): invoked once per deterministic-slot
+ * registry entry, in IOVA-ascending order, with @dom->lock held. @vaddr is
+ * the kernel-virtual base of the backing pages (safe to memcpy @len bytes
+ * from). Returning non-zero stops the walk and is propagated to the caller.
+ * The SAVE path uses this to snapshot the source VF's domain into HOST_PAGE
+ * wire records.
+ */
+typedef int (*vfmig_iova_for_each_fn)(enum vfmig_iova_slot slot,
+				      u64 instance_key, dma_addr_t iova,
+				      const void *vaddr, size_t len, void *ctx);
+
+/*
+ * Walk every deterministic-slot registry entry in @dom in IOVA-ascending
+ * order, invoking @cb for each. Returns 0 when the whole registry was
+ * walked, the first non-zero @cb return otherwise, or -EINVAL on a bad
+ * argument.
+ */
+int  vfmig_iova_for_each(struct vfmig_iova_domain *dom,
+			 vfmig_iova_for_each_fn cb, void *ctx);
+
+/*
  * Replay one HOST_PAGE record into @dom on the LOAD/destination side:
  * install a backing page at the wire-provided deterministic @iova in
  * @slot and memcpy @len bytes of @contents into it. Must run before the
