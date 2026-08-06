@@ -39,6 +39,7 @@
 #include "lib/eq.h"
 #include "lib/tout.h"
 #include "eswitch.h"
+#include "vfmig/vfmig_iova.h"
 
 enum {
 	MLX5_PAGES_CANT_GIVE	= 0,
@@ -293,6 +294,7 @@ static int alloc_4k(struct mlx5_core_dev *dev, u64 *addr, u32 function)
 static void free_fwp(struct mlx5_core_dev *dev, struct fw_page *fwp,
 		     bool in_free_list)
 {
+	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
 	struct rb_root *root;
 
 	root = xa_load(&dev->priv.page_root_xa, fwp->function);
@@ -302,9 +304,33 @@ static void free_fwp(struct mlx5_core_dev *dev, struct fw_page *fwp,
 	rb_erase(&fwp->rb_node, root);
 	if (in_free_list)
 		list_del(&fwp->list);
-	dma_unmap_page(mlx5_core_dma_dev(dev), fwp->addr & MLX5_U64_4K_PAGE_MASK,
-		       PAGE_SIZE, DMA_BIDIRECTIONAL);
-	__free_page(fwp->page);
+	if (vfmig_dom) {
+		/*
+		 * Tracked VF: this fwp's backing page came from the per-VF
+		 * IOVA allocator's FW_PAGE slot (see alloc_system_page
+		 * below). Hand it back the same way; vfmig_iova_free_slot()
+		 * unmaps the IOVA and releases the underlying alloc_pages.
+		 * fwp->page is intentionally NULL on this path -- the IOVA
+		 * module owns the page lifetime, so __free_page() must not
+		 * run here.
+		 *
+		 * Ordering: this is reachable from mlx5_reclaim_startup_pages
+		 * which runs *before* mlx5_cmd_disable in
+		 * mlx5_function_disable, so dev->cmd.vfmig_iova_dom is still
+		 * set. If a future caller inverts that order, the predicate
+		 * goes stale and we would try to dma_unmap_page() a NULL
+		 * fwp->page; the WARN_ON below catches it loudly.
+		 */
+		vfmig_iova_free_slot(vfmig_dom, VFMIG_SLOT_FW_PAGE,
+				     fwp->addr & MLX5_U64_4K_PAGE_MASK,
+				     PAGE_SIZE);
+		WARN_ON_ONCE(fwp->page);
+	} else {
+		dma_unmap_page(mlx5_core_dma_dev(dev),
+			       fwp->addr & MLX5_U64_4K_PAGE_MASK,
+			       PAGE_SIZE, DMA_BIDIRECTIONAL);
+		__free_page(fwp->page);
+	}
 	kfree(fwp);
 }
 
@@ -335,12 +361,67 @@ static void free_4k(struct mlx5_core_dev *dev, u64 addr, u32 function)
 static int alloc_system_page(struct mlx5_core_dev *dev, u32 function,
 			     u16 func_type)
 {
+	struct vfmig_iova_domain *vfmig_dom = dev->cmd.vfmig_iova_dom;
 	struct device *device = mlx5_core_dma_dev(dev);
 	int nid = dev->priv.numa_node;
 	struct page *page;
 	u64 zero_addr = 1;
 	u64 addr;
 	int err;
+
+	if (vfmig_dom) {
+		/*
+		 * Tracked VF: route all FW-owned pages (boot/init/dynamic
+		 * MANAGE_PAGES OP_GIVE) through the per-VF deterministic
+		 * IOVA allocator. The dma-iommu default path is unusable
+		 * here for the same reason as the cmd ring (see
+		 * alloc_cmd_page in cmd.c): our unmanaged IOMMU domain is
+		 * attached, so dma_map_page() returns an IOVA that doesn't
+		 * translate in the actually-attached domain and FW would
+		 * fault on first dereference.
+		 *
+		 * vfmig_iova_alloc_slot() returns IOVAs strictly above
+		 * VFMIG_IOVA_BASE (>= 4 GiB), so the "FW doesn't support
+		 * physical-address-0" workaround the default path does is
+		 * unnecessary. fwp->page is left NULL because the IOVA
+		 * module owns the backing page; free_fwp() reads vfmig_dom
+		 * to take the symmetric release path.
+		 *
+		 * Slot: VFMIG_SLOT_FW_PAGE -- one allocation per page the
+		 * firmware asks for via MANAGE_PAGES OP_GIVE.
+		 * instance_key=0 picks up per-slot auto-numbering, so each
+		 * page gets a unique sequence index that is stable as long
+		 * as the FW page-give sequence is stable.
+		 *
+		 * GFP_KERNEL, not GFP_HIGHUSER: the IOVA module needs the
+		 * backing page in the linear map (page_address() must work
+		 * for the kernel-side memcpy/zero on the SAVE/replay paths)
+		 * and iommu_map() rejects __GFP_HIGHMEM with a hard
+		 * -EINVAL.
+		 */
+		dma_addr_t iova;
+		void *vaddr;
+
+		err = vfmig_iova_alloc_slot(vfmig_dom, VFMIG_SLOT_FW_PAGE,
+					    /*instance_key=*/0, PAGE_SIZE,
+					    GFP_KERNEL, &iova, &vaddr);
+		if (err) {
+			mlx5_core_warn(dev,
+				       "vfmig: alloc_system_page: vfmig_iova_alloc_slot: %d\n",
+				       err);
+			return err;
+		}
+
+		err = insert_page(dev, iova, NULL, function, func_type);
+		if (err) {
+			mlx5_core_err(dev,
+				      "vfmig: alloc_system_page: insert_page: %d\n",
+				      err);
+			vfmig_iova_free_slot(vfmig_dom, VFMIG_SLOT_FW_PAGE,
+					     iova, PAGE_SIZE);
+		}
+		return err;
+	}
 
 	page = alloc_pages_node(nid, GFP_HIGHUSER, 0);
 	if (!page) {

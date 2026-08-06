@@ -73,10 +73,14 @@ struct vfmig_iova_domain;
  *   VFMIG_SLOT_INVALID  -- sentinel; alloc_slot rejects it.
  *   VFMIG_SLOT_CMD_RING -- cmd ring DMA buffer (one per VF), allocated
  *                          by mlx5_cmd_enable during probe.
+ *   VFMIG_SLOT_FW_PAGE  -- FW-owned pages handed over via MANAGE_PAGES
+ *                          OP_GIVE (boot/init/dynamic), one allocation
+ *                          per page (see alloc_system_page).
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
 	VFMIG_SLOT_CMD_RING	= 1,
+	VFMIG_SLOT_FW_PAGE	= 2,
 	VFMIG_SLOT_NR,		/* count; drives VFMIG_IOVA_NR_SLOTS */
 };
 
