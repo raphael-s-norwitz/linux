@@ -51,8 +51,12 @@ int mlx5_wq_cyc_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
 
 	wq->db  = wq_ctrl->db.db;
 
-	err = mlx5_frag_buf_alloc_node(mdev, wq_get_byte_sz(log_wq_sz, log_wq_stride),
-				       &wq_ctrl->buf, param->buf_numa_node);
+	err = mlx5_frag_buf_alloc_node_slot(mdev,
+					    wq_get_byte_sz(log_wq_sz,
+							   log_wq_stride),
+					    &wq_ctrl->buf,
+					    param->buf_numa_node,
+					    VFMIG_SLOT_FRAG_BUF);
 	if (err) {
 		mlx5_core_warn(mdev, "mlx5_frag_buf_alloc_node() failed, %d\n", err);
 		goto err_db_free;
@@ -116,10 +120,14 @@ int mlx5_wq_qp_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
 		return err;
 	}
 
-	err = mlx5_frag_buf_alloc_node(mdev,
-				       wq_get_byte_sz(log_rq_sz, log_rq_stride) +
-				       wq_get_byte_sz(log_sq_sz, log_sq_stride),
-				       &wq_ctrl->buf, param->buf_numa_node);
+	err = mlx5_frag_buf_alloc_node_slot(mdev,
+					    wq_get_byte_sz(log_rq_sz,
+							   log_rq_stride) +
+					    wq_get_byte_sz(log_sq_sz,
+							   log_sq_stride),
+					    &wq_ctrl->buf,
+					    param->buf_numa_node,
+					    VFMIG_SLOT_FRAG_BUF);
 	if (err) {
 		mlx5_core_warn(mdev, "mlx5_frag_buf_alloc_node() failed, %d\n", err);
 		goto err_db_free;
@@ -173,9 +181,12 @@ int mlx5_cqwq_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
 
 	wq->db  = wq_ctrl->db.db;
 
-	err = mlx5_frag_buf_alloc_node(mdev, wq_get_byte_sz(log_wq_sz, log_wq_stride),
-				       &wq_ctrl->buf,
-				       param->buf_numa_node);
+	err = mlx5_frag_buf_alloc_node_slot(mdev,
+					    wq_get_byte_sz(log_wq_sz,
+							   log_wq_stride),
+					    &wq_ctrl->buf,
+					    param->buf_numa_node,
+					    VFMIG_SLOT_FRAG_BUF);
 	if (err) {
 		mlx5_core_warn(mdev, "mlx5_frag_buf_alloc_node() failed, %d\n",
 			       err);
@@ -224,8 +235,12 @@ int mlx5_wq_ll_create(struct mlx5_core_dev *mdev, struct mlx5_wq_param *param,
 
 	wq->db  = wq_ctrl->db.db;
 
-	err = mlx5_frag_buf_alloc_node(mdev, wq_get_byte_sz(log_wq_sz, log_wq_stride),
-				       &wq_ctrl->buf, param->buf_numa_node);
+	err = mlx5_frag_buf_alloc_node_slot(mdev,
+					    wq_get_byte_sz(log_wq_sz,
+							   log_wq_stride),
+					    &wq_ctrl->buf,
+					    param->buf_numa_node,
+					    VFMIG_SLOT_FRAG_BUF);
 	if (err) {
 		mlx5_core_warn(mdev, "mlx5_frag_buf_alloc_node() failed, %d\n", err);
 		goto err_db_free;
