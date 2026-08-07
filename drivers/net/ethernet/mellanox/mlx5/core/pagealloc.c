@@ -358,6 +358,109 @@ static void free_4k(struct mlx5_core_dev *dev, u64 addr, u32 function)
 		list_add(&fwp->list, &dev->priv.free_list);
 }
 
+/*
+ * Destination-side mirror of the (alloc_system_page + alloc_4k * N)
+ * sequence that ran on the source when FW asked for pages via
+ * give_pages(). Inserts a single host-page-sized fw_page into
+ * priv->page_root_xa[function] keyed by @iova, with all sub-pages
+ * marked "handed to FW" (bitmask=0, free_count=0, off the free_list)
+ * and the matching priv->fw_pages / page_counters bumps applied.
+ *
+ * Why this is a separate API rather than reusing alloc_system_page():
+ * on a restored VF, vfmig_iova_replay_page() during LOAD already
+ * installed the IOVA mapping and copied the source's bytes into the
+ * backing page; LOAD_VHCA_STATE then handed the VHCA back to FW with
+ * that IOVA already live. We do NOT want alloc_system_page()'s
+ * vfmig_iova_alloc_slot() to run again -- that would either trip
+ * drift detection or double-allocate the same IOVA. We just need the
+ * mlx5_core-side bookkeeping (page_root, fw_pages, page_counters) to
+ * mirror what the source has, so subsequent reclaim_pages /
+ * mlx5_reclaim_root_pages walks find the page and route through
+ * free_fwp()'s vfmig branch (vfmig_iova_free_slot).
+ *
+ * @function: encoded (func_vhca_id, ec_function); on a VF reclaiming
+ *  its own pages this is 0.
+ * @iova: page-aligned IOVA from the wire. Length is implicit
+ *  (PAGE_SIZE) -- this matches alloc_system_page()'s contract.
+ *
+ * Caller must hold the per-VF "no concurrent give_pages / reclaim
+ * yet" guarantee; in practice that means calling this from the VF
+ * mlx5_core probe path between mlx5_cmd_enable() (which initialises
+ * page_root_xa) and any FW command that would itself trigger
+ * give_pages handling. The current caller is the restored-VF branch
+ * of mlx5_function_enable(), before mlx5_start_health_poll().
+ *
+ * Returns 0 on success or a negative errno from insert_page() or
+ * find_fw_page().
+ */
+int mlx5_pages_import_replayed_fw_page(struct mlx5_core_dev *dev,
+				       u32 function, u64 iova)
+{
+	struct fw_page *fwp;
+	int err;
+	u16 type;
+
+	/*
+	 * The wire format only carries one (slot, iova) tuple per
+	 * source-side alloc_system_page() call. On architectures where
+	 * PAGE_SIZE > MLX5_ADAPTER_PAGE_SIZE (e.g. 64K-page aarch64),
+	 * a single source-side fw_page covered MLX5_NUM_4K_IN_PAGE > 1
+	 * sub-pages, and the LAST fw_page in a give_pages run could be
+	 * partially-handed-out (free_count > 0, still on free_list).
+	 * We have no way to recover that partial state from the wire,
+	 * and treating it as "fully handed out" would over-count
+	 * fw_pages by up to MLX5_NUM_4K_IN_PAGE-1. SAVE+LOAD across
+	 * differing host page sizes isn't supported anyway (the
+	 * deterministic IOVA layout depends on the FW + host paging
+	 * contract being identical). Catch the same-host regression
+	 * early.
+	 */
+	if (WARN_ON_ONCE(MLX5_NUM_4K_IN_PAGE != 1))
+		return -EOPNOTSUPP;
+
+	/*
+	 * Resolve the FW func_type up front: 7.2's insert_page() stamps
+	 * it onto the fw_page (fwp->func_type) so free_4k / reclaim
+	 * decrement the matching priv->page_counters[] bucket. Mirror
+	 * give_pages()'s func_vhca_id_to_type() derivation, but from the
+	 * encoded @function key rather than raw (func_vhca_id, ec).
+	 */
+	type = func_vhca_id_to_type(dev, mlx5_get_func_vhca_id(function),
+				    mlx5_get_ec_function(function));
+
+	err = insert_page(dev, iova, NULL, function, type);
+	if (err)
+		return err;
+
+	fwp = find_fw_page(dev, iova, function);
+	if (WARN_ON_ONCE(!fwp))
+		return -ENOENT;
+
+	/*
+	 * insert_page() leaves the new fw_page in priv->free_list with
+	 * free_count = MLX5_NUM_4K_IN_PAGE and bitmask all-set, i.e.
+	 * "all sub-pages available for alloc_4k to hand out". Flip to
+	 * "all sub-pages already handed to FW" so the page mirrors the
+	 * source-side post-give_pages state and is not eligible to be
+	 * re-handed-out by a subsequent alloc_4k() call (which would
+	 * silently double-allocate the same IOVA to FW).
+	 */
+	fwp->bitmask = 0;
+	fwp->free_count = 0;
+	list_del_init(&fwp->list);
+
+	/*
+	 * Mirror the bumps that alloc_4k() would have applied
+	 * MLX5_NUM_4K_IN_PAGE times on the source to land at the
+	 * "all sub-pages out" state.
+	 */
+	if (type != MLX5_FUNC_TYPE_NONE)
+		dev->priv.page_counters[type] += MLX5_NUM_4K_IN_PAGE;
+	dev->priv.fw_pages += MLX5_NUM_4K_IN_PAGE;
+
+	return 0;
+}
+
 static int alloc_system_page(struct mlx5_core_dev *dev, u32 function,
 			     u16 func_type)
 {

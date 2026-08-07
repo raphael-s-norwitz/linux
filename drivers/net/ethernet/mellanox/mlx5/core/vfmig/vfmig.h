@@ -76,6 +76,36 @@ bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *vf_dev,
 int  mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev);
 
 /*
+ * Reconstitute the destination VF's mlx5_core page rb-tree
+ * (priv->page_root_xa[function=0]) from the per-VF deterministic
+ * IOVA domain's FW_PAGE entries, mirroring the
+ * alloc_system_page() -> insert_page() path that ran on the source.
+ *
+ * Without this step, mlx5_reclaim_root_pages() at restored-VF
+ * teardown finds an empty rb-tree, returns 0 pages reclaimed, and
+ * the IOVA allocator never frees the restored backing pages -- per-
+ * VF leak that grows unbounded across bind/unbind cycles. See the
+ * function comment in vfmig.c for the full rationale and the
+ * symptoms of the missing-import regression.
+ *
+ * MUST be called between mlx5_cmd_enable() (which initialises
+ * priv->page_root_xa) and any FW give/take-pages event on the
+ * restored VHCA. Current caller is the restored-VF branch of
+ * mlx5_function_enable() in main.c, after
+ * mlx5_vfmig_vf_apply_pending_load() returns success.
+ *
+ * No-op on PFs, on VFs whose cmd ring isn't tracked (vfmig_iova_dom
+ * is NULL), and on tracked VFs whose IOVA registry happens to have
+ * no FW_PAGE entries (e.g. a SAVE that captured zero FW pages).
+ *
+ * Returns 0 on success or a negative errno from the first failing
+ * mlx5_pages_import_replayed_fw_page() call. Partial inserts are
+ * NOT rolled back; mlx5_reclaim_root_pages() at the next teardown
+ * frees them via the same vfmig branch.
+ */
+int  mlx5_vfmig_vf_import_replayed_fw_pages(struct mlx5_core_dev *vf_dev);
+
+/*
  * Return the per-VF deterministic IOVA domain for @vf_dev if its VF was
  * vfmig-tracked (SET_TRACKED { enable=1 }) when probe fired, else NULL.
  * Called from the VF's cmd-ring allocation (cmd.c) to decide whether to
@@ -123,6 +153,12 @@ static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *vf_dev,
 }
 
 static inline int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
+{
+	return 0;
+}
+
+static inline int
+mlx5_vfmig_vf_import_replayed_fw_pages(struct mlx5_core_dev *vf_dev)
 {
 	return 0;
 }

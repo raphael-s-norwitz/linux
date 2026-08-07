@@ -1167,6 +1167,29 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 			goto err_cmd_cleanup;
 		}
 
+		/*
+		 * Reconstitute priv->page_root_xa for the restored VHCA so
+		 * the destination's mlx5_core has the same per-VF page
+		 * rb-tree the source had after give_pages(). Without this,
+		 * mlx5_reclaim_root_pages() at VF teardown finds an empty
+		 * tree and the restored backing pages leak in the IOVA
+		 * allocator forever. See the function-level comment in
+		 * vfmig.c for the full rationale.
+		 *
+		 * Done AFTER apply_pending_load (which issues
+		 * LOAD_VHCA_STATE on the PF mdev) so the import is the very
+		 * first VF-mdev-side touch of priv->page_root_xa, matching
+		 * the "no give-pages event has fired yet" precondition of
+		 * mlx5_pages_import_replayed_fw_page().
+		 */
+		err = mlx5_vfmig_vf_import_replayed_fw_pages(dev);
+		if (err) {
+			mlx5_core_err(dev,
+				      "vfmig: import replayed FW pages failed for vhca_id 0x%04x: %d\n",
+				      restored_vhca_id, err);
+			goto err_cmd_cleanup;
+		}
+
 		mlx5_start_health_poll(dev);
 		mlx5_core_info(dev,
 			       "vfmig: VF (vhca_id 0x%04x) restored; ENABLE_HCA/SET_ISSI/boot-pages/INIT_HCA skipped\n",
