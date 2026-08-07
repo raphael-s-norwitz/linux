@@ -3077,6 +3077,154 @@ out_unlock:
 	return err;
 }
 
+struct vfmig_import_fwp_ctx {
+	struct mlx5_core_dev *vf_dev;
+	u32 imported;
+	int err;
+};
+
+static int vfmig_import_fwp_cb(enum vfmig_iova_slot slot, u64 instance_key,
+			       dma_addr_t iova, const void *vaddr, size_t len,
+			       void *ctx)
+{
+	struct vfmig_import_fwp_ctx *ic = ctx;
+	int err;
+
+	/*
+	 * Only FW_PAGE entries went through alloc_system_page() ->
+	 * insert_page() on the source. The other slots (CMD_RING,
+	 * EQ_BUF, FRAG_BUF, DB_PAGE, DMA_COHERENT) live in their own
+	 * lifetime trackers (cmd ring buffer, struct mlx5_frag_buf,
+	 * mlx5_db_pgdir, etc.) and never appear in priv->page_root_xa.
+	 * Skip them here -- their reconstruction is the matching
+	 * consumer's job.
+	 */
+	if (slot != VFMIG_SLOT_FW_PAGE)
+		return 0;
+
+	/*
+	 * alloc_system_page() always allocates exactly PAGE_SIZE per
+	 * call; the wire mirrors that 1:1. Defensive check rather than
+	 * silently importing a malformed-len entry.
+	 */
+	if (WARN_ON_ONCE(len != PAGE_SIZE))
+		return 0;
+
+	/*
+	 * function=0 is the VF reclaiming-its-own-pages encoding
+	 * (func_id=0, ec_function=0). Matches what give_pages() passes
+	 * on the source for VF-self give-pages events, which is the
+	 * only flavour alloc_system_page() ever drives on a VF mdev.
+	 */
+	err = mlx5_pages_import_replayed_fw_page(ic->vf_dev, /*function=*/0,
+						 (u64)iova);
+	if (err) {
+		ic->err = err;
+		return err;
+	}
+	ic->imported++;
+	return 0;
+}
+
+/*
+ * Reconstitute mlx5_core's per-VF page rb-tree (priv->page_root_xa)
+ * for a restored VF, mirroring the source's give_pages() output.
+ *
+ * On the source, every FW_PAGE the IOVA allocator handed out was
+ * also recorded in priv->page_root_xa[function] via insert_page() in
+ * alloc_system_page(); priv->fw_pages and priv->page_counters[VF]
+ * tracked the running total. Both data structures together back
+ * mlx5_reclaim_root_pages() at VF teardown: it walks page_root, calls
+ * free_fwp() on each entry, and free_fwp()'s vfmig branch routes the
+ * page back through vfmig_iova_free_slot().
+ *
+ * On the destination, vfmig_iova_replay_page() during LOAD installed
+ * the IOVA mapping and the page contents, but it did NOT touch
+ * page_root_xa -- the VF mdev didn't even exist yet (the LOAD ioctl
+ * runs on the PF cdev pre-bind). Without this reconstruction step
+ * the restored VF probes with an empty page_root for its own
+ * function and:
+ *
+ *   - mlx5_reclaim_root_pages() at teardown finds nothing, returns 0
+ *     pages reclaimed; FW thinks it still owns the pages and the
+ *     IOVA allocator never frees them -> per-VF leak that grows
+ *     unbounded with bind/unbind cycles.
+ *   - any FW-initiated MANAGE_PAGES { take_pages } walks the (empty)
+ *     rb-tree, returns -EEXIST/0-pages, and FW state diverges from
+ *     mlx5_core's view.
+ *   - priv->fw_pages and the per-type page_counters[] under-report
+ *     by exactly the number of pages LOAD restored, tripping
+ *     debug-kernel sanity checks in mlx5_destroy_mkey() and the
+ *     pages_debugfs reader.
+ *
+ * Walks the per-VF deterministic IOVA domain in IOVA-ascending order
+ * (matching the source's give-pages order, which is what
+ * vfmig_iova_for_each guarantees) and calls
+ * mlx5_pages_import_replayed_fw_page() for each FW_PAGE entry. Other
+ * slots are skipped -- they live in their own consumer-side
+ * lifetime trackers (cmd ring buffer, mlx5_frag_buf, mlx5_db_pgdir)
+ * which the corresponding consumer reconstructs on its own probe.
+ *
+ * MUST run between the destination VF's mlx5_cmd_enable() (which
+ * initialises priv->page_root_xa) and any FW give-pages event on the
+ * restored VHCA. The current caller is the restored-VF branch of
+ * mlx5_function_enable() in main.c, right after
+ * mlx5_vfmig_vf_apply_pending_load() returns success and before
+ * mlx5_start_health_poll().
+ *
+ * Returns 0 on success (including the no-domain / no-FW_PAGE-entries
+ * case) or a negative errno from the first failed
+ * mlx5_pages_import_replayed_fw_page(). On error, partial inserts
+ * are NOT rolled back: the pages live in priv->page_root_xa and will
+ * be reclaimed by mlx5_reclaim_root_pages() at VF teardown via the
+ * same vfmig branch as a successful import. The probe should still
+ * fail loudly via the err return so the operator sees the divergence.
+ */
+int mlx5_vfmig_vf_import_replayed_fw_pages(struct mlx5_core_dev *vf_dev)
+{
+	struct vfmig_iova_domain *dom;
+	struct vfmig_import_fwp_ctx ic = { .vf_dev = vf_dev };
+	struct pci_dev *vf_pdev;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	vf_pdev = vf_dev->pdev;
+	if (!vf_pdev || !vf_pdev->is_virtfn)
+		return 0;
+
+	/*
+	 * Read the IOVA domain off vf_dev->cmd, NOT via
+	 * mlx5_vf_get_vfmig_iova_domain(): the latter takes the
+	 * PF reference and goes through the cdev lookup path, which
+	 * is heavier than what we need here and (more importantly)
+	 * acquires intf_state_mutex on the PF -- a lock our caller
+	 * (mlx5_function_enable) doesn't hold but would inherit a
+	 * deadlock risk against if the lookup ever started running on
+	 * a path that does. The cmd-side pointer was set by
+	 * mlx5_cmd_enable() upstream of us and is guaranteed live for
+	 * the duration of this VF probe (see vfmig.h docstring on
+	 * mlx5_vf_get_vfmig_iova_domain for the lifetime contract).
+	 */
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	err = vfmig_iova_for_each(dom, vfmig_import_fwp_cb, &ic);
+	if (err) {
+		mlx5_core_warn(vf_dev,
+			       "vfmig: import_replayed_fw_pages: failed after %u entries: %d\n",
+			       ic.imported, err);
+		return err;
+	}
+
+	mlx5_core_info(vf_dev,
+		       "vfmig: imported %u replayed FW_PAGE entries into priv->page_root\n",
+		       ic.imported);
+	return 0;
+}
+
 /*
  * Destroy every staged-but-unconsumed pending_load slot and clear the
  * restored latch it set. pf_mdev must be alive (FW resource teardown).

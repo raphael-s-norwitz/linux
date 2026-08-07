@@ -233,6 +233,27 @@ int mlx5_query_module_num(struct mlx5_core_dev *dev, int *module_num);
 int mlx5_frag_buf_alloc_node_slot(struct mlx5_core_dev *dev, int size,
 				  struct mlx5_frag_buf *buf, int node,
 				  enum vfmig_iova_slot slot);
+
+/*
+ * Destination-side mirror of an alloc_system_page() call from the
+ * source. Inserts a host-page-sized fw_page into
+ * priv->page_root_xa[function] keyed by @iova, marks it as fully
+ * handed to FW (off priv->free_list), and bumps priv->fw_pages /
+ * priv->page_counters[type] accordingly. Used by vfmig.c at restored-
+ * VF probe to reconstitute the page rb-tree before any FW give/take
+ * pages event can fire on the restored VHCA.
+ *
+ * @function: encoded (func_id, ec_function); on a VF reclaiming its
+ *  own pages this is 0.
+ * @iova: page-aligned IOVA from the wire.
+ *
+ * Returns 0 on success, -EOPNOTSUPP if PAGE_SIZE > MLX5_ADAPTER_PAGE_
+ * SIZE (we cannot reconstruct the partial-handout state of the last
+ * page), or a negative errno from insert_page() / find_fw_page().
+ */
+int mlx5_pages_import_replayed_fw_page(struct mlx5_core_dev *dev,
+				       u32 function, u64 iova);
+
 int mlx5_cmd_init(struct mlx5_core_dev *dev);
 void mlx5_cmd_cleanup(struct mlx5_core_dev *dev);
 int mlx5_cmd_enable(struct mlx5_core_dev *dev);
