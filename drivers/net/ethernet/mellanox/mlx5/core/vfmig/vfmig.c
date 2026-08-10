@@ -3830,6 +3830,40 @@ int mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
 }
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_cq);
 
+/*
+ * Public Stage-2 source-side retag entry point for the mlx5_ib user QP
+ * creation path (header docstring in include/linux/mlx5/driver.h).
+ * Identical shape to the MR/CQ helpers modulo the kind: a QPC-managed QP
+ * (RC / UC / UD) shares one umem covering the SQ and RQ WQE buffers and
+ * FW assigns @qpn at mlx5_qpc_create_qp time, so promote its entries to
+ * VFMIG_HUOBJ_KEY(KIND_QP, qpn). RAW_PACKET / SOURCE_QPN QPs (split
+ * SQ/RQ umems) are skipped at the callsite. The doorbell page is
+ * retagged separately by mlx5_vfmig_retag_user_dbr. Same
+ * cmd.vfmig_iova_dom fast path and -ENOENT-to-0 mapping as the others.
+ */
+int mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			     dma_addr_t iova_base, size_t length)
+{
+	struct vfmig_iova_domain *dom;
+	u64 instance_key;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_QP, qpn);
+	err = vfmig_iova_retag_external_range(dom, iova_base, length,
+					      instance_key);
+	if (err == -ENOENT)
+		return 0;
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_retag_user_qp);
+
 int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig;

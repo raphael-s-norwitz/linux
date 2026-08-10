@@ -1351,6 +1351,28 @@ mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
 }
 #endif
 
+/*
+ * Source-side retag for a freshly-registered user QP's IOVA range in the
+ * per-VF vfmig deterministic IOVA domain. Same contract as the CQ helper
+ * modulo the kind: @qpn is the FW-allocated qpn (== base->mqp.qpn).
+ * Called by mlx5_ib's create_user_qp() once mlx5_qpc_create_qp() returns.
+ * v0 scope is the QPC-managed types (RC / UC / UD), whose single umem
+ * covers both the SQ and RQ WQE buffers; RAW_PACKET / SOURCE_QPN QPs use
+ * split SQ/RQ umems and are skipped at the callsite. The QP's doorbell
+ * page is retagged separately by mlx5_vfmig_retag_user_dbr.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			     dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			 dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 int mlx5_sriov_blocking_notifier_register(struct mlx5_core_dev *mdev,
 					  int vf_id,
 					  struct notifier_block *nb);
