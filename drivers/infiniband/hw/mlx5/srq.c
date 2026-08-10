@@ -291,6 +291,35 @@ int mlx5_ib_create_srq(struct ib_srq *ib_srq,
 		goto err_usr_kern_srq;
 	}
 
+	/*
+	 * Source-side vfmig retag (mirrors create_real_mr). Runs after
+	 * mlx5_cmd_create_srq populates srq->msrq.srqn -- the second
+	 * component of VFMIG_HUOBJ_KEY(SRQ, srqn). The SRQ WQE-buffer umem
+	 * was DMA-mapped earlier in create_srq_user, so its KIND_NONE
+	 * registry entries are already awaiting promotion. Gated on a user
+	 * SRQ with a real umem (kernel SRQs use in.pas), a tracked VF, and a
+	 * non-dmabuf umem. The doorbell page is retagged separately by
+	 * mlx5_ib's db_map_user path. Non-fatal on error: the SRQ stays
+	 * usable, just not CRIU-restorable.
+	 */
+	if (udata && srq->umem && dev->mdev->cmd.vfmig_iova_dom &&
+	    !srq->umem->is_dmabuf) {
+		struct sg_table *sgt = &srq->umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		size_t retag_length = ALIGN(ib_umem_offset(srq->umem) +
+					    srq->umem->length, PAGE_SIZE);
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_srq(dev->mdev,
+						      srq->msrq.srqn,
+						      iova_base, retag_length);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				     "vfmig: source-side retag for SRQ failed: srqn=0x%x iova_base=0x%llx length=0x%zx err=%d -- SRQ usable but not CRIU-restorable\n",
+				     srq->msrq.srqn, (u64)iova_base,
+				     retag_length, retag_err);
+	}
+
 	mlx5_ib_dbg(dev, "create SRQ with srqn 0x%x\n", srq->msrq.srqn);
 
 	srq->msrq.event = mlx5_ib_srq_event;
