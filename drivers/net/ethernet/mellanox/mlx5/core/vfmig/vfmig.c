@@ -122,6 +122,21 @@ struct vfmig_host_page_record {
 };
 
 /*
+ * Identity-only record for one external (USER_PAGE) registry entry.
+ * Unlike HOST_PAGE it carries no page contents: @instance_key encodes
+ * VFMIG_HUOBJ_KEY(kind, fw_id), and (@iova, @len) pin the source-side
+ * IOVA window the destination will replay as an awaiting-bind
+ * placeholder. @flags / @reserved must be zero.
+ */
+struct vfmig_host_user_page_record {
+	__le32 flags;
+	__le32 reserved;
+	__le64 instance_key;
+	__le64 iova;
+	__le64 len;
+};
+
+/*
  * Detached, fully-staged LOAD_VHCA_STATE payload waiting for the next
  * mlx5_core probe of a VF to apply it. Populated when a LOAD anon-inode
  * fd is closed after a complete blob was written; the firmware-tied
@@ -1243,7 +1258,7 @@ static void vfmig_save_build_header(struct mlx5_vfmig_save_ctx *ctx,
 	hdr->tag = cpu_to_le32(VFMIG_WIRE_TAG_FW_DATA);
 }
 
-/* Pass-1 for vfmig_iova_for_each: sum on-wire footprint + count entries. */
+/* Pass-1 for vfmig_iova_for_each: sum HOST_PAGE footprint + count entries. */
 struct vfmig_save_hp_size_ctx {
 	u64 total;
 	u64 count;
@@ -1262,7 +1277,7 @@ static int vfmig_save_hp_count_cb(enum vfmig_iova_slot slot, u64 instance_key,
 }
 
 /*
- * Pass-2 for vfmig_iova_for_each: serialize one HOST_PAGE record (wire
+ * Pass-3 for vfmig_iova_for_each: serialize one HOST_PAGE record (wire
  * header + sub-header + page contents) into @ctx->buf at @ctx->cursor and
  * fold the record's identity tuple into the running manifest CRC. The
  * destination recomputes the same fold and checks it against the value
@@ -1323,6 +1338,33 @@ static int vfmig_save_hp_emit_cb(enum vfmig_iova_slot slot, u64 instance_key,
 	return 0;
 }
 
+/* Pass-2 for vfmig_iova_for_each_external: size + count retagged entries. */
+struct vfmig_save_hup_size_ctx {
+	u64 total;
+	u64 count;
+};
+
+static int vfmig_save_hup_count_cb(u8 kind, u64 fw_id, dma_addr_t iova,
+				   size_t len, void *ctx)
+{
+	struct vfmig_save_hup_size_ctx *sc = ctx;
+
+	/*
+	 * Un-retagged (auto-numbered) entries have no stable cross-host
+	 * identity to emit; skip them. Until the source-side retag
+	 * callsites land, every external entry is KIND_NONE, so a tracked
+	 * VF counts zero user-page records and the SAVE footprint is
+	 * unchanged from the HOST_PAGE-only layout.
+	 */
+	if (kind == VFMIG_HUOBJ_KIND_NONE)
+		return 0;
+
+	sc->total += sizeof(struct vfmig_wire_header) +
+		     sizeof(struct vfmig_host_user_page_record);
+	sc->count++;
+	return 0;
+}
+
 /*
  * Snapshot the source VF's vfmig_iova_domain registry into @ctx's wire
  * prefix (STREAM_HEADER + N HOST_PAGE records). Owned by
@@ -1338,6 +1380,7 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 					   struct vfmig_iova_domain *dom)
 {
 	struct vfmig_save_hp_size_ctx sc = {};
+	struct vfmig_save_hup_size_ctx sc_hup = {};
 	struct vfmig_save_hp_emit_ctx ec;
 	struct vfmig_wire_header sh_hdr;
 	struct vfmig_stream_header sh_payload;
@@ -1348,11 +1391,16 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 	if (!dom)
 		return 0;
 
+	/* Pass 1 + 2: size the HOST_PAGE then HOST_USER_PAGE regions. */
 	err = vfmig_iova_for_each(dom, vfmig_save_hp_count_cb, &sc);
 	if (err)
 		return err;
+	err = vfmig_iova_for_each_external(dom, vfmig_save_hup_count_cb,
+					   &sc_hup);
+	if (err)
+		return err;
 
-	buf_total = sh_total + sc.total;
+	buf_total = sh_total + sc.total + sc_hup.total;
 	ctx->host_pages_buf = kvmalloc(buf_total, GFP_KERNEL);
 	if (!ctx->host_pages_buf)
 		return -ENOMEM;
