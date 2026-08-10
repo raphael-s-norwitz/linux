@@ -77,9 +77,16 @@ struct vfmig_wire_header {
  * vfmig-private wire records prefixing the FW_DATA payload on a tracked
  * VF's SAVE stream. A tracked source's blob is:
  *
- *   [STREAM_HEADER]  1x  { magic, version, num_pages, manifest_crc32 }
+ *   [STREAM_HEADER]  1x  { magic, version, num_pages, manifest_crc32,
+ *                          num_user_pages }
  *   [HOST_PAGE]      Nx  one per deterministic-IOVA registry entry, in
  *                        IOVA-ascending order, carrying page contents
+ *   [HOST_USER_PAGE] Mx  one per retagged external (USER_PAGE) entry,
+ *                        identity-only (kind, fw_id, iova, len); no
+ *                        contents -- the umem pages are CRIU's to
+ *                        restore. M == 0 until the source-side retag
+ *                        callsites land, so this record is absent on a
+ *                        blob produced before then.
  *   [FW_DATA]        1x  the SAVE_VHCA_STATE firmware blob
  *
  * The HOST_PAGE records are replayed into the destination's per-VF IOVA
@@ -103,6 +110,7 @@ struct vfmig_wire_header {
 #define VFMIG_STREAM_VERSION		1
 #define VFMIG_WIRE_TAG_STREAM_HEADER	0x4853
 #define VFMIG_WIRE_TAG_HOST_PAGE	0x4842
+#define VFMIG_WIRE_TAG_HOST_USER_PAGE	0x4855
 #define VFMIG_HOST_PAGE_MAX_LEN		(16ULL << 20)
 
 struct vfmig_stream_header {
@@ -110,7 +118,7 @@ struct vfmig_stream_header {
 	__le32 version;
 	__le64 num_pages;
 	__le32 manifest_crc32;
-	__le32 reserved;
+	__le32 num_user_pages;
 };
 
 struct vfmig_host_page_record {
@@ -1366,6 +1374,59 @@ static int vfmig_save_hup_count_cb(u8 kind, u64 fw_id, dma_addr_t iova,
 }
 
 /*
+ * Pass-4 for vfmig_iova_for_each_external: serialize one identity-only
+ * HOST_USER_PAGE record and fold its tuple into the manifest CRC
+ * (continued from the HOST_PAGE pass, so the destination folds HP then
+ * HUP in the same order). No page contents -- the umem is CRIU's.
+ */
+struct vfmig_save_hup_emit_ctx {
+	u8 *buf;
+	u64 capacity;
+	u64 cursor;
+	u32 crc;
+};
+
+static int vfmig_save_hup_emit_cb(u8 kind, u64 fw_id, dma_addr_t iova,
+				  size_t len, void *ctx)
+{
+	struct vfmig_save_hup_emit_ctx *ec = ctx;
+	struct vfmig_wire_header hdr;
+	struct vfmig_host_user_page_record sub;
+	u64 record_size = sizeof(sub);
+	u64 need = sizeof(hdr) + record_size;
+
+	if (kind == VFMIG_HUOBJ_KIND_NONE)
+		return 0;
+
+	if (ec->cursor + need > ec->capacity)
+		return -EOVERFLOW;
+
+	hdr.record_size = cpu_to_le64(record_size);
+	hdr.flags	= 0;
+	hdr.tag		= cpu_to_le32(VFMIG_WIRE_TAG_HOST_USER_PAGE);
+	memcpy(ec->buf + ec->cursor, &hdr, sizeof(hdr));
+	ec->cursor += sizeof(hdr);
+
+	sub.flags	 = 0;
+	sub.reserved	 = 0;
+	sub.instance_key = cpu_to_le64(VFMIG_HUOBJ_KEY(kind, fw_id));
+	sub.iova	 = cpu_to_le64(iova);
+	sub.len		 = cpu_to_le64(len);
+	memcpy(ec->buf + ec->cursor, &sub, sizeof(sub));
+	ec->cursor += sizeof(sub);
+
+	/* Field-by-field fold (see vfmig_save_hp_emit_cb) to skip padding. */
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.flags, sizeof(sub.flags));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.reserved,
+			   sizeof(sub.reserved));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.instance_key,
+			   sizeof(sub.instance_key));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.iova, sizeof(sub.iova));
+	ec->crc = crc32_le(ec->crc, (const u8 *)&sub.len, sizeof(sub.len));
+	return 0;
+}
+
+/*
  * Snapshot the source VF's vfmig_iova_domain registry into @ctx's wire
  * prefix (STREAM_HEADER + N HOST_PAGE records). Owned by
  * @ctx->host_pages_buf / @ctx->host_pages_size. The whole prefix is
@@ -1382,6 +1443,7 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 	struct vfmig_save_hp_size_ctx sc = {};
 	struct vfmig_save_hup_size_ctx sc_hup = {};
 	struct vfmig_save_hp_emit_ctx ec;
+	struct vfmig_save_hup_emit_ctx ec_hup;
 	struct vfmig_wire_header sh_hdr;
 	struct vfmig_stream_header sh_payload;
 	const u64 sh_total = sizeof(sh_hdr) + sizeof(sh_payload);
@@ -1406,9 +1468,10 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 		return -ENOMEM;
 
 	/*
-	 * Emit HOST_PAGE records first (into the tail of the buffer) so the
-	 * manifest CRC is known before the STREAM_HEADER that advertises it
-	 * is serialized into the head.
+	 * Pass 3: emit HOST_PAGE records into the buffer just after the
+	 * stream header, starting the manifest CRC. The STREAM_HEADER that
+	 * advertises the CRC is serialized last, once both record passes
+	 * have folded their tuples in.
 	 */
 	ec.buf	    = (u8 *)ctx->host_pages_buf + sh_total;
 	ec.capacity = sc.total;
@@ -1422,6 +1485,26 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 		goto err_free;
 	}
 
+	/*
+	 * Pass 4: emit HOST_USER_PAGE records immediately after the
+	 * HOST_PAGE region, continuing the same manifest CRC. sc_hup.count
+	 * is 0 until the source-side retag callsites land, in which case
+	 * this pass writes nothing and the CRC equals the HOST_PAGE-only
+	 * value.
+	 */
+	ec_hup.buf	= (u8 *)ctx->host_pages_buf + sh_total + sc.total;
+	ec_hup.capacity = sc_hup.total;
+	ec_hup.cursor	= 0;
+	ec_hup.crc	= ec.crc;
+	err = vfmig_iova_for_each_external(dom, vfmig_save_hup_emit_cb,
+					   &ec_hup);
+	if (err)
+		goto err_free;
+	if (WARN_ON(ec_hup.cursor != sc_hup.total)) {
+		err = -EIO;
+		goto err_free;
+	}
+
 	sh_hdr.record_size = cpu_to_le64(sizeof(sh_payload));
 	sh_hdr.flags	   = 0;
 	sh_hdr.tag	   = cpu_to_le32(VFMIG_WIRE_TAG_STREAM_HEADER);
@@ -1430,8 +1513,8 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 	sh_payload.magic	  = cpu_to_le32(VFMIG_WIRE_MAGIC);
 	sh_payload.version	  = cpu_to_le32(VFMIG_STREAM_VERSION);
 	sh_payload.num_pages	  = cpu_to_le64(sc.count);
-	sh_payload.manifest_crc32 = cpu_to_le32(ec.crc);
-	sh_payload.reserved	  = 0;
+	sh_payload.manifest_crc32 = cpu_to_le32(ec_hup.crc);
+	sh_payload.num_user_pages = cpu_to_le32((u32)sc_hup.count);
 	memcpy((u8 *)ctx->host_pages_buf + sizeof(sh_hdr),
 	       &sh_payload, sizeof(sh_payload));
 
