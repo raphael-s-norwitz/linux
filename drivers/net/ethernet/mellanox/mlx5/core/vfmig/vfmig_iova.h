@@ -311,6 +311,58 @@ int  vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 			 vfmig_iova_for_each_fn cb, void *ctx);
 
 /*
+ * User-object identity taxonomy for USER_PAGE external entries. A
+ * tracked VF's user MR (and, as support lands, CQ / QP / SRQ buffers and
+ * doorbell records) flow through the ib_core umem-placement hook as
+ * external registry entries with an auto-numbered @instance_key (kind
+ * byte 0 == KIND_NONE). A later slice retags each entry, post-FW-create,
+ * with VFMIG_HUOBJ_KEY(kind, fw_id) so SAVE can emit a stable (kind, fw_id)
+ * identity the destination replays. @instance_key packs an 8-bit kind in
+ * the top byte (so at most 256 kinds) and the 56-bit FW resource id
+ * (mkey_index / cqn / qpn / srqn / dbr VA) below. Additional kinds are
+ * appended as their retag callsites land.
+ */
+enum vfmig_huobj_kind {
+	VFMIG_HUOBJ_KIND_NONE	= 0,	/* auto-numbered / un-retagged */
+	VFMIG_HUOBJ_KIND_NR,            /* count; must stay <= 256 */
+};
+
+#define VFMIG_HUOBJ_FWID_BITS	56U
+#define VFMIG_HUOBJ_FWID_MASK	((1ULL << VFMIG_HUOBJ_FWID_BITS) - 1ULL)
+#define VFMIG_HUOBJ_KEY(kind, fw_id)				\
+	((((u64)(kind)) << VFMIG_HUOBJ_FWID_BITS) |		\
+	 ((u64)(fw_id) & VFMIG_HUOBJ_FWID_MASK))
+#define VFMIG_HUOBJ_KIND(key)					\
+	((u8)(((u64)(key)) >> VFMIG_HUOBJ_FWID_BITS))
+#define VFMIG_HUOBJ_FWID(key)					\
+	(((u64)(key)) & VFMIG_HUOBJ_FWID_MASK)
+
+/*
+ * Callback for vfmig_iova_for_each_external(): invoked once per external
+ * (USER_PAGE, caller-owned) registry entry, in IOVA-ascending order,
+ * with @dom->lock held. @kind / @fw_id are decoded from the entry's
+ * retagged @instance_key (both zero for a still-auto-numbered entry).
+ * Unlike vfmig_iova_for_each() there is no @vaddr: the backing page is
+ * umem-owned and its contents are CRIU's responsibility, so the SAVE
+ * path emits identity-only HOST_USER_PAGE records. Returning non-zero
+ * stops the walk and is propagated to the caller.
+ */
+typedef int (*vfmig_iova_for_each_external_fn)(u8 kind, u64 fw_id,
+					       dma_addr_t iova, size_t len,
+					       void *ctx);
+
+/*
+ * Walk every external registry entry in @dom in IOVA-ascending order,
+ * invoking @cb for each. Non-external (deterministic-slot) entries are
+ * skipped -- they are covered by vfmig_iova_for_each(). Returns 0 when
+ * the whole registry was walked, the first non-zero @cb return
+ * otherwise, or -EINVAL on a bad argument.
+ */
+int  vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
+				  vfmig_iova_for_each_external_fn cb,
+				  void *ctx);
+
+/*
  * Replay one HOST_PAGE record into @dom on the LOAD/destination side:
  * install a backing page at the wire-provided deterministic @iova in
  * @slot and memcpy @len bytes of @contents into it. Must run before the

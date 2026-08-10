@@ -972,3 +972,27 @@ int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 	mutex_unlock(&dom->lock);
 	return ret;
 }
+
+int vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
+				 vfmig_iova_for_each_external_fn cb,
+				 void *ctx)
+{
+	struct vfmig_iova_page *p;
+	int ret = 0;
+
+	if (!dom || !cb)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	list_for_each_entry(p, &dom->pages, node) {
+		if (!p->external)
+			continue;
+		ret = cb(VFMIG_HUOBJ_KIND(p->instance_key),
+			 VFMIG_HUOBJ_FWID(p->instance_key),
+			 p->iova, p->len, ctx);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&dom->lock);
+	return ret;
+}
