@@ -790,6 +790,36 @@ static struct ib_mr *create_real_mr(struct ib_pd *pd, struct ib_umem *umem,
 			return ERR_PTR(err);
 		}
 	}
+
+	/*
+	 * Source-side vfmig retag: promote the auto-numbered (KIND_NONE)
+	 * registry entries that vfmig_dma_ops.map_sg planted during
+	 * ib_umem_get's dma_map_sgtable into VFMIG_HUOBJ_KEY(MR,
+	 * mkey_index)-keyed entries, so SAVE_VHCA_STATE emits a
+	 * HOST_USER_PAGE record per entry and LOAD re-installs them as
+	 * awaiting_bind placeholders. Runs after the FW mkey is fully wired
+	 * (post-UMR enable above, or already populated on the reg_create
+	 * slow path). Since the shim page-aligns its inputs and the bump
+	 * cursor allocates contiguously, the umem's footprint collapses to
+	 * one (base, length) range. A non-zero return is non-fatal: the MR
+	 * stays usable for data path, just not CRIU-restorable.
+	 */
+	if (dev->mdev->cmd.vfmig_iova_dom && !umem->is_dmabuf) {
+		struct sg_table *sgt = &umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		size_t retag_length = ALIGN(ib_umem_offset(umem) + umem->length,
+					    PAGE_SIZE);
+		u32 mkey_index = mr->mmkey.key >> 8;
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_mr(dev->mdev, mkey_index,
+						     iova_base, retag_length);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				     "vfmig: source-side retag for MR failed: mkey_index=0x%x iova_base=0x%llx length=0x%zx err=%d -- MR usable but not CRIU-restorable\n",
+				     mkey_index, (u64)iova_base, retag_length,
+				     retag_err);
+	}
 	return &mr->ibmr;
 }
 

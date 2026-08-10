@@ -3756,6 +3756,47 @@ mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev)
 	return dom;
 }
 
+/*
+ * Public Stage-2 source-side retag entry point for the mlx5_ib MR
+ * creation path (header docstring in include/linux/mlx5/driver.h).
+ *
+ * Reads vf_dev->cmd.vfmig_iova_dom directly: an O(1), lockless load set
+ * in cmd.c at VF probe time iff the VF was vfmig-tracked, NULL otherwise
+ * (PFs, untracked VFs, unbound mdevs). The same NULL test at the mlx5_ib
+ * callsite lets non-vfmig deployments skip the iova_base/length compute
+ * entirely; the check here is defense-in-depth and how we obtain @dom.
+ * The pointer's lifetime is the VF's bound lifetime (cmd.c clears it on
+ * cmd-ring free, and SET_TRACKED{disable} is gated to unbound VFs), so a
+ * non-NULL read stays valid for this call.
+ *
+ * -ENOENT (no matching entries: umem took a non-vfmig DMA path) folds to
+ * 0. -EEXIST (mkey_index collides with a prior retag) and -EINVAL
+ * (misaligned args) propagate so the caller can warn; the MR stays usable
+ * for data path, just not CRIU-restorable.
+ */
+int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			     dma_addr_t iova_base, size_t length)
+{
+	struct vfmig_iova_domain *dom;
+	u64 instance_key;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_MR, mkey_index);
+	err = vfmig_iova_retag_external_range(dom, iova_base, length,
+					      instance_key);
+	if (err == -ENOENT)
+		return 0;
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_retag_user_mr);
+
 int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig;
