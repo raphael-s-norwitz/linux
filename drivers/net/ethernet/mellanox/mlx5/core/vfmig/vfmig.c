@@ -2014,6 +2014,8 @@ enum vfmig_load_state {
 	VFMIG_LS_HP_READ_SUBHDR,	/* reading a HOST_PAGE sub-header */
 	VFMIG_LS_HP_READ_DATA,		/* reading a HOST_PAGE's page contents */
 	VFMIG_LS_HP_REPLAY,		/* replaying the HOST_PAGE into the domain */
+	VFMIG_LS_HUP_READ_SUBHDR,	/* reading a HOST_USER_PAGE sub-header */
+	VFMIG_LS_HUP_REPLAY,		/* replaying the HOST_USER_PAGE placeholder */
 	VFMIG_LS_PREP_IMAGE,		/* allocate staging for the payload */
 	VFMIG_LS_READ_IMAGE,		/* accumulating the FW_DATA payload */
 	VFMIG_LS_LOAD_IMAGE,		/* payload complete, run LOAD */
@@ -2087,6 +2089,21 @@ struct mlx5_vfmig_load_ctx {
 	u64 hp_len;
 	void *hp_contents;
 	u64 hp_filled;
+
+	/*
+	 * HOST_USER_PAGE accounting + per-record scratch. @hup_expected is
+	 * pinned from the stream header's num_user_pages; @hup_seen counts
+	 * placeholders replayed so far. The identity-only sub-header (no
+	 * page contents follow) is accumulated into @hup_subhdr_buf in
+	 * VFMIG_LS_HUP_READ_SUBHDR and consumed in VFMIG_LS_HUP_REPLAY.
+	 */
+	u64 hup_expected;
+	u64 hup_seen;
+	u8  hup_subhdr_buf[sizeof(struct vfmig_host_user_page_record)];
+	u32 hup_subhdr_filled;
+	u64 hup_instance_key;
+	u64 hup_iova;
+	u64 hup_len;
 
 	/* Firmware-tied resources, mutated under vfmig->lock. */
 	bool resources_freed;
@@ -2212,16 +2229,19 @@ err_pages:
 }
 
 /*
- * Once every HOST_PAGE record the STREAM_HEADER promised has been
- * replayed, verify the running manifest CRC matches what the source
- * pinned and arm at-probe drift detection. Latched by @records_finalized;
- * a no-op until hp_seen == hp_expected.
+ * Once every HOST_PAGE and HOST_USER_PAGE record the STREAM_HEADER
+ * promised has been replayed, verify the running manifest CRC matches
+ * what the source pinned and arm at-probe drift detection. Latched by
+ * @records_finalized; a no-op until both hp_seen == hp_expected and
+ * hup_seen == hup_expected (the CRC folds HOST_PAGE then HOST_USER_PAGE
+ * records, so it is only complete once both streams are drained).
  */
 static int vfmig_load_maybe_finalize_records(struct mlx5_vfmig_load_ctx *ctx)
 {
 	if (ctx->records_finalized)
 		return 0;
-	if (ctx->hp_seen != ctx->hp_expected)
+	if (ctx->hp_seen != ctx->hp_expected ||
+	    ctx->hup_seen != ctx->hup_expected)
 		return 0;
 
 	if (ctx->manifest_crc_have != ctx->manifest_crc_want) {
@@ -2303,6 +2323,25 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 		ctx->hp_filled = 0;
 		ctx->state = VFMIG_LS_HP_READ_SUBHDR;
 		return 0;
+	case VFMIG_WIRE_TAG_HOST_USER_PAGE:
+		if (!ctx->iova_dom) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_USER_PAGE record but destination not SET_TRACKED'd; aborting LOAD\n",
+				       ctx->vf_id);
+			return -EINVAL;
+		}
+		if (record_size != sizeof(struct vfmig_host_user_page_record))
+			return -EINVAL;
+		if (ctx->hup_seen >= ctx->hup_expected) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_USER_PAGE record beyond declared num_user_pages=%llu\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hup_expected);
+			return -EPROTO;
+		}
+		ctx->hup_subhdr_filled = 0;
+		ctx->state = VFMIG_LS_HUP_READ_SUBHDR;
+		return 0;
 	case VFMIG_WIRE_TAG_FW_DATA:
 		if (ctx->image_staged) {
 			mlx5_core_warn(ctx->vfmig->pf_mdev,
@@ -2316,6 +2355,14 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 				       ctx->vf_id,
 				       (unsigned long long)ctx->hp_seen,
 				       (unsigned long long)ctx->hp_expected);
+			return -EPROTO;
+		}
+		if (ctx->hup_seen != ctx->hup_expected) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: FW_DATA before all HOST_USER_PAGE records (%llu / %llu); aborting\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hup_seen,
+				       (unsigned long long)ctx->hup_expected);
 			return -EPROTO;
 		}
 		if (!record_size)
@@ -2462,22 +2509,25 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 		}
 
 		ctx->hp_expected	= le64_to_cpu(sh.num_pages);
+		ctx->hup_expected	= le32_to_cpu(sh.num_user_pages);
 		ctx->manifest_crc_want	= le32_to_cpu(sh.manifest_crc32);
 		ctx->manifest_crc_have	= 0;
 		ctx->hp_seen		= 0;
+		ctx->hup_seen		= 0;
 		ctx->records_finalized	= false;
 		ctx->stream_hdr_seen	= true;
 
 		/*
-		 * A source that recorded HOST_PAGE records needs a tracked
-		 * destination to replay them into. Reject the mismatch here
-		 * rather than at the first record.
+		 * A source that recorded HOST_PAGE / HOST_USER_PAGE records
+		 * needs a tracked destination to replay them into. Reject the
+		 * mismatch here rather than at the first record.
 		 */
-		if (ctx->hp_expected && !ctx->iova_dom) {
+		if ((ctx->hp_expected || ctx->hup_expected) && !ctx->iova_dom) {
 			mlx5_core_warn(ctx->vfmig->pf_mdev,
-				       "vfmig: vf %u: stream declares %llu HOST_PAGE records but destination not SET_TRACKED'd\n",
+				       "vfmig: vf %u: stream declares %llu HOST_PAGE + %llu HOST_USER_PAGE records but destination not SET_TRACKED'd\n",
 				       ctx->vf_id,
-				       (unsigned long long)ctx->hp_expected);
+				       (unsigned long long)ctx->hp_expected,
+				       (unsigned long long)ctx->hup_expected);
 			return -EINVAL;
 		}
 
@@ -2485,9 +2535,9 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 		 * Zero-record stream: no replays will arrive, so the manifest
 		 * CRC (folded over zero bytes on the SAVE side) must be the
 		 * crc32_le initial value of 0. Verify + arm now, since
-		 * HP_REPLAY's finalize will never be reached.
+		 * HP_REPLAY / HUP_REPLAY finalize will never be reached.
 		 */
-		if (ctx->hp_expected == 0) {
+		if (ctx->hp_expected == 0 && ctx->hup_expected == 0) {
 			if (ctx->manifest_crc_want != 0) {
 				mlx5_core_warn(ctx->vfmig->pf_mdev,
 					       "vfmig: vf %u: 0 records but non-zero manifest CRC 0x%08x\n",
@@ -2650,6 +2700,132 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 			      ctx->hp_slot,
 			      (unsigned long long)ctx->hp_iova,
 			      (unsigned long long)ctx->hp_len);
+
+		err = vfmig_load_maybe_finalize_records(ctx);
+		if (err)
+			return err;
+
+		ctx->state = VFMIG_LS_READ_HEADER;
+		*progressed = true;
+		return 0;
+	}
+	case VFMIG_LS_HUP_READ_SUBHDR: {
+		size_t need = sizeof(ctx->hup_subhdr_buf) -
+			      ctx->hup_subhdr_filled;
+		size_t take = min(need, *left);
+		struct vfmig_host_user_page_record subhdr;
+		u32 hup_flags;
+		u32 hup_reserved;
+		u8 kind;
+
+		if (take) {
+			if (copy_from_user(ctx->hup_subhdr_buf +
+						   ctx->hup_subhdr_filled,
+					   *ubuf, take))
+				return -EFAULT;
+			ctx->hup_subhdr_filled += take;
+			*ubuf += take;
+			*left -= take;
+			*progressed = true;
+		}
+		if (ctx->hup_subhdr_filled < sizeof(ctx->hup_subhdr_buf))
+			return 0;
+
+		memcpy(&subhdr, ctx->hup_subhdr_buf, sizeof(subhdr));
+		hup_flags		 = le32_to_cpu(subhdr.flags);
+		hup_reserved		 = le32_to_cpu(subhdr.reserved);
+		ctx->hup_instance_key	 = le64_to_cpu(subhdr.instance_key);
+		ctx->hup_iova		 = le64_to_cpu(subhdr.iova);
+		ctx->hup_len		 = le64_to_cpu(subhdr.len);
+
+		if (hup_flags || hup_reserved) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_USER_PAGE flags=0x%x reserved=0x%x set (must be 0)\n",
+				       ctx->vf_id, hup_flags, hup_reserved);
+			return -EOPNOTSUPP;
+		}
+
+		kind = VFMIG_HUOBJ_KIND(ctx->hup_instance_key);
+		if (kind == VFMIG_HUOBJ_KIND_NONE ||
+		    kind >= VFMIG_HUOBJ_KIND_NR) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_USER_PAGE kind %u out of range\n",
+				       ctx->vf_id, kind);
+			return -EPROTO;
+		}
+		if (ctx->hup_len == 0 ||
+		    !IS_ALIGNED(ctx->hup_len, VFMIG_IOVA_GRANULE) ||
+		    !IS_ALIGNED(ctx->hup_iova, VFMIG_IOVA_GRANULE)) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: malformed HOST_USER_PAGE iova=0x%llx len=%llu\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hup_iova,
+				       (unsigned long long)ctx->hup_len);
+			return -EINVAL;
+		}
+
+		ctx->state = VFMIG_LS_HUP_REPLAY;
+		*progressed = true;
+		return 0;
+	}
+	case VFMIG_LS_HUP_REPLAY: {
+		struct vfmig_host_user_page_record subhdr;
+
+		err = vfmig_iova_replay_external(ctx->iova_dom,
+						 VFMIG_SLOT_USER_PAGE,
+						 ctx->hup_instance_key,
+						 ctx->hup_iova, ctx->hup_len);
+		if (err) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: replay_external(key=0x%llx iova=0x%llx len=%llu) failed: %d\n",
+				       ctx->vf_id,
+				       (unsigned long long)ctx->hup_instance_key,
+				       (unsigned long long)ctx->hup_iova,
+				       (unsigned long long)ctx->hup_len, err);
+			return err;
+		}
+
+		/*
+		 * Fold this record's identity tuple into the running manifest
+		 * CRC, continuing from the HOST_PAGE pass and re-encoding from
+		 * ctx->hup_* so the hashed bytes match the SAVE side exactly
+		 * regardless of struct padding (flags/reserved are always 0).
+		 */
+		subhdr.flags	    = 0;
+		subhdr.reserved	    = 0;
+		subhdr.instance_key = cpu_to_le64(ctx->hup_instance_key);
+		subhdr.iova	    = cpu_to_le64(ctx->hup_iova);
+		subhdr.len	    = cpu_to_le64(ctx->hup_len);
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.flags,
+				 sizeof(subhdr.flags));
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.reserved,
+				 sizeof(subhdr.reserved));
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.instance_key,
+				 sizeof(subhdr.instance_key));
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.iova,
+				 sizeof(subhdr.iova));
+		ctx->manifest_crc_have =
+			crc32_le(ctx->manifest_crc_have,
+				 (const u8 *)&subhdr.len,
+				 sizeof(subhdr.len));
+
+		ctx->hup_seen++;
+		mlx5_core_dbg(ctx->vfmig->pf_mdev,
+			      "vfmig: vf %u: replayed HOST_USER_PAGE %llu/%llu key=0x%llx iova=0x%llx len=%llu\n",
+			      ctx->vf_id,
+			      (unsigned long long)ctx->hup_seen,
+			      (unsigned long long)ctx->hup_expected,
+			      (unsigned long long)ctx->hup_instance_key,
+			      (unsigned long long)ctx->hup_iova,
+			      (unsigned long long)ctx->hup_len);
 
 		err = vfmig_load_maybe_finalize_records(ctx);
 		if (err)
