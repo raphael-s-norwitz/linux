@@ -325,6 +325,7 @@ int  vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 enum vfmig_huobj_kind {
 	VFMIG_HUOBJ_KIND_NONE	= 0,	/* auto-numbered / un-retagged */
 	VFMIG_HUOBJ_KIND_MR	= 1,	/* user memory region (mkey_index) */
+	VFMIG_HUOBJ_KIND_CQ	= 2,	/* user completion queue (cqn) */
 	VFMIG_HUOBJ_KIND_NR,            /* count; must stay <= 256 */
 };
 

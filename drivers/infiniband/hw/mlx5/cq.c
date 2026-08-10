@@ -1015,6 +1015,34 @@ int mlx5_ib_create_user_cq(struct ib_cq *ibcq,
 	if (err)
 		goto err_cqb;
 
+	/*
+	 * Source-side vfmig retag (mirrors create_real_mr). Runs after
+	 * mlx5_core_create_cq populates cq->mcq.cqn -- the second component
+	 * of VFMIG_HUOBJ_KEY(CQ, cqn). The CQE-buffer umem was DMA-mapped
+	 * earlier in create_cq_user, so its KIND_NONE registry entries are
+	 * already awaiting promotion. Gated on a user CQ with a real umem
+	 * (kernel CQs use cq->buf.frag_buf), a tracked VF, and a non-dmabuf
+	 * umem. The doorbell page is retagged separately by mlx5_ib's
+	 * db_map_user path. Non-fatal on error: the CQ stays usable, just
+	 * not CRIU-restorable.
+	 */
+	if (udata && cq->buf.umem && dev->mdev->cmd.vfmig_iova_dom &&
+	    !cq->buf.umem->is_dmabuf) {
+		struct sg_table *sgt = &cq->buf.umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		size_t retag_length = ALIGN(ib_umem_offset(cq->buf.umem) +
+					    cq->buf.umem->length, PAGE_SIZE);
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_cq(dev->mdev, cq->mcq.cqn,
+						     iova_base, retag_length);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				     "vfmig: source-side retag for CQ failed: cqn=0x%x iova_base=0x%llx length=0x%zx err=%d -- CQ usable but not CRIU-restorable\n",
+				     cq->mcq.cqn, (u64)iova_base, retag_length,
+				     retag_err);
+	}
+
 	mlx5_ib_dbg(dev, "cqn 0x%x\n", cq->mcq.cqn);
 	cq->mcq.event = mlx5_ib_cq_event;
 
