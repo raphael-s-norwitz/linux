@@ -1329,6 +1329,28 @@ mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 }
 #endif
 
+/*
+ * Source-side retag for a freshly-registered user CQ's IOVA range in the
+ * per-VF vfmig deterministic IOVA domain. Same contract as
+ * mlx5_vfmig_retag_user_mr() modulo the second tuple component: @cqn is
+ * the FW-allocated cqn (== cq->mcq.cqn), populated by mlx5_core_create_cq.
+ * Called by mlx5_ib's mlx5_ib_create_cq() once FW create succeeds; it
+ * promotes the KIND_NONE entries vfmig_dma_ops.map_sg planted for the
+ * CQE-buffer umem into VFMIG_HUOBJ_KEY(CQ, cqn)-keyed entries. The CQ's
+ * doorbell page is retagged separately by mlx5_vfmig_retag_user_dbr.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			     dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			 dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 int mlx5_sriov_blocking_notifier_register(struct mlx5_core_dev *mdev,
 					  int vf_id,
 					  struct notifier_block *nb);

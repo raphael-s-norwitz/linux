@@ -3797,6 +3797,39 @@ int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 }
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_mr);
 
+/*
+ * Public Stage-2 source-side retag entry point for the mlx5_ib user CQ
+ * creation path (header docstring in include/linux/mlx5/driver.h).
+ * Identical shape to mlx5_vfmig_retag_user_mr() modulo the kind: a single
+ * user umem covers the CQE ring buffer and FW assigns @cqn at
+ * mlx5_core_create_cq time, so promote its entries to
+ * VFMIG_HUOBJ_KEY(KIND_CQ, cqn). The doorbell page is retagged separately
+ * by mlx5_vfmig_retag_user_dbr. Same cmd.vfmig_iova_dom fast path and
+ * -ENOENT-to-0 mapping as the MR helper.
+ */
+int mlx5_vfmig_retag_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			     dma_addr_t iova_base, size_t length)
+{
+	struct vfmig_iova_domain *dom;
+	u64 instance_key;
+	int err;
+
+	if (!vf_dev)
+		return 0;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return 0;
+
+	instance_key = VFMIG_HUOBJ_KEY(VFMIG_HUOBJ_KIND_CQ, cqn);
+	err = vfmig_iova_retag_external_range(dom, iova_base, length,
+					      instance_key);
+	if (err == -ENOENT)
+		return 0;
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_retag_user_cq);
+
 int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig;
