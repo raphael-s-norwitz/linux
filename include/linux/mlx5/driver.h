@@ -1395,6 +1395,41 @@ mlx5_vfmig_retag_user_srq(struct mlx5_core_dev *vf_dev, u32 srqn,
 }
 #endif
 
+/*
+ * Source-side retag for a freshly-allocated user doorbell page in the
+ * per-VF vfmig deterministic IOVA domain. Called by the miss branch of
+ * mlx5_ib_db_map_user() -- the only place the user doorbell allocator
+ * hands a fresh PAGE_SIZE umem to ib_umem_get (and thus to
+ * vfmig_dma_ops.map_sg); the hit branch just bumps a refcount on an
+ * already-retagged page.
+ *
+ * Unlike the other kinds, the second tuple component is a page-aligned
+ * userspace virtual address, not a FW identifier: doorbell pages have no
+ * FW identity (the FW only sees the DMA address of individual 8-byte
+ * doorbell records). mlx5_ib_db_map_user() already dedups pages on
+ * (mm, user_virt & PAGE_MASK), so @user_virt is the stable key that
+ * spans the SAVE -> LOAD boundary; the helper masks it to PAGE_MASK
+ * internally. Many uobjects in one ucontext typically share a single
+ * doorbell page, hence a single registry entry. @length is PAGE_SIZE.
+ *
+ * Same fast-path / error semantics as the MR helper. A non-zero return
+ * should be logged but must NOT fail the CQ/QP/SRQ create that triggered
+ * the mapping -- the resource stays usable, just not CRIU-restorable.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
+			      unsigned long user_virt,
+			      dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
+			  unsigned long user_virt,
+			  dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 int mlx5_sriov_blocking_notifier_register(struct mlx5_core_dev *mdev,
 					  int vf_id,
 					  struct notifier_block *nb);
