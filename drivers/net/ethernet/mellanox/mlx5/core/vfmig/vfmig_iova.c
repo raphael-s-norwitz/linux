@@ -51,6 +51,20 @@ struct vfmig_iova_page {
 	void		*vaddr;
 	enum vfmig_iova_slot slot;
 	u64		 instance_key;
+
+	/*
+	 * @external: the backing page is owned by the caller, not by the
+	 * registry. Set on entries created by the
+	 * vfmig_iova_user_page_map_phys() path (umem-pinned MR / CQ / QP /
+	 * SRQ buffers + doorbell records flowing through the ib_core
+	 * umem-placement hook). For these entries the registry tracks the
+	 * (iova, len) bookkeeping and owns the arena link, but @page and
+	 * @vaddr are NULL: it
+	 * does not alloc_pages() at install nor __free_pages() at destroy,
+	 * and vfmig_iova_for_each() skips them (its callback dereferences
+	 * @vaddr, which is meaningless here).
+	 */
+	bool		 external;
 };
 
 /*
@@ -758,6 +772,15 @@ int vfmig_iova_for_each(struct vfmig_iova_domain *dom,
 
 	mutex_lock(&dom->lock);
 	list_for_each_entry(p, &dom->pages, node) {
+		/*
+		 * External (USER_PAGE, caller-owned) entries have no
+		 * kernel-virtual @vaddr for the callback to read; SAVE's
+		 * HOST_PAGE memcpy would dereference NULL. They are emitted
+		 * separately via the external-iteration path, so skip them
+		 * here.
+		 */
+		if (p->external)
+			continue;
 		ret = cb(p->slot, p->instance_key, p->iova, p->vaddr,
 			 p->len, ctx);
 		if (ret)
