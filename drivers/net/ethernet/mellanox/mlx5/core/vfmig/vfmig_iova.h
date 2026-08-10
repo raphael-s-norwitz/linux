@@ -328,6 +328,7 @@ enum vfmig_huobj_kind {
 	VFMIG_HUOBJ_KIND_CQ	= 2,	/* user completion queue (cqn) */
 	VFMIG_HUOBJ_KIND_QP	= 3,	/* user queue pair (qpn) */
 	VFMIG_HUOBJ_KIND_SRQ	= 4,	/* user shared receive queue (srqn) */
+	VFMIG_HUOBJ_KIND_DBR	= 5,	/* user doorbell page (user VA) */
 	VFMIG_HUOBJ_KIND_NR,            /* count; must stay <= 256 */
 };
 
