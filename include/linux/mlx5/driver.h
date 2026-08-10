@@ -1292,6 +1292,43 @@ static inline int mlx5_st_dealloc_index(struct mlx5_core_dev *dev, u16 st_index)
 struct mlx5_core_dev *mlx5_vf_get_core_dev(struct pci_dev *pdev);
 void mlx5_vf_put_core_dev(struct mlx5_core_dev *mdev);
 
+/*
+ * Source-side retag for a freshly-registered user MR's IOVA range in the
+ * per-VF vfmig deterministic IOVA domain. Called by mlx5_ib after the FW
+ * mkey is fully wired: it rewrites the auto-numbered (KIND_NONE) registry
+ * entries that vfmig_dma_ops.map_sg planted at ib_umem_get time to
+ * VFMIG_HUOBJ_KEY(MR, mkey_index), so SAVE_VHCA_STATE emits a
+ * HOST_USER_PAGE record per entry and LOAD re-installs them as
+ * awaiting_bind placeholders.
+ *
+ * @vf_dev:     this MR's mlx5_core_dev (mlx5_ib_dev->mdev). No-ops
+ *              cheaply (O(1) NULL load, no locks) on PFs and on VFs that
+ *              aren't vfmig-tracked, so callers may invoke it
+ *              unconditionally from the MR-creation hot path.
+ * @mkey_index: FW-allocated mkey_index (== mr->mmkey.key >> 8).
+ * @iova_base:  PAGE_SIZE-aligned lower bound of the umem's DMA IOVA
+ *              footprint.
+ * @length:     PAGE_SIZE-aligned length covering every backing page.
+ *
+ * Returns 0 on success or graceful no-op (not tracked, no domain, or a
+ * non-vfmig DMA path so the registry has no matching range). Returns a
+ * negative errno on hard failure (-EEXIST on an mkey_index collision with
+ * a prior retag, -EINVAL on misaligned arguments). Callers should warn on
+ * a non-zero return but must NOT fail the MR registration -- the MR stays
+ * usable for data path, just not CRIU-restorable.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			     dma_addr_t iova_base, size_t length);
+#else
+static inline int
+mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			 dma_addr_t iova_base, size_t length)
+{
+	return 0;
+}
+#endif
+
 int mlx5_sriov_blocking_notifier_register(struct mlx5_core_dev *mdev,
 					  int vf_id,
 					  struct notifier_block *nb);

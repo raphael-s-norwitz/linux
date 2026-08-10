@@ -324,6 +324,7 @@ int  vfmig_iova_for_each(struct vfmig_iova_domain *dom,
  */
 enum vfmig_huobj_kind {
 	VFMIG_HUOBJ_KIND_NONE	= 0,	/* auto-numbered / un-retagged */
+	VFMIG_HUOBJ_KIND_MR	= 1,	/* user memory region (mkey_index) */
 	VFMIG_HUOBJ_KIND_NR,            /* count; must stay <= 256 */
 };
 
@@ -389,6 +390,25 @@ int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 int  vfmig_iova_replay_external(struct vfmig_iova_domain *dom,
 				enum vfmig_iova_slot slot, u64 instance_key,
 				dma_addr_t iova, size_t len);
+
+/*
+ * Source-side retag: overwrite the auto-numbered @instance_key of every
+ * external registry entry overlapping [@iova_base, @iova_base + @length)
+ * with @new_instance_key, promoting KIND_NONE placeholders that the
+ * ib_core umem-placement hook planted at umem-map time into
+ * (kind, fw_id)-keyed entries. @iova_base and @length must be VFMIG_IOVA_GRANULE-aligned and
+ * @new_instance_key's kind byte must be != NONE. A multi-page user object
+ * yields one entry per source-side sg, all retagged with the same key.
+ * Idempotent for an entry already carrying @new_instance_key. Returns the
+ * number-agnostic 0 on success, -ENOENT if the range holds no external
+ * entries (caller went through a non-vfmig DMA path), -EEXIST if an entry
+ * is already claimed by a different (kind, fw_id) (source-side bug; every
+ * entry retagged in this call is rolled back to KIND_NONE), or -EINVAL on
+ * a bad argument. Runs on the SAVE/source side, before drift-arming.
+ */
+int  vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
+				     dma_addr_t iova_base, size_t length,
+				     u64 new_instance_key);
 
 /*
  * Rewind every per-slot bump cursor to its slot base (and per-slot

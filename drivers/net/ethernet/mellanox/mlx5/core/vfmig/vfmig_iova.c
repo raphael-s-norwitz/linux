@@ -1009,6 +1009,98 @@ out_unlock:
 	return err;
 }
 
+int vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
+				    dma_addr_t iova_base, size_t length,
+				    u64 new_instance_key)
+{
+	u8 new_kind = VFMIG_HUOBJ_KIND(new_instance_key);
+	struct vfmig_iova_page *p;
+	u64 base = (u64)iova_base;
+	unsigned int retagged = 0;
+	int err = 0;
+	u64 limit;
+
+	if (!dom || length == 0)
+		return -EINVAL;
+	limit = base + length;
+	if (!IS_ALIGNED(base, VFMIG_IOVA_GRANULE) ||
+	    !IS_ALIGNED(length, VFMIG_IOVA_GRANULE))
+		return -EINVAL;
+	if (new_kind == VFMIG_HUOBJ_KIND_NONE)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+
+	/*
+	 * dom->pages is sorted by IOVA, so a single forward walk covers
+	 * every entry overlapping [base, limit). A multi-page user object
+	 * (umem spanning >1 page) yields multiple entries in the range,
+	 * one per source-side sg, all retagged with the same key.
+	 */
+	list_for_each_entry(p, &dom->pages, node) {
+		u64 p_end = p->iova + p->len;
+
+		if (p->iova >= limit)
+			break;		/* sorted: past the range */
+		if (p_end <= base)
+			continue;	/* before the range */
+		if (!p->external)
+			continue;	/* kernel slot; skip silently */
+
+		if (p->instance_key == new_instance_key) {
+			retagged++;	/* idempotent re-retag: no-op */
+			continue;
+		}
+		if (VFMIG_HUOBJ_KIND(p->instance_key) !=
+		    VFMIG_HUOBJ_KIND_NONE) {
+			/*
+			 * Already claimed by a different (kind, fw_id):
+			 * overlapping umem ranges from two uobject
+			 * creations. Source-side bug; roll back below.
+			 */
+			err = -EEXIST;
+			break;
+		}
+		p->instance_key = new_instance_key;
+		retagged++;
+	}
+
+	if (err) {
+		/*
+		 * Revert every entry we retagged in this call -- the only
+		 * entries in [base, limit) whose key now equals
+		 * @new_instance_key -- back to the auto-numbered sentinel.
+		 */
+		list_for_each_entry(p, &dom->pages, node) {
+			u64 p_end = p->iova + p->len;
+
+			if (p->iova >= limit)
+				break;
+			if (p_end <= base)
+				continue;
+			if (!p->external)
+				continue;
+			if (p->instance_key != new_instance_key)
+				continue;
+			p->instance_key = 0;
+		}
+		goto out_unlock;
+	}
+
+	if (retagged == 0) {
+		/*
+		 * No external entries on the range: the umem was mapped
+		 * through a non-vfmig DMA path, or the callsite ran before
+		 * the dma_map that plants the entries.
+		 */
+		err = -ENOENT;
+	}
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
 void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 {
 	unsigned int s;
