@@ -65,6 +65,20 @@ struct vfmig_iova_page {
 	 * @vaddr, which is meaningless here).
 	 */
 	bool		 external;
+
+	/*
+	 * @awaiting_bind: LOAD/destination-side placeholder flag. Set on
+	 * external entries pre-installed by vfmig_iova_replay_external()
+	 * from a HOST_USER_PAGE wire record, before any destination-side
+	 * umem has been pinned: the (iova, len) window is reserved and the
+	 * (kind, fw_id) identity recorded in @instance_key, but there is no
+	 * arena link yet (@page / @vaddr stay NULL, as for any external
+	 * entry). A later slice's restore path consumes the placeholder,
+	 * maps the freshly-pinned umem at @iova, and clears this flag. Only
+	 * ever true when @external is; always false on a fresh / SAVE-side
+	 * external entry.
+	 */
+	bool		 awaiting_bind;
 };
 
 /*
@@ -893,6 +907,100 @@ int vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 	 * vfmig_iova_reset_cursor() rewinds to the slot base, and so that
 	 * absent a reset fresh allocs still don't collide with replays.
 	 */
+	if ((u64)iova + len > dom->cursor[slot])
+		dom->cursor[slot] = (u64)iova + len;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+/*
+ * Install a LOAD-side awaiting-bind placeholder: an external USER_PAGE
+ * registry entry that reserves the wire-provided [iova, iova+len) window
+ * and records the (kind, fw_id) identity in @instance_key, but installs
+ * no arena link (there is no umem to point at yet -- @page / @vaddr stay
+ * NULL). @instance_key must already be retagged (kind byte != NONE); the
+ * placeholder is what a later slice's restore path looks up and binds.
+ * Same window/alignment/duplicate validation as the phys installer.
+ * Caller holds @dom->lock.
+ */
+static int
+vfmig_iova_install_external_placeholder_locked(struct vfmig_iova_domain *dom,
+					       enum vfmig_iova_slot slot,
+					       u64 instance_key, u64 iova,
+					       size_t len, gfp_t gfp,
+					       struct vfmig_iova_page **out_p)
+{
+	struct vfmig_iova_page *p;
+
+	if (!IS_ALIGNED(iova, VFMIG_IOVA_GRANULE) ||
+	    !IS_ALIGNED(len, VFMIG_IOVA_GRANULE) ||
+	    len == 0)
+		return -EINVAL;
+	if (slot != VFMIG_SLOT_USER_PAGE)
+		return -EINVAL;
+	if (VFMIG_HUOBJ_KIND(instance_key) == VFMIG_HUOBJ_KIND_NONE)
+		return -EINVAL;
+	if (iova < vfmig_iova_user_page_start(dom) ||
+	    iova + len > vfmig_iova_slot_end(dom, slot))
+		return -ERANGE;
+	if (vfmig_iova_find_locked(dom, iova))
+		return -EEXIST;
+
+	p = kzalloc(sizeof(*p), gfp);
+	if (!p)
+		return -ENOMEM;
+
+	p->page		 = NULL;
+	p->vaddr	 = NULL;
+	p->iova		 = iova;
+	p->len		 = len;
+	p->slot		 = slot;
+	p->instance_key	 = instance_key;
+	p->external	 = true;
+	p->awaiting_bind = true;
+
+	vfmig_iova_insert_locked(dom, p);
+	*out_p = p;
+	return 0;
+}
+
+/*
+ * Replay one HOST_USER_PAGE record into @dom on the LOAD/destination
+ * side: install an awaiting-bind placeholder at the wire-provided @iova
+ * for the (kind, fw_id) packed into @instance_key. Unlike
+ * vfmig_iova_replay_page() this carries no contents -- the umem pages are
+ * the migration tool's to restore -- so it only reserves the IOVA window
+ * and records the identity. Bumps the USER_PAGE expected-count and pushes
+ * the slot cursor past the placeholder, mirroring replay_page. Must run
+ * before the domain is drift-armed. Returns 0 or a negative errno.
+ */
+int vfmig_iova_replay_external(struct vfmig_iova_domain *dom,
+			       enum vfmig_iova_slot slot, u64 instance_key,
+			       dma_addr_t iova, size_t len)
+{
+	struct vfmig_iova_page *p;
+	int err;
+
+	if (!dom)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+
+	if (WARN_ON_ONCE(dom->drift_armed)) {
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
+	err = vfmig_iova_install_external_placeholder_locked(dom, slot,
+							     instance_key,
+							     (u64)iova, len,
+							     GFP_KERNEL, &p);
+	if (err)
+		goto out_unlock;
+
+	dom->expected_count[slot]++;
 	if ((u64)iova + len > dom->cursor[slot])
 		dom->cursor[slot] = (u64)iova + len;
 

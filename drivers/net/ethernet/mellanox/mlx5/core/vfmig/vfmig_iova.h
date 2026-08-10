@@ -377,6 +377,20 @@ int  vfmig_iova_replay_page(struct vfmig_iova_domain *dom,
 			    dma_addr_t iova, const void *contents, size_t len);
 
 /*
+ * Replay one HOST_USER_PAGE record into @dom on the LOAD/destination
+ * side: install an awaiting-bind placeholder reserving [iova, iova+len)
+ * in @slot (must be VFMIG_SLOT_USER_PAGE) for the (kind, fw_id) packed
+ * into @instance_key (kind byte must be != NONE). Carries no contents --
+ * unlike vfmig_iova_replay_page() it installs no arena link; the umem is
+ * bound later. Must run before the domain is drift-armed. Returns 0, or a
+ * negative errno (-ERANGE on an out-of-window IOVA, -EEXIST on a
+ * duplicate, -EINVAL on a bad slot/identity/alignment).
+ */
+int  vfmig_iova_replay_external(struct vfmig_iova_domain *dom,
+				enum vfmig_iova_slot slot, u64 instance_key,
+				dma_addr_t iova, size_t len);
+
+/*
  * Rewind every per-slot bump cursor to its slot base (and per-slot
  * auto-key counters to 0) so the destination VF's probe re-claims the
  * replayed pages from the bottom of each slot in the same order the
