@@ -85,7 +85,18 @@ enum mlx5_lib_caps {
 };
 
 enum mlx5_ib_alloc_uctx_v2_flags {
-	MLX5_IB_ALLOC_UCTX_DEVX	= 1 << 0,
+	MLX5_IB_ALLOC_UCTX_DEVX			= 1 << 0,
+	/*
+	 * VFMIG ucontext restore: skip per-slot ALLOC_UAR in
+	 * mlx5_ib_alloc_ucontext()'s allocate_uars(); leave
+	 * bfregi->sys_pages[] sentinel-filled (MLX5_IB_INVALID_UAR_INDEX)
+	 * pending a follow-up MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT call
+	 * that seeds the table from the source process's snapshot.
+	 *
+	 * Any UAR mmap() between alloc and restore is rejected by
+	 * uar_mmap()'s existing INVALID-slot check.
+	 */
+	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE	= 1 << 1,
 };
 struct mlx5_ib_alloc_ucontext_req_v2 {
 	__u32	total_num_bfregs;

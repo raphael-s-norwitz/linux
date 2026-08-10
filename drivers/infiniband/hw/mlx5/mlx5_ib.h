@@ -199,6 +199,14 @@ struct mlx5_ib_ucontext {
 	u16			devx_uid;
 	/* For RoCE LAG TX affinity */
 	atomic_t		tx_port_affinity;
+	/*
+	 * Set by mlx5_ib_alloc_ucontext() when MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE
+	 * was passed in; cleared by MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT once
+	 * bfregi->sys_pages[] has been seeded from the source snapshot. While
+	 * set, bfregi->sys_pages[] is sentinel-filled (MLX5_IB_INVALID_UAR_INDEX)
+	 * and any UAR mmap() is refused.
+	 */
+	bool			vfmig_restore_pending;
 };
 
 static inline struct mlx5_ib_ucontext *to_mucontext(struct ib_ucontext *ibucontext)
