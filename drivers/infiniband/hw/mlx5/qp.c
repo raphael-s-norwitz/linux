@@ -2446,6 +2446,38 @@ static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 	if (err)
 		goto err_create;
 
+	/*
+	 * Source-side vfmig retag (mirrors create_real_mr). QPC-managed QPs
+	 * (RC / UC / UD) allocate a single umem covering both SQ and RQ WQE
+	 * buffers, so one retag over its page-aligned footprint keyed by
+	 * VFMIG_HUOBJ_KEY(QP, base->mqp.qpn) covers the whole QP. RAW_PACKET
+	 * / SOURCE_QPN QPs took create_raw_packet_qp() above with split
+	 * SQ/RQ umems and are skipped here (a separate retag surface, not in
+	 * v0). Gated further on a real, non-dmabuf umem on a tracked VF. The
+	 * doorbell page is retagged separately by mlx5_ib's db_map_user
+	 * path. Non-fatal on error: the QP stays usable, just not
+	 * CRIU-restorable.
+	 */
+	if (init_attr->qp_type != IB_QPT_RAW_PACKET &&
+	    !(qp->flags & IB_QP_CREATE_SOURCE_QPN) &&
+	    base->ubuffer.umem && dev->mdev->cmd.vfmig_iova_dom &&
+	    !base->ubuffer.umem->is_dmabuf) {
+		struct sg_table *sgt = &base->ubuffer.umem->sgt_append.sgt;
+		dma_addr_t iova_base = sg_dma_address(sgt->sgl) & PAGE_MASK;
+		size_t retag_length =
+			ALIGN(ib_umem_offset(base->ubuffer.umem) +
+			      base->ubuffer.umem->length, PAGE_SIZE);
+		int retag_err;
+
+		retag_err = mlx5_vfmig_retag_user_qp(dev->mdev, base->mqp.qpn,
+						     iova_base, retag_length);
+		if (retag_err)
+			mlx5_ib_warn(dev,
+				     "vfmig: source-side retag for QP failed: qpn=0x%x iova_base=0x%llx length=0x%zx err=%d -- QP usable but not CRIU-restorable\n",
+				     base->mqp.qpn, (u64)iova_base, retag_length,
+				     retag_err);
+	}
+
 	base->container_mibqp = qp;
 	base->mqp.event = mlx5_ib_qp_event;
 	if (MLX5_CAP_GEN(mdev, ece_support))
