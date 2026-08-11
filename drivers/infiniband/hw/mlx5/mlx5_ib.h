@@ -1528,6 +1528,14 @@ extern const struct uapi_definition mlx5_ib_create_qp_defs[];
 extern const struct uapi_definition mlx5_ib_create_srq_defs[];
 extern const struct uapi_definition mlx5_ib_vfmig_defs[];
 
+/*
+ * mlx5-specific mmap_offset codec. mlx5_entry_to_mmap_offset() packs a
+ * mlx5_user_mmap_entry's start_pgoff into the byte offset libmlx5 hands
+ * to mmap() (and that UAR_OBJ_ALLOC reports back). Used by the vfmig
+ * dyn-UAR snapshot verb so captured offsets round-trip across restore.
+ */
+u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry);
+
 static inline int is_qp1(enum ib_qp_type qp_type)
 {
 	return qp_type == MLX5_IB_QPT_HW_GSI || qp_type == IB_QPT_GSI;
