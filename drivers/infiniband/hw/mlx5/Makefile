@@ -29,5 +29,6 @@ mlx5_ib-$(CONFIG_INFINIBAND_ON_DEMAND_PAGING) += odp.o
 mlx5_ib-$(CONFIG_MLX5_ESWITCH) += ib_rep.o
 mlx5_ib-$(CONFIG_INFINIBAND_USER_ACCESS) += devx.o \
 					    qos.o \
-					    std_types.o
+					    std_types.o \
+					    vfmig_uctx.o
 mlx5_ib-$(CONFIG_MLX5_MACSEC) += macsec.o
