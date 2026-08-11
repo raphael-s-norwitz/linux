@@ -60,6 +60,11 @@
 MODULE_AUTHOR("Eli Cohen <eli@mellanox.com>");
 MODULE_DESCRIPTION("Mellanox 5th generation network adapters (ConnectX series) IB driver");
 MODULE_LICENSE("Dual BSD/GPL");
+/*
+ * The vfmig restore verbs (vfmig_uctx.c) call the rdma_core-namespaced
+ * rdma_alloc_begin_uobject_at_handle()/commit/abort uobject helpers.
+ */
+MODULE_IMPORT_NS("rdma_core");
 
 struct mlx5_ib_event_work {
 	struct work_struct	work;
@@ -2776,6 +2781,34 @@ u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry)
 		(index & 0xFF)) << PAGE_SHIFT;
 }
 
+/*
+ * Inverse of mlx5_entry_to_mmap_offset(): recover the rdma_user_mmap_entry
+ * start_pgoff from the libmlx5-wire-format mmap_offset returned by
+ * UAR_OBJ_ALLOC / VAR_OBJ_ALLOC. Used by the VFMIG dyn-UAR restore path
+ * (drivers/.../vfmig_uctx.c) to feed rdma_user_mmap_entry_insert_exact
+ * with a pgoff that matches the source ucontext's so libmlx5's captured
+ * mmap_offset is valid against the destination ucontext.
+ *
+ * Returns U32_MAX on out-of-range input. Caller must check.
+ */
+u32 mlx5_mmap_offset_to_pgoff(u64 mmap_offset)
+{
+	u64 inner = mmap_offset >> PAGE_SHIFT;
+	u32 cmd, index_hi, index_lo, index;
+
+	if (inner > U32_MAX)
+		return U32_MAX;
+
+	cmd	 = (inner >> MLX5_IB_MMAP_CMD_SHIFT) & MLX5_IB_MMAP_CMD_MASK;
+	index_hi = (inner >> 16) & 0xFFFF;
+	index_lo =  inner	 & 0xFF;
+	index	 = (index_hi << 8) | index_lo;
+
+	if (cmd > 0xFFFF)
+		return U32_MAX;
+	return (cmd << 16) | index;
+}
+
 static int mlx5_ib_mmap(struct ib_ucontext *ibcontext, struct vm_area_struct *vma)
 {
 	struct mlx5_ib_ucontext *context = to_mucontext(ibcontext);
@@ -4419,6 +4452,58 @@ alloc_uar_entry(struct mlx5_ib_ucontext *c,
 err_insert:
 	mlx5_cmd_uar_dealloc(dev->mdev, uar_index, c->devx_uid);
 end:
+	kfree(entry);
+	return ERR_PTR(err);
+}
+
+/*
+ * VFMIG sibling of alloc_uar_entry() used by RESTORE_DYN_UARS.
+ *
+ * Differences from the normal allocator:
+ *   - No mlx5_cmd_uar_alloc() FW round-trip. The destination VHCA
+ *     already holds @uar_index reserved as part of LOAD_VHCA_STATE
+ *     (the source VHCA's UAR id, transferred verbatim via the FW
+ *     migration blob); issuing ALLOC_UAR here would either pick a
+ *     different id or, worse, EBUSY on a slot we already own.
+ *   - rdma_user_mmap_entry_insert_exact() pins the start_pgoff so it
+ *     matches the source's mmap_offset byte-for-byte, which is what
+ *     keeps libmlx5's captured offset valid against the destination
+ *     ucontext's mmap table.
+ *
+ * Cleanup is identical to the normal path: mmap_obj_cleanup() calls
+ * mlx5_cmd_uar_dealloc() on the page_idx, returning the FW UAR id to
+ * the VHCA's pool exactly as if it had been freshly allocated.
+ */
+struct mlx5_user_mmap_entry *
+restore_uar_entry(struct mlx5_ib_ucontext *c,
+		  enum mlx5_ib_uapi_uar_alloc_type alloc_type,
+		  u32 uar_index, u32 mmap_pgoff)
+{
+	struct mlx5_user_mmap_entry *entry;
+	struct mlx5_ib_dev *dev;
+	int err;
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry)
+		return ERR_PTR(-ENOMEM);
+
+	dev = to_mdev(c->ibucontext.device);
+	entry->page_idx = uar_index;
+	entry->address = uar_index2paddress(dev, uar_index);
+	if (alloc_type == MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF)
+		entry->mmap_flag = MLX5_IB_MMAP_TYPE_UAR_WC;
+	else
+		entry->mmap_flag = MLX5_IB_MMAP_TYPE_UAR_NC;
+
+	err = rdma_user_mmap_entry_insert_exact(&c->ibucontext,
+						&entry->rdma_entry,
+						PAGE_SIZE, mmap_pgoff);
+	if (err)
+		goto err_insert;
+
+	return entry;
+
+err_insert:
 	kfree(entry);
 	return ERR_PTR(err);
 }

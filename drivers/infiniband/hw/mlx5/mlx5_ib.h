@@ -1529,12 +1529,26 @@ extern const struct uapi_definition mlx5_ib_create_srq_defs[];
 extern const struct uapi_definition mlx5_ib_vfmig_defs[];
 
 /*
+ * VFMIG dyn-UAR restore helper. Defined in main.c next to alloc_uar_entry();
+ * exposed here so the vfmig vendor verbs (drivers/.../vfmig_uctx.c) can
+ * reuse the exact mmap_entry / mmap_flag setup the live-alloc path uses,
+ * differing only in (a) skipping mlx5_cmd_uar_alloc and (b) pinning the
+ * mmap pgoff so libmlx5's captured offsets stay valid post-restore.
+ */
+struct mlx5_user_mmap_entry *
+restore_uar_entry(struct mlx5_ib_ucontext *c,
+		  enum mlx5_ib_uapi_uar_alloc_type alloc_type,
+		  u32 uar_index, u32 mmap_pgoff);
+
+/*
  * mlx5-specific mmap_offset codec. mlx5_entry_to_mmap_offset() packs a
  * mlx5_user_mmap_entry's start_pgoff into the byte offset libmlx5 hands
- * to mmap() (and that UAR_OBJ_ALLOC reports back). Used by the vfmig
- * dyn-UAR snapshot verb so captured offsets round-trip across restore.
+ * to mmap() (and that UAR_OBJ_ALLOC reports back); mlx5_mmap_offset_to_pgoff()
+ * is its inverse. Both used by the vfmig dyn-UAR snapshot/restore verbs so
+ * captured offsets round-trip across restore.
  */
 u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry);
+u32 mlx5_mmap_offset_to_pgoff(u64 mmap_offset);
 
 static inline int is_qp1(enum ib_qp_type qp_type)
 {

@@ -398,6 +398,7 @@ enum mlx5_ib_vfmig_methods {
 	 * RESTORE_DYN_UARS replays them at the same handles/offsets.
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS,
+	MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS,
 };
 
 /*
@@ -467,6 +468,21 @@ enum mlx5_ib_vfmig_restore_ucontext_attrs {
 enum mlx5_ib_vfmig_query_dyn_uars_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS = (1U << UVERBS_ID_NS_SHIFT),
 	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT,
+};
+
+/*
+ * RESTORE_DYN_UARS replays a QUERY_DYN_UARS snapshot onto a destination
+ * lib_uar_dyn=true ucontext (opened with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE),
+ * recreating each MLX5_IB_OBJECT_UAR uobject at its source handle and
+ * mmap offset without issuing ALLOC_UAR (the FW UAR ids are already held
+ * by the destination VHCA via LOAD_VHCA_STATE). Single-shot: it consumes
+ * c->vfmig_restore_pending like RESTORE_UCONTEXT does.
+ *
+ *   RECORDS: array of struct mlx5_ib_vfmig_dyn_uar_record, length ==
+ *            COUNT (from the QUERY_DYN_UARS sizing pass) * record size.
+ */
+enum mlx5_ib_vfmig_restore_dyn_uars_attrs {
+	MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS = (1U << UVERBS_ID_NS_SHIFT),
 };
 
 /*
