@@ -448,11 +448,190 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(__u32),
 			    UA_MANDATORY));
 
+/*
+ * Single-record dyn-UAR restore worker. Allocates and pins the
+ * MLX5_IB_OBJECT_UAR uobject at @rec->handle, then attaches an
+ * mlx5_user_mmap_entry whose start_pgoff matches @rec->mmap_offset.
+ *
+ * Failure modes:
+ *   - rdma_alloc_begin_uobject_at_handle() returning -EBUSY: handle
+ *     already in use by something else in this ucontext (concurrent
+ *     UAR_OBJ_ALLOC, or duplicate handle in the snapshot). Surface as
+ *     -EBUSY; the snapshot is malformed and the caller should fail.
+ *   - restore_uar_entry() returning -EBUSY: mmap pgoff already in use
+ *     (range collision with another mmap_entry in this ucontext). v0
+ *     does not attempt to relocate.
+ *
+ * On error before commit: rdma_alloc_abort_uobject() drops the pinned
+ * idr slot and the rdmacg charge. After commit, the uobject is owned
+ * by the ufile and will be torn down on ucontext close.
+ */
+static int vfmig_restore_one_dyn_uar(struct uverbs_attr_bundle *attrs,
+				     struct mlx5_ib_ucontext *c,
+				     const struct mlx5_ib_vfmig_dyn_uar_record *rec)
+{
+	struct mlx5_ib_dev *dev = to_mdev(c->ibucontext.device);
+	struct mlx5_user_mmap_entry *entry;
+	struct ib_uobject *uobj;
+	u32 mmap_pgoff;
+	int err;
+
+	if (rec->alloc_type != MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF &&
+	    rec->alloc_type != MLX5_IB_UAPI_UAR_ALLOC_TYPE_NC) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: unsupported alloc_type=%u for handle=%u\n",
+			    rec->alloc_type, rec->handle);
+		return -EINVAL;
+	}
+
+	if (rec->mmap_offset & ~PAGE_MASK) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: unaligned mmap_offset=0x%llx for handle=%u\n",
+			    (unsigned long long)rec->mmap_offset, rec->handle);
+		return -EINVAL;
+	}
+	/*
+	 * QUERY_DYN_UARS emits the libmlx5-wire-format mmap_offset (what
+	 * userspace mmap()s); rdma_user_mmap_entry_insert_exact() needs
+	 * the rdma_user_mmap_entry start_pgoff. Run the inverse codec.
+	 */
+	mmap_pgoff = mlx5_mmap_offset_to_pgoff(rec->mmap_offset);
+	if (mmap_pgoff == U32_MAX) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: out-of-range mmap_offset=0x%llx for handle=%u\n",
+			    (unsigned long long)rec->mmap_offset, rec->handle);
+		return -EINVAL;
+	}
+
+	uobj = rdma_alloc_begin_uobject_at_handle(attrs,
+						  MLX5_IB_OBJECT_UAR,
+						  rec->handle);
+	if (IS_ERR(uobj)) {
+		err = PTR_ERR(uobj);
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: alloc_at_handle(%u) failed: %d\n",
+			    rec->handle, err);
+		return err;
+	}
+
+	entry = restore_uar_entry(c, rec->alloc_type, rec->uar_index,
+				  mmap_pgoff);
+	if (IS_ERR(entry)) {
+		err = PTR_ERR(entry);
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: restore_uar_entry(handle=%u uar=%u pgoff=%u) failed: %d\n",
+			    rec->handle, rec->uar_index, mmap_pgoff, err);
+		/*
+		 * No HW object yet (mmap_entry not inserted, no
+		 * mlx5_cmd_uar_alloc was issued -- restore path skips it).
+		 */
+		rdma_alloc_abort_uobject(uobj, attrs, /* hw_obj_valid */ false);
+		return err;
+	}
+
+	uobj->object = entry;
+	rdma_alloc_commit_uobject(uobj, attrs);
+
+	mlx5_ib_dbg(dev,
+		    "VFMIG_RESTORE_DYN_UARS: restored handle=%u uar=%u pgoff=%u alloc_type=%u\n",
+		    rec->handle, rec->uar_index, mmap_pgoff, rec->alloc_type);
+	return 0;
+}
+
+/*
+ * RESTORE_DYN_UARS -- replay a QUERY_DYN_UARS snapshot onto a destination
+ * lib_uar_dyn=true ucontext, recreating each MLX5_IB_OBJECT_UAR uobject at
+ * its source handle/offset. Single-shot: consumes vfmig_restore_pending.
+ */
+static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS)(struct uverbs_attr_bundle *attrs)
+{
+	const struct mlx5_ib_vfmig_dyn_uar_record *records;
+	struct mlx5_ib_ucontext *c;
+	struct mlx5_ib_dev *dev;
+	size_t arr_len;
+	u32 nrecords;
+	u32 i;
+	int err;
+	u16 rec_attr = MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS;
+
+	c = to_mucontext(ib_uverbs_get_ucontext(attrs));
+	if (IS_ERR(c))
+		return PTR_ERR(c);
+
+	dev = to_mdev(c->ibucontext.device);
+
+	/*
+	 * Mirrors the precondition set in RESTORE_UCONTEXT:
+	 *  - vfmig_restore_pending must be set (ucontext was opened with
+	 *    MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE; this is the single-shot
+	 *    flag that prevents repeated restores from double-creating
+	 *    uobjects);
+	 *  - lib_uar_dyn must be true (a static-UAR ucontext uses
+	 *    RESTORE_UCONTEXT instead).
+	 */
+	if (!c->vfmig_restore_pending) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: ucontext not in restore-pending state\n");
+		return -EINVAL;
+	}
+	if (!c->bfregi.lib_uar_dyn) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: ucontext is not lib_uar_dyn=true; use VFMIG_RESTORE_UCONTEXT\n");
+		return -EINVAL;
+	}
+
+	arr_len = uverbs_attr_get_len(attrs, rec_attr);
+	if (!arr_len || arr_len % sizeof(*records)) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_RESTORE_DYN_UARS: bad RECORDS length %zu (record size %zu)\n",
+			    arr_len, sizeof(*records));
+		return -EINVAL;
+	}
+	nrecords = arr_len / sizeof(*records);
+
+	records = uverbs_attr_get_alloced_ptr(attrs, rec_attr);
+	if (IS_ERR(records))
+		return PTR_ERR(records);
+
+	/*
+	 * Bail-on-first-error semantics. We could attempt to roll back
+	 * already-committed uobjects on a partial failure, but in
+	 * practice a partial RESTORE_DYN_UARS failure means the
+	 * destination ucontext is unusable for the migrated workload --
+	 * the userspace caller will close the fd and start over. We log
+	 * loudly so the leftover uobjects (which will be torn down on
+	 * fd close anyway) are easy to diagnose.
+	 */
+	for (i = 0; i < nrecords; i++) {
+		err = vfmig_restore_one_dyn_uar(attrs, c, &records[i]);
+		if (err) {
+			mlx5_ib_dbg(dev,
+				    "VFMIG_RESTORE_DYN_UARS: failed at record %u/%u: %d (close ucontext to retry)\n",
+				    i, nrecords, err);
+			return err;
+		}
+	}
+
+	c->vfmig_restore_pending = false;
+	mlx5_ib_dbg(dev,
+		    "VFMIG_RESTORE_DYN_UARS: restored %u dyn UAR(s), cleared restore-pending\n",
+		    nrecords);
+	return 0;
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS,
+	UVERBS_ATTR_PTR_IN(MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS,
+			   UVERBS_ATTR_MIN_SIZE(0),
+			   UA_MANDATORY,
+			   UA_ALLOC_AND_COPY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	MLX5_IB_OBJECT_VFMIG,
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT),
-	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS));
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS),
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS));
 
 const struct uapi_definition mlx5_ib_vfmig_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(MLX5_IB_OBJECT_VFMIG),
