@@ -389,6 +389,7 @@ enum mlx5_ib_get_data_direct_sysfs_path_attrs {
  */
 enum mlx5_ib_vfmig_methods {
 	MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT,
 };
 
 /*
@@ -412,6 +413,37 @@ enum mlx5_ib_vfmig_query_ucontext_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_UAR_TABLE = (1U << UVERBS_ID_NS_SHIFT),
 	MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_BFREG_COUNT,
 	MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META,
+};
+
+/*
+ * RESTORE_UCONTEXT consumes a snapshot previously emitted by
+ * QUERY_UCONTEXT on a source ucontext (whose VHCA was then
+ * SAVE_VHCA_STATE'd and LOAD_VHCA_STATE'd onto this destination VHCA)
+ * and seeds the destination ucontext's bfregi->sys_pages[] verbatim,
+ * skipping the per-slot ALLOC_UAR commands mlx5_ib_alloc_ucontext would
+ * otherwise issue. This relies on the destination VHCA already holding
+ * those FW UAR ids reserved as part of LOAD_VHCA_STATE.
+ *
+ * Preconditions (all enforced by the handler; -EINVAL on failure):
+ *   1. ucontext was created with MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE
+ *      (so sys_pages[] is sentinel-INVALID and ready to be seeded), and
+ *      lib_uar_dyn=false (v0 doesn't cover dynamic-UAR ucontexts).
+ *   2. META cross-check: every shape-defining field must match what the
+ *      destination's mlx5_ib_alloc_ucontext computed for THIS ucontext.
+ *   3. UAR_TABLE length == num_sys_pages * sizeof(__u32); the static
+ *      slots [0..num_static) must all be valid FW ids.
+ *   4. BFREG_COUNT, if supplied, length == total_num_bfregs *
+ *      sizeof(__u32), and v0 requires every entry zero (non-zero implies
+ *      live QPs / claimed dyn UARs not yet rebuilt).
+ *
+ * On success sys_pages[] is seeded under bfregi->lock and
+ * c->vfmig_restore_pending is cleared, so a second RESTORE on the same
+ * ucontext fails precondition #1: exactly one RESTORE per ucontext.
+ */
+enum mlx5_ib_vfmig_restore_ucontext_attrs {
+	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_UAR_TABLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_BFREG_COUNT,
+	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META,
 };
 
 /*
