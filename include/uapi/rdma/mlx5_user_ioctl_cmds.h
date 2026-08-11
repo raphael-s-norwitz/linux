@@ -390,6 +390,14 @@ enum mlx5_ib_get_data_direct_sysfs_path_attrs {
 enum mlx5_ib_vfmig_methods {
 	MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT = (1U << UVERBS_ID_NS_SHIFT),
 	MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT,
+	/*
+	 * Dynamic-UAR (lib_uar_dyn=true / MLX5_LIB_CAP_DYN_UAR) save/restore.
+	 * libmlx5 in this mode does not use bfregi->sys_pages[]; UARs are
+	 * MLX5_IB_OBJECT_UAR uobjects allocated lazily via UAR_OBJ_ALLOC.
+	 * QUERY_DYN_UARS snapshots every outstanding such uobject; a later
+	 * RESTORE_DYN_UARS replays them at the same handles/offsets.
+	 */
+	MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS,
 };
 
 /*
@@ -444,6 +452,41 @@ enum mlx5_ib_vfmig_restore_ucontext_attrs {
 	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_UAR_TABLE = (1U << UVERBS_ID_NS_SHIFT),
 	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_BFREG_COUNT,
 	MLX5_IB_ATTR_VFMIG_RESTORE_UCONTEXT_META,
+};
+
+/*
+ * QUERY_DYN_UARS attribute IDs.
+ *
+ *   RECORDS: array of struct mlx5_ib_vfmig_dyn_uar_record. OPTIONAL --
+ *            omit for the sizing pass. If supplied, its length must equal
+ *            COUNT * sizeof(struct mlx5_ib_vfmig_dyn_uar_record).
+ *   COUNT:   __u32. Kernel always writes the number of dynamic UARs held
+ *            by this ucontext, so the sizing pass tells userspace how big
+ *            RECORDS must be and the snapshot pass confirms it.
+ */
+enum mlx5_ib_vfmig_query_dyn_uars_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT,
+};
+
+/*
+ * Per-dynamic-UAR record exchanged across migration.
+ *
+ *   handle:      ufile->idr handle of the MLX5_IB_OBJECT_UAR uobject on
+ *                the source ucontext (userspace's opaque UAR handle).
+ *   uar_index:   FW UAR id (page_idx). Valid only against a destination
+ *                VHCA whose state was imported via LOAD_VHCA_STATE.
+ *   mmap_offset: libmlx5-wire-format mmap offset of the source
+ *                rdma_user_mmap_entry (what libmlx5 passed to mmap()).
+ *   alloc_type:  MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF (write-combining) or
+ *                MLX5_IB_UAPI_UAR_ALLOC_TYPE_NC (uncached).
+ */
+struct mlx5_ib_vfmig_dyn_uar_record {
+	__u32	handle;
+	__u32	uar_index;
+	__aligned_u64 mmap_offset;
+	__u8	alloc_type;
+	__u8	reserved0[7];
 };
 
 /*

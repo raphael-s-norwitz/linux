@@ -2767,7 +2767,7 @@ static int mlx5_ib_mmap_offset(struct mlx5_ib_dev *dev,
 	return ret;
 }
 
-static u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry)
+u64 mlx5_entry_to_mmap_offset(struct mlx5_user_mmap_entry *entry)
 {
 	u64 cmd = (entry->rdma_entry.start_pgoff >> 16) & 0xFFFF;
 	u64 index = entry->rdma_entry.start_pgoff & 0xFFFF;

@@ -311,10 +311,148 @@ DECLARE_UVERBS_NAMED_METHOD(
 			   UVERBS_ATTR_TYPE(struct mlx5_ib_vfmig_ucontext_meta),
 			   UA_MANDATORY));
 
+/*
+ * QUERY_DYN_UARS: snapshot every outstanding MLX5_IB_OBJECT_UAR uobject
+ * in this (lib_uar_dyn) ucontext. Two-pass: pass 1 (no RECORDS) reports
+ * COUNT; pass 2 fills a COUNT-sized RECORDS array. We walk
+ * ufile->uobjects (the per-fd committed-uobject list, the only place with
+ * a well-defined iteration order) under ufile->uobjects_lock, filter by
+ * object id, and copy {handle, uar_index, mmap_offset, alloc_type}.
+ */
+static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS)(struct uverbs_attr_bundle *attrs)
+{
+	struct mlx5_ib_vfmig_dyn_uar_record *records = NULL;
+	struct mlx5_ib_ucontext *c;
+	struct ib_uverbs_file *ufile;
+	struct ib_uobject *uobj;
+	struct mlx5_ib_dev *dev;
+	bool want_records;
+	size_t want_len;
+	size_t arr_len;
+	u32 nrecords;
+	u32 count;
+	int err;
+	u16 rec_attr = MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS;
+
+	c = to_mucontext(ib_uverbs_get_ucontext(attrs));
+	if (IS_ERR(c))
+		return PTR_ERR(c);
+
+	dev = to_mdev(c->ibucontext.device);
+	ufile = attrs->ufile;
+
+	if (!c->bfregi.lib_uar_dyn) {
+		mlx5_ib_dbg(dev,
+			    "VFMIG_QUERY_DYN_UARS: ucontext is not lib_uar_dyn=true; use VFMIG_QUERY_UCONTEXT\n");
+		return -EINVAL;
+	}
+
+	want_records = uverbs_attr_is_valid(attrs, rec_attr);
+	if (want_records) {
+		records = uverbs_zalloc(attrs,
+					uverbs_attr_get_len(attrs, rec_attr));
+		if (IS_ERR(records))
+			return PTR_ERR(records);
+	}
+
+	count = 0;
+	spin_lock_irq(&ufile->uobjects_lock);
+	list_for_each_entry(uobj, &ufile->uobjects, list) {
+		struct mlx5_user_mmap_entry *entry;
+
+		if (uobj_get_object_id(uobj) != MLX5_IB_OBJECT_UAR)
+			continue;
+		entry = uobj->object;
+		if (!entry)
+			continue;
+
+		if (!want_records) {
+			count++;
+			continue;
+		}
+
+		/*
+		 * Bail out cleanly if RECORDS is shorter than what we would
+		 * emit (also cross-checked against the final count below).
+		 */
+		nrecords = uverbs_attr_get_len(attrs, rec_attr) /
+			sizeof(*records);
+		if (count >= nrecords) {
+			spin_unlock_irq(&ufile->uobjects_lock);
+			return -EINVAL;
+		}
+
+		records[count].handle = uobj->id;
+		records[count].uar_index = entry->page_idx;
+		/*
+		 * Emit the libmlx5-wire-format mmap_offset (what UAR_OBJ_ALLOC
+		 * reports and userspace mmap()s), so captured values round-trip
+		 * byte-for-byte and are directly usable with mmap() after
+		 * restore.
+		 */
+		records[count].mmap_offset = mlx5_entry_to_mmap_offset(entry);
+		switch (entry->mmap_flag) {
+		case MLX5_IB_MMAP_TYPE_UAR_WC:
+			records[count].alloc_type =
+				MLX5_IB_UAPI_UAR_ALLOC_TYPE_BF;
+			break;
+		case MLX5_IB_MMAP_TYPE_UAR_NC:
+			records[count].alloc_type =
+				MLX5_IB_UAPI_UAR_ALLOC_TYPE_NC;
+			break;
+		default:
+			/*
+			 * MLX5_IB_OBJECT_UAR uobjects only ever carry
+			 * UAR_WC / UAR_NC mmap_flags; anything else is a bug.
+			 */
+			spin_unlock_irq(&ufile->uobjects_lock);
+			mlx5_ib_dbg(dev,
+				    "VFMIG_QUERY_DYN_UARS: unexpected mmap_flag=%u on UAR handle=%u\n",
+				    entry->mmap_flag, uobj->id);
+			return -EIO;
+		}
+		count++;
+	}
+	spin_unlock_irq(&ufile->uobjects_lock);
+
+	if (want_records) {
+		want_len = (size_t)count * sizeof(*records);
+		arr_len = uverbs_attr_get_len(attrs, rec_attr);
+		if (arr_len != want_len) {
+			mlx5_ib_dbg(dev,
+				    "VFMIG_QUERY_DYN_UARS: RECORDS length %zu != expected %zu (count=%u)\n",
+				    arr_len, want_len, count);
+			return -EINVAL;
+		}
+		err = uverbs_copy_to(attrs, rec_attr, records, want_len);
+		if (err)
+			return err;
+	}
+
+	err = uverbs_copy_to(attrs, MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT,
+			     &count, sizeof(count));
+	if (err)
+		return err;
+
+	mlx5_ib_dbg(dev, "VFMIG_QUERY_DYN_UARS: %s pass, %u dyn UAR(s)\n",
+		    want_records ? "snapshot" : "sizing", count);
+	return 0;
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS,
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS,
+			    UVERBS_ATTR_MIN_SIZE(0),
+			    UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT,
+			    UVERBS_ATTR_TYPE(__u32),
+			    UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	MLX5_IB_OBJECT_VFMIG,
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT),
-	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT));
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT),
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS));
 
 const struct uapi_definition mlx5_ib_vfmig_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(MLX5_IB_OBJECT_VFMIG),
