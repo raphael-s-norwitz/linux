@@ -399,6 +399,16 @@ enum mlx5_ib_vfmig_methods {
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS,
 	MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS,
+	/*
+	 * QUERY_PD: dump-side counterpart to UVERBS_METHOD_RESTORE_PD.
+	 * Emit, for the PD resolved through UVERBS_OBJECT_PD on the calling
+	 * fd's ufile, the bytes a CRIU plugin needs to drive RESTORE_PD on
+	 * the destination side. CRIU learns the source's FW pdn on the
+	 * uverbs fd it already holds, under the per-ucontext "if you can see
+	 * the ucontext, you can read its metadata" boundary -- no
+	 * CAP_NET_ADMIN / cross-netns NLDEV dependency.
+	 */
+	MLX5_IB_METHOD_VFMIG_QUERY_PD,
 };
 
 /*
@@ -483,6 +493,35 @@ enum mlx5_ib_vfmig_query_dyn_uars_attrs {
  */
 enum mlx5_ib_vfmig_restore_dyn_uars_attrs {
 	MLX5_IB_ATTR_VFMIG_RESTORE_DYN_UARS_RECORDS = (1U << UVERBS_ID_NS_SHIFT),
+};
+
+/*
+ * Attrs for MLX5_IB_METHOD_VFMIG_QUERY_PD.
+ *
+ * The HANDLE is resolved via UVERBS_ATTR_IDR(UVERBS_OBJECT_PD,
+ * UVERBS_ACCESS_READ): the calling fd's ufile-idr must own this PD.
+ *
+ *   RESP_BLOB  struct mlx5_ib_restore_pd_req (goes verbatim into the
+ *              RESTORE_PD UHW tail at restore time). Carries the FW
+ *              pdn; the handler leaves req.reserved / req.reserved2
+ *              zero so the restore path's "must be 0" checks pass
+ *              round-trip. The byte-equal contract lets CRIU plugin
+ *              code memcpy in, memcpy out.
+ *
+ *   RESP_UID   __u32, the source PD's mpd->uid. Diagnostics only, not
+ *              consumed by RESTORE_PD (which takes uid from the adopted
+ *              ucontext's devx_uid) and not a dump-time gate: a non-zero
+ *              uid is expected since the default libmlx5 ucontext runs
+ *              under a DEVX uid, so the plugin records it for debugging
+ *              rather than rejecting the dump.
+ *
+ * Both outs are MANDATORY: a CRIU plugin that ignores either at dump
+ * time will produce an unrestorable image.
+ */
+enum mlx5_ib_vfmig_query_pd_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB,
+	MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID,
 };
 
 /*

@@ -626,12 +626,71 @@ DECLARE_UVERBS_NAMED_METHOD(
 			   UA_MANDATORY,
 			   UA_ALLOC_AND_COPY));
 
+/*
+ * MLX5_IB_METHOD_VFMIG_QUERY_PD -- emit, for the PD resolved through
+ * UVERBS_OBJECT_PD on the calling fd's ufile, the bytes a CRIU plugin
+ * needs to drive UVERBS_METHOD_RESTORE_PD on the destination side.
+ *
+ * Two-part output:
+ *   RESP_BLOB  struct mlx5_ib_restore_pd_req, byte-equal to what
+ *              RESTORE_PD's UHW consumes. The handler leaves
+ *              req.reserved / req.reserved2 zero so the restore path's
+ *              "must be 0" checks pass round-trip.
+ *   RESP_UID   mpd->uid, the source PD's owning FW uid. Dump-side
+ *              cross-check only -- RESTORE_PD takes uid from the
+ *              adopted ucontext's devx_uid, not from this value.
+ *
+ * A PD has no umem and no source userspace VAs, and the IDR lookup came
+ * through a user ufile by construction, so there is no kernel-mode
+ * rejection; mpd->pdn is the 24-bit FW resource id, non-zero for any
+ * live PD. The IDR lookup grabs UVERBS_ACCESS_READ on the PD uobject
+ * for the duration of the call, so a concurrent DEALLOC_PD on the same
+ * fd cannot race.
+ */
+static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_PD)(struct uverbs_attr_bundle *attrs)
+{
+	struct ib_pd *ibpd = uverbs_attr_get_obj(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE);
+	struct mlx5_ib_restore_pd_req blob = {};
+	struct mlx5_ib_pd *mpd;
+	u32 uid;
+	int err;
+
+	if (IS_ERR(ibpd))
+		return PTR_ERR(ibpd);
+
+	mpd = to_mpd(ibpd);
+	blob.pdn = mpd->pdn;
+	uid = mpd->uid;
+
+	err = uverbs_copy_to(attrs, MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB,
+			     &blob, sizeof(blob));
+	if (err)
+		return err;
+	return uverbs_copy_to(attrs, MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID,
+			      &uid, sizeof(uid));
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	MLX5_IB_METHOD_VFMIG_QUERY_PD,
+	UVERBS_ATTR_IDR(MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE,
+			UVERBS_OBJECT_PD,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB,
+			    UVERBS_ATTR_TYPE(struct mlx5_ib_restore_pd_req),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	MLX5_IB_OBJECT_VFMIG,
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS),
-	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS));
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS),
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_PD));
 
 const struct uapi_definition mlx5_ib_vfmig_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(MLX5_IB_OBJECT_VFMIG),
