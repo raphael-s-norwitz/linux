@@ -2406,10 +2406,17 @@ static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		if (init_attr->srq) {
 			MLX5_SET(qpc, qpc, xrcd, devr->xrcdn0);
 			MLX5_SET(qpc, qpc, srqn_rmpn_xrqn, to_msrq(init_attr->srq)->msrq.srqn);
-		} else {
+		} else if (devr->s1) {
 			MLX5_SET(qpc, qpc, xrcd, devr->xrcdn1);
 			MLX5_SET(qpc, qpc, srqn_rmpn_xrqn, to_msrq(devr->s1)->msrq.srqn);
 		}
+		/*
+		 * else: leave qpc.xrcd / qpc.srqn_rmpn_xrqn zero. On a
+		 * restored VF dev_res's default XRC SRQ stays gated (see
+		 * mlx5_ib_dev_res_srq_init in main.c), so devr->s1 is NULL;
+		 * FW does not consume these fields for a non-XRC QP with no
+		 * SRQ, and dereferencing to_msrq(devr->s1) would NULL-deref.
+		 */
 	}
 
 	if (init_attr->send_cq)
@@ -2583,11 +2590,27 @@ static int create_kernel_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		MLX5_SET(qpc, qpc, xrcd, devr->xrcdn0);
 		MLX5_SET(qpc, qpc, srqn_rmpn_xrqn,
 			 to_msrq(attr->srq)->msrq.srqn);
-	} else {
+	} else if (devr->s1) {
 		MLX5_SET(qpc, qpc, xrcd, devr->xrcdn1);
 		MLX5_SET(qpc, qpc, srqn_rmpn_xrqn,
 			 to_msrq(devr->s1)->msrq.srqn);
 	}
+	/*
+	 * else: dev_res's default XRC SRQ has not been lazy-initialised
+	 * (no XRC-class / GSI QP has triggered mlx5_ib_dev_res_srq_init()
+	 * yet on this device, or this is a restored VF where srq_init
+	 * intentionally stays gated -- see main.c). FW does not consume
+	 * qpc.xrcd or qpc.srqn_rmpn_xrqn for non-XRC kernel QPs that
+	 * don't reference an SRQ (e.g. the UMR QP), so leaving these
+	 * fields zero is correct. Without this gate to_msrq(devr->s1)
+	 * NULL-derefs in create_kernel_qp() the very first time
+	 * mlx5_ib_reg_user_mr() lazily creates the UMR QP on a restored
+	 * VF.
+	 *
+	 * Mirrors the same gate in the create_user_qp() default path;
+	 * kept structurally identical so future audits see the pattern
+	 * in both branches.
+	 */
 
 	if (attr->send_cq)
 		MLX5_SET(qpc, qpc, cqn_snd, to_mcq(attr->send_cq)->mcq.cqn);
@@ -3344,13 +3367,41 @@ int mlx5_ib_create_qp(struct ib_qp *ibqp, struct ib_qp_init_attr *attr,
 	enum ib_qp_type type;
 	int err;
 
-	err = mlx5_ib_dev_res_srq_init(dev);
-	if (err)
-		return err;
-
 	err = check_qp_type(dev, attr, &type);
 	if (err)
 		return err;
+
+	/*
+	 * dev_res's XRC default SRQs (devr->s0/s1) and the PD/CQ/XRCDs
+	 * that back them are only consumed by XRC-class QPs and by GSI
+	 * QP1. Other QP types either supply their own SRQ via
+	 * init_attr->srq or have qpc.srqn / qpc.xrcd left zero (FW does
+	 * not consume those qpc fields when the QP is not XRC and has no
+	 * SRQ).
+	 *
+	 * Defer the lazy dev_res init to the types that actually need
+	 * it. The previous unconditional call at function entry forced
+	 * FW round-trips (CREATE_PD, CREATE_CQ, CREATE_SRQ x2) on the
+	 * very first QP create regardless of type, and -- more
+	 * importantly for the vfmig restore path -- it returns
+	 * -EOPNOTSUPP on a restored VF (see mlx5_ib_dev_res_srq_init in
+	 * main.c), which would block all RC/UD/UC user QP creation even
+	 * though those types have no functional dependency on dev_res.
+	 * With the gate moved here, plain user verbs work on a restored
+	 * VF; XRC and GSI continue to fail until a later stage imports
+	 * the source's dev_res FW objects.
+	 */
+	switch (type) {
+	case IB_QPT_XRC_INI:
+	case IB_QPT_XRC_TGT:
+	case IB_QPT_GSI:
+		err = mlx5_ib_dev_res_srq_init(dev);
+		if (err)
+			return err;
+		break;
+	default:
+		break;
+	}
 
 	err = check_valid_flow(dev, pd, attr, udata);
 	if (err)

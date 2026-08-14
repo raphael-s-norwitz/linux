@@ -3376,6 +3376,29 @@ int mlx5_ib_dev_res_srq_init(struct mlx5_ib_dev *dev)
 	int ret = 0;
 
 	/*
+	 * On a restored VF the dev_res XRC SRQs (devr->s0/s1) and their
+	 * backing CQ/PD belong to the source -- recreating them would
+	 * post CREATE_SRQ to FW, which (empirically, CX-7 / FW
+	 * 28.48.1000) returns syndrome 0x32624 because the FW already
+	 * has those objects on this VHCA. Unlike ALLOC_PD / CREATE_CQ
+	 * in mlx5_ib_dev_res_cq_init() -- which FW accepts and which the
+	 * UMR / GSI paths need, so it is deliberately NOT gated -- we
+	 * must keep these CREATE_SRQ commands from flying here.
+	 *
+	 * The only in-tree caller that depends on this resource during
+	 * probe is the GSI QP1 setup in ib_core's create_mad_qp(), which
+	 * calls into mlx5_ib_create_qp() -> here. Returning -EOPNOTSUPP
+	 * makes ib_mad_init_device() leave the port out of the MAD agent
+	 * list (one residual "Couldn't open port 1" in dmesg from
+	 * ib_core; the caller is in ib_core, not us). Port 1 stays DOWN,
+	 * ib_register_device() succeeds, and the user-visible
+	 * /dev/infiniband/uverbsN appears so the restored CRIU process
+	 * can later open it.
+	 */
+	if (mlx5_vf_is_restored(dev->mdev))
+		return -EOPNOTSUPP;
+
+	/*
 	 * devr->s1 is set once, never changed until device unload.
 	 * Avoid taking the mutex if initialization is already done.
 	 */
