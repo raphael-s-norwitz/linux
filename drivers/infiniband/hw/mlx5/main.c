@@ -2274,9 +2274,19 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 	 * sees it and skips the per-slot ALLOC_UAR commands. The bool is
 	 * cleared by MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT once
 	 * bfregi->sys_pages[] is seeded.
+	 *
+	 * Also latch the sticky companion bool vfmig_restore_mode -- this
+	 * one is NOT cleared by RESTORE_UCONTEXT and is the bit reported
+	 * by mlx5_ib_ucontext_is_restore_mode() to the generic
+	 * UVERBS_METHOD_RESTORE_<TYPE> dispatchers. It must outlive
+	 * vfmig_restore_pending because RESTORE_PD/MR/CQ/QP run AFTER
+	 * MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT (those resources need a
+	 * usable UAR at hw-create time). See struct mlx5_ib_ucontext.
 	 */
-	if (req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE)
+	if (req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE) {
 		context->vfmig_restore_pending = true;
+		context->vfmig_restore_mode = true;
+	}
 
 	if (req.flags & MLX5_IB_ALLOC_UCTX_DEVX) {
 		err = mlx5_ib_devx_create(dev, true, uctx->enabled_caps);
@@ -2429,6 +2439,19 @@ static void mlx5_ib_dealloc_ucontext(struct ib_ucontext *ibcontext)
 						       context->devx_uid);
 		mlx5_ib_devx_destroy(dev, context->devx_uid);
 	}
+}
+
+/*
+ * ib_device_ops.ucontext_is_restore_mode for mlx5_ib. Reports the
+ * sticky-for-lifetime vfmig_restore_mode bool latched in
+ * mlx5_ib_alloc_ucontext(). See struct mlx5_ib_ucontext in mlx5_ib.h
+ * for the distinction between this and the single-shot
+ * vfmig_restore_pending. See ib_device_ops.ucontext_is_restore_mode
+ * in include/rdma/ib_verbs.h for the contract.
+ */
+static bool mlx5_ib_ucontext_is_restore_mode(struct ib_ucontext *ibcontext)
+{
+	return to_mucontext(ibcontext)->vfmig_restore_mode;
 }
 
 static phys_addr_t uar_index2pfn(struct mlx5_ib_dev *dev,
@@ -4787,6 +4810,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.req_notify_cq = mlx5_ib_arm_cq,
 	.rereg_user_mr = mlx5_ib_rereg_user_mr,
 	.resize_user_cq = mlx5_ib_resize_cq,
+	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
 	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
 
 	INIT_RDMA_OBJ_SIZE(ib_ah, mlx5_ib_ah, ibah),
