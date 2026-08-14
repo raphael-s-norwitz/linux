@@ -207,6 +207,21 @@ struct mlx5_ib_ucontext {
 	 * and any UAR mmap() is refused.
 	 */
 	bool			vfmig_restore_pending;
+
+	/*
+	 * Sticky companion to vfmig_restore_pending: also set when
+	 * MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE was passed at alloc-ucontext
+	 * time, but NEVER cleared for the lifetime of the ucontext. This
+	 * is the bit reported by mlx5_ib_ucontext_is_restore_mode() to
+	 * the generic UVERBS_METHOD_RESTORE_<TYPE> dispatchers, which
+	 * run AFTER MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT (because the
+	 * resources they restore reference UARs that the snapshot
+	 * consume must have already seeded). vfmig_restore_pending
+	 * alone cannot serve as that gate -- by then it's been cleared.
+	 *
+	 * See include/rdma/ib_verbs.h:ib_device_ops.ucontext_is_restore_mode.
+	 */
+	bool			vfmig_restore_mode;
 };
 
 static inline struct mlx5_ib_ucontext *to_mucontext(struct ib_ucontext *ibucontext)
