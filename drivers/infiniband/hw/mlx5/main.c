@@ -2915,12 +2915,213 @@ static int mlx5_ib_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 	return 0;
 }
 
+/*
+ * Empirical "PDN unknown to allocator" syndrome and status returned
+ * by FW for DEALLOC_PD when the PDN was inherited from another VHCA
+ * via LOAD_VHCA_STATE (the dest VHCA's allocator preserved its
+ * high-water mark but lost the (pdn -> owner_uid) registration
+ * entry). The same status/syndrome combo is also returned for
+ * definitely-bogus pdns. Reproduced on FW 28.48.1000 / ConnectX-7.
+ * status==0x9 (bad_resource_state) is the umbrella class FW uses for
+ * PDN/UID registry misses; the syndrome is the precise sub-class.
+ */
+#define MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_STATUS	0x9
+#define MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_SYNDROME	0xef0c8a
+
+/*
+ * DEALLOC_PD on a vfmig-restored PD.
+ *
+ * mlx5_ib_restore_pd adopts a source pdn without issuing ALLOC_PD on
+ * the destination, and LOAD_VHCA_STATE does not preserve the
+ * (pdn -> owner_uid) registration table. So from the destination
+ * VHCA's point of view our DEALLOC_PD asserts "free a pdn I never
+ * allocated" and FW returns bad_resource_state(0x9)/0xef0c8a. The FW
+ * state is reclaimed at VHCA close; the kernel-side mpd just needs to
+ * be freed cleanly, so tolerate exactly that syndrome on a restored
+ * PD (bounded leak, documented in design/pd_registration_wipe.md).
+ *
+ * Any other failure -- including this syndrome on a NON-restored mpd,
+ * which would be a real kernel/FW bookkeeping bug -- is replayed
+ * through mlx5_cmd_check() for the standard error log + errno and
+ * propagated.
+ */
 static int mlx5_ib_dealloc_pd(struct ib_pd *pd, struct ib_udata *udata)
 {
 	struct mlx5_ib_dev *mdev = to_mdev(pd->device);
 	struct mlx5_ib_pd *mpd = to_mpd(pd);
+	u32 in[MLX5_ST_SZ_DW(dealloc_pd_in)] = {};
+	u32 out[MLX5_ST_SZ_DW(dealloc_pd_out)] = {};
+	u32 syndrome;
+	u8 status;
+	int err;
 
-	return mlx5_cmd_dealloc_pd(mdev->mdev, mpd->pdn, mpd->uid);
+	MLX5_SET(dealloc_pd_in, in, opcode, MLX5_CMD_OP_DEALLOC_PD);
+	MLX5_SET(dealloc_pd_in, in, pd, mpd->pdn);
+	MLX5_SET(dealloc_pd_in, in, uid, mpd->uid);
+	err = mlx5_cmd_do(mdev->mdev, in, sizeof(in), out, sizeof(out));
+	if (!err)
+		return 0;
+
+	status = MLX5_GET(dealloc_pd_out, out, status);
+	syndrome = MLX5_GET(dealloc_pd_out, out, syndrome);
+
+	if (mpd->vfmig_restored &&
+	    status == MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_STATUS &&
+	    syndrome == MLX5_IB_VFMIG_DEALLOC_PD_UNKNOWN_PDN_SYNDROME) {
+		mlx5_ib_dbg(mdev,
+			    "vfmig: tolerating DEALLOC_PD pdn=0x%x uid=%u: err=%d status=0x%x syndrome=0x%x (PDN registration wiped by LOAD_VHCA_STATE; FW state reclaimed at VHCA close)\n",
+			    mpd->pdn, mpd->uid, err, status, syndrome);
+		return 0;
+	}
+
+	err = mlx5_cmd_check(mdev->mdev, err, in, out);
+	mlx5_ib_warn(mdev,
+		     "DEALLOC_PD pdn=0x%x uid=%u failed: err=%d status=0x%x syndrome=0x%x vfmig_restored=%d\n",
+		     mpd->pdn, mpd->uid, err, status, syndrome,
+		     mpd->vfmig_restored);
+	return err;
+}
+
+/*
+ * Defense-in-depth FW probe for mlx5_ib_restore_pd's adoption model.
+ * Issues a transient CREATE_MKEY{mkc.pd=pdn, mkc.uid=uid} followed by
+ * DESTROY_MKEY on the bound VF's cmdif. If FW rejects the create, the
+ * (pdn, uid) pair is not adoptable -- either the pdn is stale (never
+ * allocated on this VHCA) or the uid mismatches FW's record of who
+ * owns pdn. Returns 0 on success (test mkey already destroyed) or a
+ * negative errno; fw_status/fw_syndrome carry the raw FW codepoints
+ * so the caller can log the precise failure shape.
+ */
+static int mlx5_ib_restore_pd_fw_probe(struct mlx5_ib_dev *dev, u32 pdn,
+				       u16 uid, u8 *fw_status,
+				       u32 *fw_syndrome)
+{
+	u32 in[MLX5_ST_SZ_DW(create_mkey_in)] = {};
+	u32 out[MLX5_ST_SZ_DW(create_mkey_out)] = {};
+	u32 dmk_in[MLX5_ST_SZ_DW(destroy_mkey_in)] = {};
+	u32 dmk_out[MLX5_ST_SZ_DW(destroy_mkey_out)] = {};
+	u32 mkey_index;
+	void *mkc;
+	int err;
+
+	if (fw_status)
+		*fw_status = 0;
+	if (fw_syndrome)
+		*fw_syndrome = 0;
+
+	MLX5_SET(create_mkey_in, in, opcode, MLX5_CMD_OP_CREATE_MKEY);
+	MLX5_SET(create_mkey_in, in, uid, uid);
+	mkc = MLX5_ADDR_OF(create_mkey_in, in, memory_key_mkey_entry);
+	MLX5_SET(mkc, mkc, access_mode_1_0, MLX5_MKC_ACCESS_MODE_PA);
+	MLX5_SET(mkc, mkc, lr, 1);
+	MLX5_SET(mkc, mkc, pd, pdn);
+	MLX5_SET(mkc, mkc, length64, 1);
+	MLX5_SET(mkc, mkc, qpn, 0xffffff);
+
+	err = mlx5_cmd_exec(dev->mdev, in, sizeof(in), out, sizeof(out));
+	if (err) {
+		if (fw_status)
+			*fw_status = MLX5_GET(create_mkey_out, out, status);
+		if (fw_syndrome)
+			*fw_syndrome =
+				MLX5_GET(create_mkey_out, out, syndrome);
+		return err;
+	}
+
+	mkey_index = MLX5_GET(create_mkey_out, out, mkey_index);
+
+	/* Best-effort destroy; a leaked test mkey is cleaned at VHCA close. */
+	MLX5_SET(destroy_mkey_in, dmk_in, opcode, MLX5_CMD_OP_DESTROY_MKEY);
+	MLX5_SET(destroy_mkey_in, dmk_in, uid, uid);
+	MLX5_SET(destroy_mkey_in, dmk_in, mkey_index, mkey_index);
+	mlx5_cmd_exec(dev->mdev, dmk_in, sizeof(dmk_in), dmk_out,
+		      sizeof(dmk_out));
+	return 0;
+}
+
+/*
+ * mlx5_ib_restore_pd: CRIU-managed PD restore. Adopts the source's FW
+ * pdn (still reserved on the destination VF after LOAD_VHCA_STATE)
+ * into a fresh kernel-side mlx5_ib_pd without re-issuing ALLOC_PD.
+ * The generic dispatcher has already reserved target_handle and
+ * allocated the zeroed mlx5_ib_pd; our job is to validate and stamp
+ * mpd->pdn / mpd->uid.
+ *
+ * v0 covers the non-DEVX (uid=0) libibverbs path only: CREATE_MKEY
+ * under uid=0 is ungated by FW on mkc.pd validity, so adopted
+ * resources work. DEVX ucontexts (devx_uid != 0) hit the
+ * LOAD_VHCA_STATE uctx-registry wipe and are not supported here; the
+ * CRIU plugin must open the dest ucontext without DEVX.
+ */
+static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
+			      struct ib_udata *udata)
+{
+	struct mlx5_ib_dev *dev = to_mdev(ibpd->device);
+	struct mlx5_ib_pd *pd = to_mpd(ibpd);
+	struct mlx5_ib_restore_pd_req req = {};
+	struct mlx5_ib_ucontext *context;
+	u8 fw_status = 0;
+	u32 fw_syndrome = 0;
+	int err;
+
+	context = rdma_udata_to_drv_context(udata, struct mlx5_ib_ucontext,
+					    ibucontext);
+	if (!context)
+		return -EINVAL;
+
+	/*
+	 * The generic dispatcher already gated on
+	 * mlx5_ib_ucontext_is_restore_mode. Belt & suspenders here so a
+	 * driver-direct caller cannot bypass the per-ucontext bool.
+	 */
+	if (!context->vfmig_restore_mode)
+		return -EPERM;
+
+	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+		return -EINVAL;
+	err = ib_copy_from_udata(&req, udata, sizeof(req));
+	if (err)
+		return err;
+	if (req.reserved || req.reserved2)
+		return -EINVAL;
+	/* FW pdn is a 24-bit field (see PRM "alloc_pd_out"). */
+	if (req.pdn & ~0xffffffU || req.pdn == 0)
+		return -EINVAL;
+
+	(void)target_handle; /* ufile-handle slot is the dispatcher's job */
+
+	/*
+	 * Defense-in-depth: confirm (pdn, uid) is usable on the
+	 * destination VHCA before stamping it onto mpd, so a stale pdn
+	 * or a DEVX-uid mismatch surfaces here rather than as an opaque
+	 * BAD_PARAM at the first downstream CREATE_QP/CREATE_MKEY.
+	 */
+	err = mlx5_ib_restore_pd_fw_probe(dev, req.pdn, context->devx_uid,
+					  &fw_status, &fw_syndrome);
+	if (err) {
+		const char *hint;
+
+		if (context->devx_uid)
+			hint = "DEVX-adoption blind spot; open dest ucontext without DEVX";
+		else
+			hint = "stale pdn (source restrack id, not FW pdn?)";
+
+		mlx5_ib_warn(dev,
+			     "restore_pd: FW probe rejected (pdn=0x%x, uid=%u): err=%d fw_status=0x%x fw_syndrome=0x%x -- %s\n",
+			     req.pdn, context->devx_uid, err,
+			     fw_status, fw_syndrome, hint);
+		return -ENOENT;
+	}
+
+	pd->pdn = req.pdn;
+	pd->uid = context->devx_uid;
+	/*
+	 * Mark this mpd as a vfmig-restored PD so mlx5_ib_dealloc_pd
+	 * tolerates the expected "unknown PDN" syndrome from FW on the
+	 * eventual DEALLOC_PD (FW state is reclaimed at VHCA close).
+	 */
+	pd->vfmig_restored = true;
+	return 0;
 }
 
 static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
@@ -4810,6 +5011,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.req_notify_cq = mlx5_ib_arm_cq,
 	.rereg_user_mr = mlx5_ib_rereg_user_mr,
 	.resize_user_cq = mlx5_ib_resize_cq,
+	.restore_pd = mlx5_ib_restore_pd,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
 	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
 
