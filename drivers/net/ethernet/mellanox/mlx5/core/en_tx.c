@@ -652,6 +652,67 @@ netdev_tx_t mlx5e_xmit(struct sk_buff *skb, struct net_device *dev)
 	struct mlx5e_txqsq *sq;
 	u16 pi;
 
+	/*
+	 * Stage-1 vfmig: on a restored VF the netdev TX SQ uses MKEYs
+	 * that were inherited from the source's FW state and do NOT match
+	 * any IOVA installed in the destination's vfmig_iova domain. The
+	 * very first packet posted on this SQ produces ERR CQE syndrome
+	 * 0x4 + vendor 0x51 (lkey violation / address translation miss),
+	 * and the bail-out path through mlx5e_poll_tx_cq trips a FIFO
+	 * underflow assertion (txrx.h:359 *fifo->pc == *fifo->cc) and
+	 * NULL-derefs.
+	 *
+	 * We re-enable mlx5e on restored VFs (so the netdev exists and
+	 * RoCE GIDs flow naturally from `ip addr add`) but keep the data
+	 * path inert: drop every TX silently.
+	 *
+	 * WARNING: this does NOT make userspace RDMA verbs safe. A
+	 * post-restore reg_user_mr goes through create_real_mr ->
+	 * mlx5r_umr_update_mr_pas -> mlx5r_umr_post_send_wait(), which
+	 * programs the MR's translation by posting a WQE on the kernel
+	 * UMR QP and ringing a UAR doorbell. On a restored VF the UMR /
+	 * UAR / MKEY translation resources are NOT reconstituted coherently
+	 * with the LOAD_VHCA_STATE'd firmware, so that WQE never completes:
+	 * mlx5r_umr_post_send_wait()'s untimed wait_for_completion() hangs
+	 * the caller in D state forever and the VF subsequently trips
+	 * poll_health "Fatal error 3" (MLX5_SENSOR_NIC_DISABLED) with
+	 * DEALLOC_UAR failing "bad resource state". The fix is the same
+	 * Stage-2 MKEY/UAR reconstitution called out below; until then any
+	 * UMR-driven verb (reg_mr/rereg_mr/large/ODP MRs) on a restored VF
+	 * is unsafe. See design/datapath_pause_resume.md.
+	 *
+	 * Drop returns NETDEV_TX_OK so the stack never retries: ARP
+	 * entries cycle quietly, TCP retransmits "succeed" silently,
+	 * nothing in the kernel waits synchronously on TX completion
+	 * for this netdev. No watchdog ndo_tx_timeout because we never
+	 * queue. We bump the standard tx_dropped stat (visible via
+	 * /sys/class/net/<dev>/statistics/tx_dropped, even though
+	 * mlx5e's ndo_get_stats64 doesn't fold it into ethtool -S) and
+	 * emit a one-shot netdev_warn so dmesg makes the inert state
+	 * obvious during debugging.
+	 *
+	 * FIXME(stage2+): cleaner alternatives we deliberately did NOT
+	 * take here:
+	 *   - netif_carrier_off after mlx5e_open: stack stops TXing,
+	 *     no timeouts at all, but mlx5_ib_query_port for RoCE reads
+	 *     netif_carrier_ok and would report port=DOWN, defeating
+	 *     ibv_modify_qp -> RTR.
+	 *   - netif_dormant_on: cleaner OperState signal but the stack
+	 *     still TXes, so a drop is still needed underneath.
+	 *   - skip mlx5e_open / refuse IFF_UP: same query_port problem.
+	 * The right long-term fix is to either rebuild the kernel TX
+	 * SQ's MKEYs against destination IOVAs (cousin of L4 R3 user-MR
+	 * rebinding) or import the source's MKEYs from FW so the SQ is
+	 * actually functional, after which this whole drop disappears.
+	 */
+	if (unlikely(mlx5_vf_is_restored(priv->mdev))) {
+		netdev_warn_once(dev,
+				 "vfmig: TX disabled on restored VF (Stage 1: kernel MKEYs/UARs not rebound; UMR-driven verbs e.g. reg_mr are also unsafe and may hang)\n");
+		dev->stats.tx_dropped++;
+		dev_kfree_skb_any(skb);
+		return NETDEV_TX_OK;
+	}
+
 	/* All changes to txq2sq are performed in sync with mlx5e_xmit, when the
 	 * queue being changed is disabled, and smp_wmb guarantees that the
 	 * changes are visible before mlx5e_xmit tries to read from txq2sq. It
