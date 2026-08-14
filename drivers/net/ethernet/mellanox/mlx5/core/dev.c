@@ -303,6 +303,41 @@ static void adev_release(struct device *dev)
 	priv->adev[idx] = NULL;
 }
 
+/*
+ * Stage-1 vfmig: skip-on-restored-VF for auxiliary protocols.
+ *
+ * mlx5e (netdev) is now ALLOWED on restored VFs. The first-TX FW
+ * MKEY violation that motivated the original skip is mitigated at
+ * the source: mlx5e_xmit() short-circuits with dev_kfree_skb_any()
+ * on restored VFs (see en_tx.c). The netdev itself (eth4 et al.)
+ * registers normally so RoCE GIDs flow from `ip addr add`, port 1
+ * comes up, and userspace RC verbs work for traffic that uses MKEYs
+ * allocated post-restore.
+ *
+ * ETH_REP (switchdev representor) stays skipped: representors imply
+ * a switchdev e-switch reconfiguration that the LOAD_VHCA_STATE flow
+ * doesn't yet preserve, and they aren't exercised by Stage 1.
+ *
+ * FIXME(stage2+): replace the mlx5e_xmit drop with a real fix --
+ * either rebuild kernel MKEYs against destination IOVAs, or import
+ * source MKEYs from FW (mirrors L4 R3 user-MR rebinding). The drop
+ * is a Stage-1 expedient; the netdev appears functional but does
+ * not actually move bytes from the kernel TCP/IP stack.
+ */
+static bool mlx5_adev_idx_skip_on_restored_vf(struct mlx5_core_dev *dev,
+					      int idx)
+{
+	if (!mlx5_vf_is_restored(dev))
+		return false;
+
+	switch (idx) {
+	case MLX5_INTERFACE_PROTOCOL_ETH_REP:
+		return true;
+	default:
+		return false;
+	}
+}
+
 static struct mlx5_adev *add_adev(struct mlx5_core_dev *dev, int idx)
 {
 	const char *suffix = mlx5_adev_devices[idx].suffix;
@@ -367,6 +402,13 @@ int mlx5_attach_device(struct mlx5_core_dev *dev)
 	for (i = 0; i < ARRAY_SIZE(mlx5_adev_devices); i++) {
 		if (!priv->adev[i]) {
 			bool is_supported = false;
+
+			if (mlx5_adev_idx_skip_on_restored_vf(dev, i)) {
+				mlx5_core_info(dev,
+					       "vfmig: restored VF -- skipping adev[%d] (%s)\n",
+					       i, mlx5_adev_devices[i].suffix);
+				continue;
+			}
 
 			if (mlx5_adev_devices[i].is_enabled) {
 				bool enabled;
@@ -486,6 +528,9 @@ static int add_drivers(struct mlx5_core_dev *dev)
 		bool is_supported = false;
 
 		if (priv->adev[i])
+			continue;
+
+		if (mlx5_adev_idx_skip_on_restored_vf(dev, i))
 			continue;
 
 		if (mlx5_adev_devices[i].is_enabled &&
