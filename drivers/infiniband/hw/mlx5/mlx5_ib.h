@@ -233,6 +233,28 @@ struct mlx5_ib_pd {
 	struct ib_pd		ibpd;
 	u32			pdn;
 	u16			uid;
+	/*
+	 * "PDN registration-table wiped by LOAD_VHCA_STATE" gate.
+	 * Set true by mlx5_ib_restore_pd; never set by mlx5_ib_alloc_pd.
+	 *
+	 * The destination VHCA's PDN allocator preserves its high-water
+	 * mark across SAVE/LOAD (so a fresh ALLOC_PD on the destination
+	 * returns a pdn strictly greater than the source's max_pdn -- no
+	 * collision risk), but does NOT preserve the (pdn -> owner_uid)
+	 * registration table. DEALLOC_PD against a source-restored pdn
+	 * therefore returns status=bad_resource_state(0x9) syndrome
+	 * 0xef0c8a ("PDN unknown to allocator"), the same shape FW
+	 * returns for definitely-bogus pdns.
+	 *
+	 * mlx5_ib_dealloc_pd uses this flag to gate the suppression of
+	 * exactly that syndrome class on restored PDs, so the destructor
+	 * frees the kernel-side mpd cleanly instead of leaving it
+	 * orphaned in uverbs uobject teardown. Non-restored PDs go
+	 * through the normal teardown path -- the same syndrome on a
+	 * non-restored PD would be a real kernel/FW bookkeeping bug and
+	 * we want to surface it.
+	 */
+	bool			vfmig_restored;
 };
 
 enum {
