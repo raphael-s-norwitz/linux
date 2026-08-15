@@ -677,7 +677,18 @@ static int create_async_eqs(struct mlx5_core_dev *dev)
 	if (err)
 		goto err1;
 
-	mlx5_cmd_use_events(dev);
+	/*
+	 * vfmig: on a restored VF with vfmig_load_skip_cmd_use_events=Y,
+	 * leave cmd_eq in polling mode -- mirrors vfio-pci-mlx5's "VF cmd
+	 * interface is not host-driven post-restore" property and removes
+	 * the empirical trigger of the post-LOAD slot-0 ghost EQE / lost-
+	 * completion failure mode. cmd_eq is still created above so FW has
+	 * somewhere to drop cmd-completion EQEs if it emits any; we just
+	 * never register a notifier or read from it. destroy_async_eqs()
+	 * has the matching skip on teardown.
+	 */
+	if (!dev->cmd.vfmig_skip_cmd_use_events)
+		mlx5_cmd_use_events(dev);
 	mlx5_cmd_allowed_opcode(dev, CMD_ALLOWED_OPCODE_ALL);
 
 	param = (struct mlx5_eq_param) {
@@ -711,7 +722,14 @@ static int create_async_eqs(struct mlx5_core_dev *dev)
 err3:
 	cleanup_async_eq(dev, &table->async_eq, "async");
 err2:
-	mlx5_cmd_use_polling(dev);
+	/*
+	 * vfmig: only switch back to polling mode if we actually switched
+	 * into events mode above. With vfmig_skip_cmd_use_events the cmd-
+	 * comp notifier was never registered, so the matching unregister
+	 * in mlx5_cmd_use_polling() would walk a list it is not on.
+	 */
+	if (!dev->cmd.vfmig_skip_cmd_use_events)
+		mlx5_cmd_use_polling(dev);
 	cleanup_async_eq(dev, &table->cmd_eq, "cmd");
 err1:
 	mlx5_cmd_allowed_opcode(dev, CMD_ALLOWED_OPCODE_ALL);
@@ -728,7 +746,14 @@ static void destroy_async_eqs(struct mlx5_core_dev *dev)
 		cleanup_async_eq(dev, &table->pages_eq, "pages");
 	cleanup_async_eq(dev, &table->async_eq, "async");
 	mlx5_cmd_allowed_opcode(dev, MLX5_CMD_OP_DESTROY_EQ);
-	mlx5_cmd_use_polling(dev);
+	/*
+	 * vfmig: skip the polling-mode switch on teardown if we never
+	 * switched to events on probe (see create_async_eqs()). Without
+	 * this guard, mlx5_cmd_use_polling()'s notifier-unregister walks a
+	 * list the cmd-comp notifier was never added to.
+	 */
+	if (!dev->cmd.vfmig_skip_cmd_use_events)
+		mlx5_cmd_use_polling(dev);
 	cleanup_async_eq(dev, &table->cmd_eq, "cmd");
 	mlx5_cmd_allowed_opcode(dev, CMD_ALLOWED_OPCODE_ALL);
 	mlx5_eq_notifier_unregister(dev, &table->cq_err_nb);

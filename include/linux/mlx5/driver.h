@@ -326,6 +326,37 @@ struct mlx5_cmd {
 	 */
 	void	       *vfmig_iova_dom;
 
+	/*
+	 * Per-device opt-out of switching the cmd interface from polling
+	 * to event mode at mlx5_eq_table_create() time. When true,
+	 * create_async_eqs() leaves cmd_eq in polling mode (does not call
+	 * mlx5_cmd_use_events()) and destroy_async_eqs() does not undo
+	 * what was never set up. All cmds against this mdev for the
+	 * lifetime of the device complete via lay->status_own polling on
+	 * the cmd ring; the cmd EQ is created (so FW has a place to drop
+	 * cmd-completion EQEs if it chooses to) but the host never reads
+	 * from it.
+	 *
+	 * Targeted workaround for the post-LOAD slot-0 ghost EQE / lost
+	 * real-completion failure mode. Every observed variant of that
+	 * failure happens after mlx5_cmd_use_events() runs on a freshly-
+	 * restored VF. vfio-pci-mlx5 (the upstream SR-IOV live-migration
+	 * driver) never calls mlx5_cmd_use_events() on the VF -- the VF
+	 * cmd interface is guest-owned -- and never exhibits this failure.
+	 * Mirroring that "no cmd_use_events on the VF" property is the
+	 * most direct way to remove the trigger without re-architecting
+	 * probe.
+	 *
+	 * Set by mlx5_function_enable() on the restored-VF branch, before
+	 * mlx5_load() reaches mlx5_eq_table_create(), when
+	 * vfmig_load_skip_cmd_use_events is Y. Zero on every other code
+	 * path. The set is symmetric on teardown: skipping cmd_use_events
+	 * means destroy_async_eqs() must also skip the matching
+	 * cmd_use_polling(), otherwise its notifier-unregister walks a
+	 * list the cmd-comp notifier was never added to.
+	 */
+	bool		vfmig_skip_cmd_use_events;
+
 	/* protect command queue allocations
 	 */
 	spinlock_t	alloc_lock;
@@ -679,6 +710,22 @@ struct mlx5_priv {
 	struct blocking_notifier_head lag_nh;
 	/* Host-driven VF migration state; set on PFs when CONFIG_MLX5_VFMIG. */
 	struct mlx5_vfmig_pf	*vfmig;
+
+	/*
+	 * Per-VF-mdev "this VF was brought up via the vfmig restore path"
+	 * latch. Set in mlx5_function_enable() after the
+	 * mlx5_vfmig_vf_consume_restored() branch has fired; stays set for
+	 * the lifetime of this mdev. Read via mlx5_vf_is_restored() so that
+	 * subsystems outside mlx5_core (mlx5_ib in particular) can refuse to
+	 * post FW commands that would mutate VHCA state already installed
+	 * by LOAD_VHCA_STATE.
+	 *
+	 * Lives on the VF mdev's own priv (not on the PF's
+	 * sriov.vfs_ctx[].restored, which is consumed-and-cleared during
+	 * probe) so that consumers can interrogate it at any point in the
+	 * mdev's lifetime without coordinating with the PF.
+	 */
+	bool	vfmig_self_restored;
 };
 
 enum mlx5_device_state {
@@ -1259,6 +1306,23 @@ static inline bool mlx5_core_is_pf(const struct mlx5_core_dev *dev)
 static inline bool mlx5_core_is_vf(const struct mlx5_core_dev *dev)
 {
 	return dev->coredev_type == MLX5_COREDEV_VF;
+}
+
+/*
+ * Returns true iff this mdev is a VF that was brought up via the vfmig
+ * restore path (mlx5_vfmig_vf_consume_restored() fired during probe and
+ * LOAD_VHCA_STATE was applied to the underlying VHCA). Latched in
+ * priv.vfmig_self_restored for the lifetime of the mdev.
+ *
+ * Consumers should treat a "true" answer as "this VHCA's FW state was
+ * inherited from the source -- do NOT post commands that recreate or
+ * reconfigure top-level objects FW already considers populated."
+ *
+ * Always false on PFs and on VFs probed via the normal path.
+ */
+static inline bool mlx5_vf_is_restored(const struct mlx5_core_dev *dev)
+{
+	return dev->priv.vfmig_self_restored;
 }
 
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,
