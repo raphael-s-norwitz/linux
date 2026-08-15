@@ -104,6 +104,9 @@ static inline struct ib_umem *ib_umem_get_va(struct ib_device *device,
 	return ib_umem_get_attr_or_va(device, NULL, 0, addr, size, access);
 }
 
+struct ib_umem *ib_umem_pin(struct ib_device *device, unsigned long addr,
+			    size_t size, int access);
+
 void ib_umem_release(struct ib_umem *umem);
 int ib_umem_copy_from(void *dst, struct ib_umem *umem, size_t offset,
 		      size_t length);
@@ -193,6 +196,12 @@ ib_umem_get_desc(struct ib_device *device,
 static inline struct ib_umem *ib_umem_get_va(struct ib_device *device,
 					     unsigned long addr, size_t size,
 					     int access)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+static inline struct ib_umem *ib_umem_pin(struct ib_device *device,
+					  unsigned long addr, size_t size,
+					  int access)
 {
 	return ERR_PTR(-EOPNOTSUPP);
 }
