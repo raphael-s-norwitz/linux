@@ -3214,10 +3214,16 @@ static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	cq->mcq.vector = attr->comp_vector;
 
 	/*
-	 * The completion-callback wiring, CQE-ring and doorbell umem binds,
-	 * and FW cqn adoption are added incrementally in follow-on commits.
-	 * Until then the verb validates its inputs and reports -EOPNOTSUPP,
-	 * so the RESTORE_CQ path is reachable end-to-end from here.
+	 * Wire the cq->mcq callbacks before mlx5_core_adopt_cq registers
+	 * with the comp-eq tree: that registration immediately enables EQE
+	 * dispatch, and a NULL cq->comp would land on the dummy-cb "bogus
+	 * CQ" warning lane otherwise.
+	 */
+	mlx5_ib_set_user_cq_callbacks(cq);
+
+	/*
+	 * The CQE-ring and doorbell umem binds and FW cqn adoption are
+	 * added in follow-on commits; until then report -EOPNOTSUPP.
 	 */
 	return -EOPNOTSUPP;
 }

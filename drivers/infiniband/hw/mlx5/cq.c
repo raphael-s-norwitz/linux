@@ -1149,6 +1149,22 @@ err_cqb:
 	return err;
 }
 
+/*
+ * Wire @cq's mlx5_core_cq callbacks for a user-mode CQ rebuilt via the
+ * uverbs RESTORE path. Decouples mlx5_ib_restore_cq (in main.c) from the
+ * file-static mlx5_ib_cq_comp / mlx5_ib_cq_event symbols here in cq.c.
+ * The selection mirrors mlx5_ib_create_cq's "if (udata)" arm exactly:
+ * user CQs hop through the tasklet so the comp_handler runs in process
+ * context. Must be called before mlx5_core_adopt_cq, whose comp-EQ
+ * registration immediately enables EQE dispatch.
+ */
+void mlx5_ib_set_user_cq_callbacks(struct mlx5_ib_cq *cq)
+{
+	cq->mcq.comp = mlx5_add_cq_to_tasklet;
+	cq->mcq.tasklet_ctx.comp = mlx5_ib_cq_comp;
+	cq->mcq.event = mlx5_ib_cq_event;
+}
+
 int mlx5_ib_pre_destroy_cq(struct ib_cq *cq)
 {
 	struct mlx5_ib_dev *dev = to_mdev(cq->device);
