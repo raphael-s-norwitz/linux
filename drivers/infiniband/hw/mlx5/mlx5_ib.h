@@ -1312,6 +1312,8 @@ int mlx5_ib_dev_res_srq_init(struct mlx5_ib_dev *dev);
 int mlx5_ib_db_map_user(struct mlx5_ib_ucontext *context,
 			const struct uverbs_attr_bundle *attrs, u16 attr_id,
 			unsigned long virt, struct mlx5_db *db);
+int mlx5_ib_db_map_user_restore(struct mlx5_ib_ucontext *context,
+				unsigned long virt, struct mlx5_db *db);
 void mlx5_ib_db_unmap_user(struct mlx5_ib_ucontext *context, struct mlx5_db *db);
 u64 mlx5_ib_db_user_virt(const struct mlx5_db *db);
 void __mlx5_ib_cq_clean(struct mlx5_ib_cq *cq, u32 qpn, struct mlx5_ib_srq *srq);

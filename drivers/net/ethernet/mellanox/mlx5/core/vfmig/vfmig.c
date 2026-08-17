@@ -3973,6 +3973,45 @@ int mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
 EXPORT_SYMBOL(mlx5_vfmig_bind_user_cq);
 
 /*
+ * Public destination-side bind entry point for the doorbell-page umem
+ * of the mlx5_ib RESTORE_CQ / RESTORE_QP / RESTORE_SRQ verb bodies.
+ * Header docstring lives in include/linux/mlx5/driver.h.
+ *
+ * The instance_key is VFMIG_HUOBJ_KEY(KIND_DBR, user_virt & PAGE_MASK)
+ * -- DBR is the only kind whose fw_id is a userspace virtual address
+ * rather than a FW-allocated identifier (no FW resource owns "the
+ * doorbell page"; the FW only sees the DMA address of individual 8-byte
+ * doorbell records inside it). mlx5_ib_db_map_user already dedups on
+ * (mm, user_virt & PAGE_MASK), so both the SAVE-side
+ * mlx5_vfmig_retag_user_dbr and this bind lean on that key. @user_virt
+ * need not be page-aligned: it is masked to PAGE_MASK here.
+ *
+ * One extra invariant over mlx5_vfmig_bind_user_mr: @sgt must describe
+ * exactly one PAGE_SIZE entry, since mlx5_ib_db_map_user pins a single
+ * page per doorbell umem. Multi-page sgts are rejected with -EINVAL.
+ */
+int mlx5_vfmig_bind_user_dbr(struct mlx5_core_dev *vf_dev,
+			     unsigned long user_virt, struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !sgt)
+		return -EINVAL;
+	if (sgt->nents != 1 || sg_dma_len(sgt->sgl) > PAGE_SIZE)
+		return -EINVAL;
+	if (sgt->sgl->length != PAGE_SIZE)
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_bind_user_object(dom, VFMIG_HUOBJ_KIND_DBR,
+					   (u64)(user_virt & PAGE_MASK), sgt);
+}
+EXPORT_SYMBOL(mlx5_vfmig_bind_user_dbr);
+
+/*
  * Public Stage-2 source-side retag entry point for the mlx5_ib user CQ
  * creation path (header docstring in include/linux/mlx5/driver.h).
  * Identical shape to mlx5_vfmig_retag_user_mr() modulo the kind: a single
