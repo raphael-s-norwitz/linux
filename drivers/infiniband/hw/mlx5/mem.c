@@ -73,6 +73,37 @@ struct ib_umem *mlx5_ib_umem_restore_mr(struct mlx5_ib_dev *dev,
 }
 
 /*
+ * Stage-3 destination-side umem bind for a CRIU-restored user CQ's
+ * CQE-ring buffer. Same composition as mlx5_ib_umem_restore_mr modulo
+ * the kind: ib_umem_pin() with IB_ACCESS_LOCAL_WRITE (the FW writes
+ * CQEs into the buffer, matching the source-side create-time
+ * ib_umem_get access) followed by mlx5_vfmig_bind_user_cq(), which
+ * iommu_maps each sg at the (KIND_CQ, @cqn) placeholder IOVA range.
+ *
+ * @cqn must match the source cqn the SAVE-side retag emitted. On bind
+ * failure the pinned umem is unwound via ib_umem_release(); returns the
+ * populated umem (stored by the caller in cq->buf.umem) or ERR_PTR.
+ */
+struct ib_umem *mlx5_ib_umem_restore_cq(struct mlx5_ib_dev *dev, u32 cqn,
+					unsigned long addr, size_t size)
+{
+	struct ib_umem *umem;
+	int err;
+
+	umem = ib_umem_pin(&dev->ib_dev, addr, size, IB_ACCESS_LOCAL_WRITE);
+	if (IS_ERR(umem))
+		return umem;
+
+	err = mlx5_vfmig_bind_user_cq(dev->mdev, cqn,
+				      &umem->sgt_append.sgt);
+	if (err) {
+		ib_umem_release(umem);
+		return ERR_PTR(err);
+	}
+	return umem;
+}
+
+/*
  * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
  * filled in the pas array.
  */

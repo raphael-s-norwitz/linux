@@ -3942,6 +3942,37 @@ int mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 EXPORT_SYMBOL(mlx5_vfmig_bind_user_mr);
 
 /*
+ * Public destination-side bind entry point for the mlx5_ib RESTORE_CQ
+ * verb body's CQE-ring umem. Header docstring lives in
+ * include/linux/mlx5/driver.h.
+ *
+ * Identical shape and error semantics as mlx5_vfmig_bind_user_mr modulo
+ * the kind enum. The instance_key is VFMIG_HUOBJ_KEY(KIND_CQ, cqn); the
+ * source-side retag (mlx5_vfmig_retag_user_cq, fired from
+ * mlx5_ib_create_cq post-FW-create) installed the matching placeholder
+ * in the SAVE-side IOVA domain, which LOAD_VHCA_STATE replays onto the
+ * destination ahead of this bind.
+ */
+int mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			    struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !sgt)
+		return -EINVAL;
+	if (cqn == 0 || (cqn & ~0xffffffU))
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_bind_user_object(dom, VFMIG_HUOBJ_KIND_CQ,
+					   (u64)cqn, sgt);
+}
+EXPORT_SYMBOL(mlx5_vfmig_bind_user_cq);
+
+/*
  * Public Stage-2 source-side retag entry point for the mlx5_ib user CQ
  * creation path (header docstring in include/linux/mlx5/driver.h).
  * Identical shape to mlx5_vfmig_retag_user_mr() modulo the kind: a single
