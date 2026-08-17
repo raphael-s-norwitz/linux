@@ -187,6 +187,82 @@ int mlx5_core_create_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
 }
 EXPORT_SYMBOL(mlx5_core_create_cq);
 
+/*
+ * mlx5_core_adopt_cq: register a kernel-side mlx5_core_cq against an
+ * already-FW-resident CQ. The companion to mlx5_core_create_cq for the
+ * vfmig CRIU restore path: instead of issuing FW CREATE_CQ (which would
+ * allocate a fresh cqn), the FW state is preserved across
+ * LOAD_VHCA_STATE and the kernel-side wrapper is rebuilt around the
+ * source's @cqn.
+ *
+ * This mirrors mlx5_create_cq's post-FW-command tail exactly -- comp +
+ * async EQ-tree registration is what makes the EQ ISR dispatch
+ * completion EQEs to cq->comp() rather than logging "Completion event
+ * for bogus CQ" and dropping them -- with three deliberate divergences:
+ *   - No FW CREATE_CQ command: the caller has established the cqn is
+ *     alive in destination FW post-LOAD.
+ *   - cq->arm_db is untouched: that path applies only to kernel CQs;
+ *     restore is exclusively user CQs whose arm_db lives in the
+ *     source userspace doorbell page, preserved across the umem bind.
+ *   - On EQ-add failure we roll back the comp-eq add but leave the FW
+ *     cqn alone (the source CQ is still alive and adoptable).
+ *
+ * The caller (mlx5_ib_restore_cq) must set cq->comp / cq->event /
+ * cq->tasklet_ctx.comp before calling: the comp-eq registration
+ * immediately enables EQE dispatch, and a NULL cq->comp would land on
+ * the mlx5_core_cq_dummy_cb fallback installed here for safety.
+ */
+int mlx5_core_adopt_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
+		       u32 cqn, int eqn, u16 uid)
+{
+	struct mlx5_eq_comp *eq;
+	int err;
+
+	if (cqn == 0 || (cqn & ~0xffffffU))
+		return -EINVAL;
+
+	eq = mlx5_eqn2comp_eq(dev, eqn);
+	if (IS_ERR(eq))
+		return PTR_ERR(eq);
+
+	cq->cqn = cqn;
+	cq->cons_index = 0;
+	cq->arm_sn     = 0;
+	cq->eq         = eq;
+	cq->uid        = uid;
+
+	refcount_set(&cq->refcount, 1);
+	init_completion(&cq->free);
+	if (!cq->comp)
+		cq->comp = mlx5_core_cq_dummy_cb;
+	cq->tasklet_ctx.priv = &eq->tasklet_ctx;
+	INIT_LIST_HEAD(&cq->tasklet_ctx.list);
+
+	err = mlx5_eq_add_cq(&eq->core, cq);
+	if (err)
+		return err;
+
+	err = mlx5_eq_add_cq(mlx5_get_async_eq(dev), cq);
+	if (err)
+		goto err_cq_add;
+
+	cq->pid = current->pid;
+	err = mlx5_debug_cq_add(dev, cq);
+	if (err)
+		mlx5_core_dbg(dev,
+			      "vfmig: failed adding adopted cqn 0x%x to debug fs\n",
+			      cqn);
+
+	cq->irqn = eq->core.irqn;
+
+	return 0;
+
+err_cq_add:
+	mlx5_eq_del_cq(&eq->core, cq);
+	return err;
+}
+EXPORT_SYMBOL(mlx5_core_adopt_cq);
+
 int mlx5_core_destroy_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq)
 {
 	u32 in[MLX5_ST_SZ_DW(destroy_cq_in)] = {};
