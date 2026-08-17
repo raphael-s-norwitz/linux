@@ -1101,6 +1101,23 @@ out_unlock:
 	return err;
 }
 
+/*
+ * Skeleton. The destination-side bind resolves the placeholder chain
+ * through a secondary index, validates it against @sgt and issues the
+ * iommu_maps; that logic is built out incrementally in follow-on
+ * commits. Until then the RESTORE_MR verb chain reaches this entry
+ * point and fails cleanly with -EOPNOTSUPP, so the caller's
+ * ib_umem_release() unwinds the freshly-pinned pages and the
+ * awaiting_bind placeholder is left intact for a later retry.
+ */
+int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
+				u8 kind, u64 fw_id,
+				struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+EXPORT_SYMBOL(vfmig_iova_bind_user_object);
+
 void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 {
 	unsigned int s;

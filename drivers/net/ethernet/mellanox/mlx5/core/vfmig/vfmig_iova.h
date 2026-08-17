@@ -58,6 +58,7 @@
 #include <linux/types.h>
 
 struct pci_dev;
+struct sg_table;
 struct vfmig_iova_domain;
 
 /*
@@ -413,6 +414,23 @@ int  vfmig_iova_replay_external(struct vfmig_iova_domain *dom,
 int  vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 				     dma_addr_t iova_base, size_t length,
 				     u64 new_instance_key);
+
+/*
+ * Destination-side bind: map a freshly-pinned umem @sgt onto the
+ * awaiting_bind=true placeholder chain that vfmig_iova_replay_external()
+ * installed for the (kind, fw_id) packed via VFMIG_HUOBJ_KEY. Resolves
+ * the placeholder head through the (instance_key, iova) secondary index,
+ * validates the sibling chain (all external USER_PAGE, still awaiting,
+ * iova-contiguous) and that @sgt's byte coverage equals the placeholder
+ * total, then issues one dma_iova_link per dst sg at consecutive IOVAs from
+ * the head placeholder's iova and clears awaiting_bind all-or-nothing.
+ * @kind must be a valid non-NONE VFMIG_HUOBJ_KIND. Returns 0, -ENOENT
+ * (no placeholder), -EBUSY (already bound), -EINVAL (bad args / length
+ * mismatch / mis-shaped sg), or a dma_iova_link errno (rolled back). On any
+ * non-zero return the caller MUST NOT consume sg_dma_address.
+ */
+int  vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
+				 u8 kind, u64 fw_id, struct sg_table *sgt);
 
 /*
  * Rewind every per-slot bump cursor to its slot base (and per-slot

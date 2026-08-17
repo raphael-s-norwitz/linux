@@ -3798,6 +3798,37 @@ int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_mr);
 
 /*
+ * Public destination-side bind entry point for the mlx5_ib RESTORE_MR
+ * verb body. Header docstring lives in include/linux/mlx5/driver.h.
+ *
+ * Unlike the retag family (which no-ops with 0 on a non-vfmig
+ * deployment), bind is a hard "vfmig is here, the placeholder exists,
+ * bind the umem to it" operation: the caller has already gated on
+ * vfmig_restore_mode + a tracked-VF ucontext and needs the bind to
+ * land, so a NULL vfmig_iova_dom surfaces as -ENODEV rather than a
+ * silent no-op that would leave the umem un-bound and the placeholder
+ * dangling.
+ */
+int mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			    struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !sgt)
+		return -EINVAL;
+	if (mkey_index == 0 || (mkey_index & ~0xffffffU))
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_bind_user_object(dom, VFMIG_HUOBJ_KIND_MR,
+					   (u64)mkey_index, sgt);
+}
+EXPORT_SYMBOL(mlx5_vfmig_bind_user_mr);
+
+/*
  * Public Stage-2 source-side retag entry point for the mlx5_ib user CQ
  * creation path (header docstring in include/linux/mlx5/driver.h).
  * Identical shape to mlx5_vfmig_retag_user_mr() modulo the kind: a single
