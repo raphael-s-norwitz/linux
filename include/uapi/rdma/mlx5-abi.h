@@ -232,6 +232,38 @@ struct mlx5_ib_restore_mr_req {
 	__aligned_u64 reserved2;
 };
 
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_CQ on mlx5, and
+ * the byte-equal RESP_BLOB emitted by MLX5_IB_METHOD_VFMIG_QUERY_CQ.
+ * CRIU-managed restore passes the source's FW cqn here so
+ * mlx5_ib_restore_cq() can adopt the destination-side CQ (preserved
+ * across LOAD_VHCA_STATE) into a fresh kernel-side mlx5_ib_cq without
+ * re-issuing FW CREATE_CQ.
+ *
+ * @cqn is the wire-visible identity (CQs have no lkey/rkey-style core
+ * hint; cqn is strictly mlx5-private and travels only through this
+ * UHW). @cqe_size, @buf_addr and @db_addr carry the source-side
+ * userspace state the core RESTORE_CQ attrs cannot express:
+ *   - cqe_size (64 or 128) parses the destination CQE ring;
+ *   - buf_addr binds the CQE-ring umem onto the KIND_CQ placeholder;
+ *   - db_addr binds the doorbell-page umem onto the KIND_DBR
+ *     placeholder (page-aligned by the handler; the in-page offset
+ *     survives via FW cqc.dbr_addr).
+ *
+ * NOTE on size (32 bytes): well above the 8-byte inline-UHW threshold,
+ * so the dispatcher always takes the userspace-pointer path and
+ * ib_copy_from_udata() works. Same dodge as mlx5_ib_restore_pd_req /
+ * mlx5_ib_restore_mr_req.
+ */
+struct mlx5_ib_restore_cq_req {
+	__aligned_u64 buf_addr;	/* source VA of CQE ring buffer */
+	__aligned_u64 db_addr;	/* source VA of doorbell page */
+	__u32	cqn;		/* FW cqn to adopt (24 bits significant) */
+	__u32	cqe_size;	/* 64 or 128 */
+	__u32	reserved;	/* must be 0 */
+	__u32	reserved2;	/* must be 0 */
+};
+
 struct mlx5_ib_tso_caps {
 	__u32 max_tso; /* Maximum tso payload size in bytes */
 
