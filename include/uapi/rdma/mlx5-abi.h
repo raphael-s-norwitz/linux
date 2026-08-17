@@ -204,6 +204,34 @@ struct mlx5_ib_restore_pd_req {
 	__aligned_u64 reserved2;
 };
 
+/*
+ * Driver-private UHW payload for UVERBS_METHOD_RESTORE_MR on mlx5.
+ * CRIU-managed restore passes the source's FW mkey_index here so
+ * mlx5_ib_restore_mr() can adopt the destination-side mkey (preserved
+ * across LOAD_VHCA_STATE) into a fresh kernel-side mlx5_ib_mr without
+ * re-issuing FW CREATE_MKEY. The wire-visible identity (lkey/rkey) is
+ * carried by the core UVERBS_ATTR_RESTORE_MR_LKEY_HINT / _RKEY_HINT
+ * attributes; the handler enforces mkey_index == (lkey_hint >> 8) ==
+ * (rkey_hint >> 8) as defense-in-depth against a caller that ships the
+ * source restrack id instead of the FW mkey_index (the same class of
+ * bug mlx5_ib_restore_pd's probe catches for PDs).
+ *
+ * NOTE on size (>8 bytes): same inline-UHW dodge as
+ * mlx5_ib_restore_pd_req -- two u64-equivalent payload + reserved bytes
+ * force the dispatcher onto the userspace-pointer path so
+ * ib_copy_from_udata() works, and reserve room for future per-MR
+ * DEVX-uid hints / flags.
+ */
+struct mlx5_ib_restore_mr_req {
+	__u32	mkey_index;	/* FW mkey index (24 bits significant) */
+	__u32	reserved;	/* must be 0 */
+	/*
+	 * reserved2 must be 0. It pads the struct above the inline-UHW
+	 * threshold and reserves room for future DEVX-uid / flags.
+	 */
+	__aligned_u64 reserved2;
+};
+
 struct mlx5_ib_tso_caps {
 	__u32 max_tso; /* Maximum tso payload size in bytes */
 

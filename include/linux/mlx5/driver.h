@@ -1430,6 +1430,39 @@ mlx5_vfmig_retag_user_dbr(struct mlx5_core_dev *vf_dev,
 }
 #endif
 
+/*
+ * Destination-side bind for a freshly-pinned user MR umem in the per-VF
+ * vfmig deterministic IOVA domain. The mlx5_ib RESTORE_MR verb body
+ * calls this after ib_umem_pin() to map @sgt onto the awaiting_bind
+ * placeholder that vfmig_iova_replay_external() installed at LOAD for
+ * VFMIG_HUOBJ_KEY(MR, @mkey_index), completing the source IOVA's
+ * reconstruction on the destination.
+ *
+ * @vf_dev:     this MR's mlx5_core_dev (mlx5_ib_dev->mdev).
+ * @mkey_index: FW mkey_index (== mr->mmkey.key >> 8); 24-bit, non-zero.
+ * @sgt:        umem sg_table from ib_umem_pin(); its summed sg lengths
+ *              must equal the placeholder's SAVE'd byte length.
+ *
+ * Unlike the retag family this does NOT no-op on a non-vfmig
+ * deployment: the caller has already gated on restore mode and needs
+ * the bind to land, so returns -ENODEV when no per-VF domain exists.
+ * Other errors: -EINVAL (bad args / length mismatch / mis-shaped sg),
+ * -ENOENT (no placeholder for this mkey_index), -EBUSY (already bound),
+ * or an iommu_map errno (rolled back). On any non-zero return the caller
+ * MUST NOT consume sg_dma_address and should ib_umem_release() to unwind.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			    struct sg_table *sgt);
+#else
+static inline int
+mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
+			struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 int mlx5_sriov_blocking_notifier_register(struct mlx5_core_dev *mdev,
 					  int vf_id,
 					  struct notifier_block *nb);

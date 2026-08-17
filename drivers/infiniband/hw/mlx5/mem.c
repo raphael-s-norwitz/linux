@@ -35,6 +35,44 @@
 #include "mlx5_ib.h"
 
 /*
+ * Stage-3 destination-side umem bind for a CRIU-restored user MR.
+ * Composes ib_umem_pin() -- which pins the user pages and builds the
+ * sg_append_table without dma_map_sgtable, so sg_dma_address /
+ * sg_dma_len are left unset -- with mlx5_vfmig_bind_user_mr(), which
+ * iommu_maps each sg at the placeholder IOVA range LOAD_VHCA_STATE
+ * installed for (KIND_MR, @mkey_index), populates sg_dma_address /
+ * sg_dma_len, and flips the placeholder awaiting_bind true -> false.
+ *
+ * On bind failure the pinned umem is unwound via ib_umem_release(); the
+ * vfmig unmap_sg path skips zero-iova sgs, so a partial bind (already
+ * rolled back inside mlx5_vfmig_bind_user_mr) sees no double unmap.
+ *
+ * @mkey_index must match the source mkey >> 8 the SAVE-side retag
+ * emitted as the HOST_USER_PAGE record's fw_id. Returns the populated
+ * umem (the caller stores it in mr->umem) or ERR_PTR with all resources
+ * released.
+ */
+struct ib_umem *mlx5_ib_umem_restore_mr(struct mlx5_ib_dev *dev,
+					u32 mkey_index, unsigned long addr,
+					size_t size, int access)
+{
+	struct ib_umem *umem;
+	int err;
+
+	umem = ib_umem_pin(&dev->ib_dev, addr, size, access);
+	if (IS_ERR(umem))
+		return umem;
+
+	err = mlx5_vfmig_bind_user_mr(dev->mdev, mkey_index,
+				      &umem->sgt_append.sgt);
+	if (err) {
+		ib_umem_release(umem);
+		return ERR_PTR(err);
+	}
+	return umem;
+}
+
+/*
  * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
  * filled in the pas array.
  */

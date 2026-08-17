@@ -3124,6 +3124,155 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 	return 0;
 }
 
+/*
+ * mlx5_ib_restore_mr: CRIU-managed user-MR restore via FW mkey
+ * adoption. The destination VHCA inherits the source's user-mode mkey
+ * table across LOAD_VHCA_STATE, so this builds a fresh kernel-side
+ * mlx5_ib_mr wrapping the adopted (mkey_index, pdn) pair without
+ * re-issuing FW CREATE_MKEY.
+ *
+ * The generic dispatcher has already gated on
+ * mlx5_ib_ucontext_is_restore_mode, reserved target_handle in the
+ * ufile idr, and validated that the PD belongs to this device; after
+ * we return it stamps mr->ibmr.iova / .length / .user_addr /
+ * .access_flags / .device / .pd / .type / .uobject and sets up
+ * restrack. Our job is the mlx5-private state.
+ *
+ * Wire-visible identity (lkey/rkey) comes from the caller. The mlx5
+ * invariant is lkey == rkey == (mkey_index << 8) | variant, with the
+ * 8-bit variant preserved across LOAD_VHCA_STATE; we cross-check the
+ * core lkey/rkey hints against the UHW mkey_index and reject a
+ * mismatch (defense-in-depth, mirroring mlx5_ib_restore_pd).
+ *
+ * v0 simplifications: the umem is real (pinned + iommu-bound by
+ * mlx5_ib_umem_restore_mr); adopted MRs never enter the MR cache
+ * (kzalloc leaves ibmr.frmr.pool NULL) and never run UMR/ODP.
+ */
+static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
+					u64 addr, u64 length, u64 iova,
+					int access, u32 lkey_hint,
+					u32 rkey_hint, struct ib_udata *udata)
+{
+	struct mlx5_ib_dev *dev = to_mdev(ibpd->device);
+	struct mlx5_ib_pd *mpd = to_mpd(ibpd);
+	struct mlx5_ib_restore_mr_req req = {};
+	struct mlx5_ib_ucontext *context;
+	struct mlx5_ib_mr *mr;
+	struct ib_umem *umem;
+	int err;
+
+	context = rdma_udata_to_drv_context(udata, struct mlx5_ib_ucontext,
+					    ibucontext);
+	if (!context)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * Belt & suspenders: the generic dispatcher already gated on
+	 * mlx5_ib_ucontext_is_restore_mode, but a driver-direct caller
+	 * cannot bypass the per-ucontext sticky bool here.
+	 */
+	if (!context->vfmig_restore_mode)
+		return ERR_PTR(-EPERM);
+
+	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+		return ERR_PTR(-EINVAL);
+	err = ib_copy_from_udata(&req, udata, sizeof(req));
+	if (err)
+		return ERR_PTR(err);
+	if (req.reserved || req.reserved2)
+		return ERR_PTR(-EINVAL);
+	/* FW mkey_index is a 24-bit field (PRM "create_mkey_out"). */
+	if (req.mkey_index & ~0xffffffU || req.mkey_index == 0)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * mlx5 user-MR invariant: lkey == rkey, both folding the FW
+	 * mkey_index in the upper 24 bits with an 8-bit variant nonce in
+	 * the low byte. Cross-check what CRIU shipped via the core attrs
+	 * (lkey/rkey hint) against the UHW mkey_index; a mismatch means
+	 * the caller confused the source restrack id with its FW key.
+	 */
+	if (lkey_hint != rkey_hint)
+		return ERR_PTR(-EINVAL);
+	if ((lkey_hint >> 8) != req.mkey_index)
+		return ERR_PTR(-EINVAL);
+
+	(void)iova;		/* dispatcher populates mr->ibmr.iova */
+	(void)target_handle;	/* dispatcher reserved this in the ufile idr */
+
+	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
+	if (!mr)
+		return ERR_PTR(-ENOMEM);
+
+	/*
+	 * Stage-3 destination-side umem bind: pin user pages and
+	 * iommu_map each sg at the placeholder IOVA range LOAD_VHCA_STATE
+	 * installed for (KIND_MR, mkey_index). Run before mmkey-state
+	 * population so a bind failure never leaves a half-initialised
+	 * mr->mmkey. On success the umem is owned by mr and released by
+	 * __mlx5_ib_dereg_mr's ib_umem_release(mr->umem) path.
+	 */
+	umem = mlx5_ib_umem_restore_mr(dev, req.mkey_index, addr, length,
+				       access);
+	if (IS_ERR(umem)) {
+		err = PTR_ERR(umem);
+		kfree(mr);
+		return ERR_PTR(err);
+	}
+
+	/*
+	 * Adopt the FW mkey state. No FW command is issued -- the mkey was
+	 * alive in destination FW post-LOAD. mr->mmkey.key is the full
+	 * (mkey_index << 8 | variant) key the wire sees.
+	 */
+	mr->mmkey.key = lkey_hint;
+	mr->mmkey.type = MLX5_MKEY_MR;
+	mr->mmkey.ndescs = 0;
+	init_waitqueue_head(&mr->mmkey.wait);
+	refcount_set(&mr->mmkey.usecount, 0);
+	/*
+	 * An adopted MR must never be recycled through the MR cache. In
+	 * this kernel that cache is the rdma-core frmr pool, keyed off
+	 * mr->ibmr.frmr.pool (see mlx5r_handle_mkey_cleanup); the kzalloc
+	 * above leaves it NULL, so the restored MR is destroyed outright
+	 * on dereg rather than pushed back to a pool. No explicit
+	 * "uncacheable" mkey flag exists here (the old
+	 * mmkey.cache_ent/cacheable fields are gone).
+	 */
+
+	mr->umem = umem;
+	mr->access_flags = access;
+	/*
+	 * The adopted FW mkey carries its own mkc.log_page_size from the
+	 * source CREATE_MKEY (preserved across LOAD); the kernel-side
+	 * mr->page_shift is only consulted by UMR descriptor generation,
+	 * which adopted MRs never run. PAGE_SHIFT is safe.
+	 */
+	mr->page_shift = PAGE_SHIFT;
+
+	/*
+	 * Wire-visible identity, echoed back to userspace by the
+	 * dispatcher via RESP_LKEY / RESP_RKEY.
+	 */
+	mr->ibmr.lkey = lkey_hint;
+	mr->ibmr.rkey = rkey_hint;
+
+	/*
+	 * reg_pages accounting parity with create_real_mr et al: every
+	 * caller that assigns a non-NULL mr->umem bumps reg_pages by
+	 * ib_umem_num_pages() so the symmetric atomic_sub() in
+	 * __mlx5_ib_dereg_mr does not underflow.
+	 */
+	atomic_add(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
+
+	mlx5_ib_dbg(dev,
+		    "vfmig: restore_mr mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x umem_npages=%zu\n",
+		    req.mkey_index, lkey_hint, mpd->pdn, mpd->uid,
+		    target_handle, ib_umem_num_pages(umem));
+
+	return &mr->ibmr;
+}
+
 static int mlx5_ib_mcg_attach(struct ib_qp *ibqp, union ib_gid *gid, u16 lid)
 {
 	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
@@ -5011,6 +5160,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.req_notify_cq = mlx5_ib_arm_cq,
 	.rereg_user_mr = mlx5_ib_rereg_user_mr,
 	.resize_user_cq = mlx5_ib_resize_cq,
+	.restore_mr = mlx5_ib_restore_mr,
 	.restore_pd = mlx5_ib_restore_pd,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
 	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
