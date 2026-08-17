@@ -3157,6 +3157,7 @@ static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	struct mlx5_ib_restore_cq_req req = {};
 	struct mlx5_ib_ucontext *context;
 	struct ib_umem *umem;
+	int eqn;
 	int err;
 
 	context = rdma_udata_to_drv_context(udata, struct mlx5_ib_ucontext,
@@ -3223,6 +3224,10 @@ static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	 */
 	mlx5_ib_set_user_cq_callbacks(cq);
 
+	err = mlx5_comp_eqn_get(dev->mdev, attr->comp_vector, &eqn);
+	if (err)
+		return err;
+
 	/*
 	 * Stage-3 destination-side CQE-ring umem bind: pin attr->cqe *
 	 * cqe_size bytes (== the source's pre-SAVE umem length) and
@@ -3245,11 +3250,17 @@ static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 		goto err_buf;
 
 	/*
-	 * FW cqn adoption is added in the follow-on commit; until then
-	 * unwind both binds and report -EOPNOTSUPP.
+	 * Adopt the FW CQ state. No FW command is issued -- the cqn was
+	 * alive in destination FW post-LOAD. This registers the kernel-side
+	 * mlx5_core_cq with the comp + async eq trees so EQE dispatch and
+	 * ARM doorbells route through cq->mcq.
 	 */
-	err = -EOPNOTSUPP;
-	goto err_db;
+	err = mlx5_core_adopt_cq(dev->mdev, &cq->mcq, req.cqn, eqn,
+				 context->devx_uid);
+	if (err)
+		goto err_db;
+
+	return 0;
 
 err_db:
 	mlx5_ib_db_unmap_user(context, &cq->db);
