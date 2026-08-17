@@ -3125,6 +3125,104 @@ static int mlx5_ib_restore_pd(struct ib_pd *ibpd, u32 target_handle,
 }
 
 /*
+ * mlx5_ib_restore_cq: CRIU-managed CQ restore via FW cqn adoption. The
+ * destination VHCA inherits the source's user-mode CQ context across
+ * LOAD_VHCA_STATE; this builds a fresh kernel-side mlx5_ib_cq wrapping
+ * the adopted (cqn, cqc) state without re-issuing FW CREATE_CQ.
+ *
+ * The generic dispatcher has already gated on
+ * mlx5_ib_ucontext_is_restore_mode, reserved target_handle in the ufile
+ * idr, populated cq->ibcq.{device, uobject, comp/event handlers},
+ * rejected attr->comp_vector >= num_comp_vectors and unsupported flags,
+ * and rejected a comp-channel (deferred). After we return it commits the
+ * uobject and echoes cq->cqe back via RESP_CQE.
+ *
+ * Unlike RESTORE_MR there is no core "cqn hint" to cross-check: CQs have
+ * no lkey/rkey-style identity, so cqn travels only through the @udata
+ * UHW (mlx5_ib_restore_cq_req). We enforce the FW resource-id range
+ * (non-zero, 24-bit) and cqe_size in {64, 128}.
+ *
+ * v0: cq->buf.umem is pinned + iommu-bound by mlx5_ib_umem_restore_cq;
+ * cq->db is bound by mlx5_ib_db_map_user_restore; resize / cqe_comp /
+ * CQE_128_PAD adoption is deferred (the adopted cqc already carries the
+ * FW-side bits, honoured by the data path regardless of the kernel-side
+ * cq->private_flags we never consult on adopted CQs).
+ */
+static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
+			      const struct ib_cq_init_attr *attr,
+			      struct ib_udata *udata)
+{
+	struct mlx5_ib_cq *cq = to_mcq(ibcq);
+	struct mlx5_ib_restore_cq_req req = {};
+	struct mlx5_ib_ucontext *context;
+	int err;
+
+	context = rdma_udata_to_drv_context(udata, struct mlx5_ib_ucontext,
+					    ibucontext);
+	if (!context)
+		return -EINVAL;
+
+	/*
+	 * Belt & suspenders: the generic dispatcher already gated on
+	 * mlx5_ib_ucontext_is_restore_mode, but a driver-direct caller
+	 * cannot bypass the per-ucontext sticky bool here.
+	 */
+	if (!context->vfmig_restore_mode)
+		return -EPERM;
+
+	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+		return -EINVAL;
+	err = ib_copy_from_udata(&req, udata, sizeof(req));
+	if (err)
+		return err;
+	if (req.reserved || req.reserved2)
+		return -EINVAL;
+	/* FW cqn is a 24-bit field (PRM "create_cq_out"); 0 is reserved. */
+	if (req.cqn == 0 || (req.cqn & ~0xffffffU))
+		return -EINVAL;
+	if (req.cqe_size != 64 && req.cqe_size != 128)
+		return -EINVAL;
+	if (attr->cqe < 0)
+		return -EINVAL;
+	if (attr->flags & ~(IB_UVERBS_CQ_FLAGS_TIMESTAMP_COMPLETION |
+			    IB_UVERBS_CQ_FLAGS_IGNORE_OVERRUN))
+		return -EOPNOTSUPP;
+
+	(void)target_handle;	/* dispatcher reserved this in the ufile idr */
+
+	/* Mirror mlx5_ib_create_cq's early kernel-side init. */
+	cq->ibcq.cqe = attr->cqe;
+	mutex_init(&cq->resize_mutex);
+	spin_lock_init(&cq->lock);
+	cq->resize_buf = NULL;
+	cq->resize_umem = NULL;
+	INIT_LIST_HEAD(&cq->list_send_qp);
+	INIT_LIST_HEAD(&cq->list_recv_qp);
+	INIT_LIST_HEAD(&cq->wc_list);
+	cq->cqe_size = req.cqe_size;
+	/*
+	 * This kernel has no mlx5_ib_cq.create_flags field; the raw IB
+	 * create flags are folded into cq->private_flags. Mirror
+	 * mlx5_ib_create_cq's translation. IGNORE_OVERRUN is applied to the
+	 * FW cqc at source-create time and inherited via the adopted cqn,
+	 * so only the TIMESTAMP_COMPLETION software bit is re-latched here.
+	 */
+	cq->private_flags = 0;
+	if (attr->flags & IB_UVERBS_CQ_FLAGS_TIMESTAMP_COMPLETION)
+		cq->private_flags |= MLX5_IB_CQ_PR_TIMESTAMP_COMPLETION;
+	cq->mcq.cqe_sz = cqe_sz_to_mlx_sz(cq->cqe_size, 0);
+	cq->mcq.vector = attr->comp_vector;
+
+	/*
+	 * The completion-callback wiring, CQE-ring and doorbell umem binds,
+	 * and FW cqn adoption are added incrementally in follow-on commits.
+	 * Until then the verb validates its inputs and reports -EOPNOTSUPP,
+	 * so the RESTORE_CQ path is reachable end-to-end from here.
+	 */
+	return -EOPNOTSUPP;
+}
+
+/*
  * mlx5_ib_restore_mr: CRIU-managed user-MR restore via FW mkey
  * adoption. The destination VHCA inherits the source's user-mode mkey
  * table across LOAD_VHCA_STATE, so this builds a fresh kernel-side
@@ -5180,6 +5278,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.req_notify_cq = mlx5_ib_arm_cq,
 	.rereg_user_mr = mlx5_ib_rereg_user_mr,
 	.resize_user_cq = mlx5_ib_resize_cq,
+	.restore_cq = mlx5_ib_restore_cq,
 	.restore_mr = mlx5_ib_restore_mr,
 	.restore_pd = mlx5_ib_restore_pd,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
