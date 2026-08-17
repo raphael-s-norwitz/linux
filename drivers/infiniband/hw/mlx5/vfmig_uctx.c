@@ -684,13 +684,125 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(u32),
 			    UA_MANDATORY));
 
+/*
+ * MLX5_IB_METHOD_VFMIG_QUERY_CQ -- emit, for the CQ resolved through
+ * UVERBS_OBJECT_CQ on the calling fd's ufile, the bytes a CRIU plugin
+ * needs to drive UVERBS_METHOD_RESTORE_CQ on the destination side.
+ *
+ * Four-part output:
+ *   RESP_BLOB         struct mlx5_ib_restore_cq_req, byte-equal to
+ *                     what RESTORE_CQ's UHW will consume. The handler
+ *                     leaves req.reserved / req.reserved2 zero so the
+ *                     restore path's "must be 0" checks pass round-trip.
+ *   RESP_CQE          ibcq->cqe, the ring-size-minus-one in verbs
+ *                     convention. Goes into UVERBS_ATTR_RESTORE_CQ_CQE.
+ *   RESP_COMP_VECTOR  mcq->mcq.vector, the source's comp_vector index.
+ *   RESP_FLAGS        cq->create_flags (the IB_UVERBS_CQ_FLAGS_* bits
+ *                     the source-side CREATE_CQ recorded).
+ *
+ * Precondition: the CQ must be a user-mode CQ. Kernel-mode CQs
+ * (mcq->buf.umem == NULL, mcq->db.u.pgdir != NULL) reject with -ENXIO --
+ * there are no source userspace VAs to emit.
+ *
+ * The IDR lookup for HANDLE goes through the calling fd's ufile and
+ * grabs UVERBS_ACCESS_READ on the CQ uobject for the duration of the
+ * call, so a concurrent DESTROY_CQ on the same fd cannot race.
+ */
+static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_CQ)(struct uverbs_attr_bundle *attrs)
+{
+	struct ib_cq *ibcq = uverbs_attr_get_obj(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE);
+	struct mlx5_ib_restore_cq_req blob = {};
+	struct mlx5_ib_cq *mcq;
+	u32 cqe;
+	u32 comp_vector;
+	u32 flags;
+	int err;
+
+	if (IS_ERR(ibcq))
+		return PTR_ERR(ibcq);
+
+	mcq = to_mcq(ibcq);
+
+	/*
+	 * Reject kernel-mode CQs: no source userspace state to emit.
+	 * mcq->buf.umem is NULL iff the CQ took the create_cq_kernel path;
+	 * mlx5_ib_db_user_virt returns 0 iff db->u is the pgdir (kernel)
+	 * branch of the union.
+	 */
+	if (!mcq->buf.umem || mlx5_ib_db_user_virt(&mcq->db) == 0)
+		return -ENXIO;
+
+	/*
+	 * Fields that round-trip into mlx5_ib_restore_cq_req: cqn is the
+	 * 24-bit FW resource id; cqe_size (64 or 128) is what RESTORE_CQ
+	 * gates on; buf_addr is the source CQE-ring userspace VA set by
+	 * ib_umem_get at create time; db_addr is the page-aligned doorbell
+	 * user-virt mlx5_ib_db_map_user dedup-keyed on (the in-page offset
+	 * survives via FW cqc.dbr_addr).
+	 */
+	blob.cqn = mcq->mcq.cqn;
+	blob.cqe_size = mcq->cqe_size;
+	blob.buf_addr = mcq->buf.umem->address;
+	blob.db_addr = mlx5_ib_db_user_virt(&mcq->db);
+
+	cqe = ibcq->cqe;
+	comp_vector = mcq->mcq.vector;
+	/*
+	 * This kernel has no mlx5_ib_cq.create_flags; the raw IB create
+	 * flags are folded into mcq->private_flags. Reconstruct the subset
+	 * RESTORE_CQ consumes. Only TIMESTAMP_COMPLETION is a software bit
+	 * held here; IGNORE_OVERRUN lives in the FW cqc and is inherited by
+	 * the adopted cqn across LOAD, so it need not round-trip.
+	 */
+	flags = 0;
+	if (mcq->private_flags & MLX5_IB_CQ_PR_TIMESTAMP_COMPLETION)
+		flags |= IB_UVERBS_CQ_FLAGS_TIMESTAMP_COMPLETION;
+
+	err = uverbs_copy_to(attrs, MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+			     &blob, sizeof(blob));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs, MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE,
+			     &cqe, sizeof(cqe));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs,
+			     MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR,
+			     &comp_vector, sizeof(comp_vector));
+	if (err)
+		return err;
+	return uverbs_copy_to(attrs, MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,
+			      &flags, sizeof(flags));
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	MLX5_IB_METHOD_VFMIG_QUERY_CQ,
+	UVERBS_ATTR_IDR(MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE,
+			UVERBS_OBJECT_CQ,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+			    UVERBS_ATTR_TYPE(struct mlx5_ib_restore_cq_req),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	MLX5_IB_OBJECT_VFMIG,
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_UCONTEXT),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS),
-	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_PD));
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_PD),
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_CQ));
 
 const struct uapi_definition mlx5_ib_vfmig_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(MLX5_IB_OBJECT_VFMIG),

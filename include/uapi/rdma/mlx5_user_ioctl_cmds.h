@@ -409,6 +409,19 @@ enum mlx5_ib_vfmig_methods {
 	 * CAP_NET_ADMIN / cross-netns NLDEV dependency.
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_PD,
+	/*
+	 * QUERY_CQ: dump-side counterpart to UVERBS_METHOD_RESTORE_CQ.
+	 * Emit, for the user CQ resolved through UVERBS_OBJECT_CQ on the
+	 * calling fd's ufile, the bytes a CRIU plugin needs to drive
+	 * RESTORE_CQ on the destination: a struct mlx5_ib_restore_cq_req
+	 * RESP_BLOB (byte-equal to the restore UHW) plus the cqe /
+	 * comp_vector / create_flags the restore verb takes as core
+	 * attrs. The kernel knows every field trivially; libmlx5 cannot
+	 * derive the source CQE-ring / doorbell VAs in CRIU's address
+	 * space, which is why the kernel emits them here. Kernel-mode CQs
+	 * (no source userspace VAs) reject with -ENXIO.
+	 */
+	MLX5_IB_METHOD_VFMIG_QUERY_CQ,
 };
 
 /*
@@ -522,6 +535,36 @@ enum mlx5_ib_vfmig_query_pd_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_PD_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
 	MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_BLOB,
 	MLX5_IB_ATTR_VFMIG_QUERY_PD_RESP_UID,
+};
+
+/*
+ * Attrs for MLX5_IB_METHOD_VFMIG_QUERY_CQ.
+ *
+ * The HANDLE is resolved via UVERBS_ATTR_IDR(UVERBS_OBJECT_CQ,
+ * UVERBS_ACCESS_READ): the calling fd's ufile-idr must own this CQ.
+ * The four RESP_* outs together provide everything RESTORE_CQ consumes
+ * for a user-mode mlx5 CQ:
+ *
+ *   RESP_BLOB         struct mlx5_ib_restore_cq_req, byte-equal to the
+ *                     RESTORE_CQ UHW tail. Carries cqn, cqe_size,
+ *                     buf_addr, db_addr; the handler leaves reserved /
+ *                     reserved2 zero so the restore "must be 0" checks
+ *                     pass round-trip.
+ *   RESP_CQE          __u32, the source's ibcq->cqe (entries-1 in the
+ *                     verbs convention). Goes into RESTORE_CQ's CQE.
+ *   RESP_COMP_VECTOR  __u32, the source's mcq->mcq.vector.
+ *   RESP_FLAGS        __u32, the source's cq->create_flags (subset of
+ *                     IB_UVERBS_CQ_FLAGS_*).
+ *
+ * All four outs are MANDATORY: a CRIU plugin that ignores any of them
+ * at dump time will produce an unrestorable image.
+ */
+enum mlx5_ib_vfmig_query_cq_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_BLOB,
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE,
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR,
+	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,
 };
 
 /*
