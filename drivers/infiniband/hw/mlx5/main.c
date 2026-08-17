@@ -3152,9 +3152,11 @@ static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 			      const struct ib_cq_init_attr *attr,
 			      struct ib_udata *udata)
 {
+	struct mlx5_ib_dev *dev = to_mdev(ibcq->device);
 	struct mlx5_ib_cq *cq = to_mcq(ibcq);
 	struct mlx5_ib_restore_cq_req req = {};
 	struct mlx5_ib_ucontext *context;
+	struct ib_umem *umem;
 	int err;
 
 	context = rdma_udata_to_drv_context(udata, struct mlx5_ib_ucontext,
@@ -3222,9 +3224,24 @@ static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	mlx5_ib_set_user_cq_callbacks(cq);
 
 	/*
-	 * The CQE-ring and doorbell umem binds and FW cqn adoption are
-	 * added in follow-on commits; until then report -EOPNOTSUPP.
+	 * Stage-3 destination-side CQE-ring umem bind: pin attr->cqe *
+	 * cqe_size bytes (== the source's pre-SAVE umem length) and
+	 * iommu_map each sg at the (KIND_CQ, cqn) placeholder IOVA range
+	 * LOAD_VHCA_STATE installed. Failure unwinds internally.
 	 */
+	umem = mlx5_ib_umem_restore_cq(dev, req.cqn, req.buf_addr,
+				       (size_t)attr->cqe * req.cqe_size);
+	if (IS_ERR(umem))
+		return PTR_ERR(umem);
+	cq->buf.umem = umem;
+
+	/*
+	 * The doorbell umem bind and FW cqn adoption are added in follow-on
+	 * commits; until then unwind the CQE-ring bind and report
+	 * -EOPNOTSUPP.
+	 */
+	ib_umem_release(cq->buf.umem);
+	cq->buf.umem = NULL;
 	return -EOPNOTSUPP;
 }
 

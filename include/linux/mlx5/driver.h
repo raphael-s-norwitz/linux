@@ -1499,6 +1499,29 @@ mlx5_vfmig_bind_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 }
 #endif
 
+/*
+ * Destination-side bind for a freshly-pinned user CQ CQE-ring umem in
+ * the per-VF vfmig deterministic IOVA domain. The mlx5_ib RESTORE_CQ
+ * verb body calls this (via mlx5_ib_umem_restore_cq) after ib_umem_pin()
+ * to map @sgt onto the awaiting_bind placeholder LOAD installed for
+ * VFMIG_HUOBJ_KEY(CQ, @cqn).
+ *
+ * @cqn: FW cqn of the adopted CQ; 24-bit, non-zero. Same error contract
+ * as mlx5_vfmig_bind_user_mr (no non-vfmig no-op; -ENODEV when no per-VF
+ * domain exists).
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			    struct sg_table *sgt);
+#else
+static inline int
+mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
+			struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 int mlx5_sriov_blocking_notifier_register(struct mlx5_core_dev *mdev,
 					  int vf_id,
 					  struct notifier_block *nb);
