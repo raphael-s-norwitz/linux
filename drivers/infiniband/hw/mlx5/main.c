@@ -3236,13 +3236,27 @@ static int mlx5_ib_restore_cq(struct ib_cq *ibcq, u32 target_handle,
 	cq->buf.umem = umem;
 
 	/*
-	 * The doorbell umem bind and FW cqn adoption are added in follow-on
-	 * commits; until then unwind the CQE-ring bind and report
-	 * -EOPNOTSUPP.
+	 * Stage-3 destination-side DBR-page umem bind (or refcount-up if a
+	 * previously-restored uobject in this ucontext already bound the
+	 * same page). Populates cq->db.{u.user_page, dma}.
 	 */
+	err = mlx5_ib_db_map_user_restore(context, req.db_addr, &cq->db);
+	if (err)
+		goto err_buf;
+
+	/*
+	 * FW cqn adoption is added in the follow-on commit; until then
+	 * unwind both binds and report -EOPNOTSUPP.
+	 */
+	err = -EOPNOTSUPP;
+	goto err_db;
+
+err_db:
+	mlx5_ib_db_unmap_user(context, &cq->db);
+err_buf:
 	ib_umem_release(cq->buf.umem);
 	cq->buf.umem = NULL;
-	return -EOPNOTSUPP;
+	return err;
 }
 
 /*

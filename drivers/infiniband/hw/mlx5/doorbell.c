@@ -225,3 +225,87 @@ u64 mlx5_ib_db_user_virt(const struct mlx5_db *db)
 		return 0;
 	return (u64)page->desc.addr;
 }
+
+/*
+ * Restore-time variant of mlx5_ib_db_map_user. The fast-path (a
+ * previously-restored uobject in the same ucontext already pinned this
+ * DBR page) is identical to mlx5_ib_db_map_user: refcount up and reuse
+ * db->u.user_page / db->dma. The miss-path differs in two ways:
+ *
+ *   1. ib_umem_pin() (no DMA mapping) instead of ib_umem_get(): at
+ *      restore time the IOVA must match what LOAD_VHCA_STATE installed
+ *      for the placeholder, which mlx5_vfmig_bind_user_dbr applies
+ *      synchronously (same asymmetry as mlx5_ib_umem_restore_mr vs the
+ *      create-time mlx5_ib_reg_user_mr).
+ *   2. mlx5_vfmig_bind_user_dbr() instead of relying on
+ *      mlx5_ib_db_map_user's source-side retag. It consumes the
+ *      awaiting_bind placeholder LOAD replayed for
+ *      VFMIG_HUOBJ_KEY(DBR, virt & PAGE_MASK) -- the key the SAVE-side
+ *      mlx5_vfmig_retag_user_dbr emitted.
+ *
+ * The bind is a hard prerequisite for FW data-path use of the doorbell
+ * (the FW writes doorbell records via the IOVA in cqc.dbr_addr /
+ * qpc.dbr_umem_id), so bind failure propagates to the verb body and
+ * aborts the restore. The resulting db is matched 1-to-1 by the
+ * standard mlx5_ib_db_unmap_user (no parallel restore variant needed).
+ */
+int mlx5_ib_db_map_user_restore(struct mlx5_ib_ucontext *context,
+				unsigned long virt, struct mlx5_db *db)
+{
+	struct ib_uverbs_buffer_desc desc = {
+		.type = IB_UVERBS_BUFFER_TYPE_VA,
+		.addr = virt & PAGE_MASK,
+		.length = PAGE_SIZE,
+	};
+	struct mlx5_ib_dev *dev = to_mdev(context->ibucontext.device);
+	struct mlx5_ib_user_db_page *page;
+	int err = 0;
+
+	mutex_lock(&context->db_page_mutex);
+
+	list_for_each_entry(page, &context->db_page_list, list)
+		if (current->mm == page->mm &&
+		    page->desc.type == IB_UVERBS_BUFFER_TYPE_VA &&
+		    page->desc.addr == (virt & PAGE_MASK))
+			goto found;
+
+	page = kzalloc(sizeof(*page), GFP_KERNEL);
+	if (!page) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	page->desc   = desc;
+	page->refcnt = 0;
+	page->umem = ib_umem_pin(context->ibucontext.device, virt & PAGE_MASK,
+				 PAGE_SIZE, 0);
+	if (IS_ERR(page->umem)) {
+		err = PTR_ERR(page->umem);
+		kfree(page);
+		goto out;
+	}
+
+	err = mlx5_vfmig_bind_user_dbr(dev->mdev, page->desc.addr,
+				       &page->umem->sgt_append.sgt);
+	if (err) {
+		ib_umem_release(page->umem);
+		kfree(page);
+		goto out;
+	}
+
+	mmgrab(current->mm);
+	page->mm = current->mm;
+
+	list_add(&page->list, &context->db_page_list);
+
+found:
+	db->dma = sg_dma_address(page->umem->sgt_append.sgt.sgl) +
+		  (virt & ~PAGE_MASK);
+	db->u.user_page = page;
+	++page->refcnt;
+
+out:
+	mutex_unlock(&context->db_page_mutex);
+
+	return err;
+}
