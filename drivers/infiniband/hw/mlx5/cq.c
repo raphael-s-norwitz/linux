@@ -996,6 +996,15 @@ int mlx5_ib_create_user_cq(struct ib_cq *ibcq,
 
 	cq->cqe_size = cqe_size;
 
+	/*
+	 * Mirror the resolved comp_vector onto cq->mcq.vector. The core
+	 * only stashes it here for kernel CQs; for user CQs it is otherwise
+	 * left zero. MLX5_IB_METHOD_VFMIG_QUERY_CQ reports it verbatim so a
+	 * restored CQ lands on the same completion EQ, so keep it populated
+	 * on every create path.
+	 */
+	cq->mcq.vector = vector;
+
 	cqc = MLX5_ADDR_OF(create_cq_in, cqb, cq_context);
 	MLX5_SET(cqc, cqc, cqe_sz,
 		 cqe_sz_to_mlx_sz(cqe_size,
