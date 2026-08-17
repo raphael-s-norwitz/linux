@@ -21,6 +21,7 @@
 #include <linux/mm.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/rbtree.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -79,6 +80,18 @@ struct vfmig_iova_page {
 	 * external entry.
 	 */
 	bool		 awaiting_bind;
+
+	/*
+	 * @user_index_node: link in dom->user_index, the (instance_key,
+	 * iova) secondary index. Populated only for external entries whose
+	 * @instance_key has a non-NONE kind byte (source-side retagged or
+	 * LOAD-side placeholders); RB_CLEAR_NODE for every other entry so
+	 * destroy_page_locked can tell membership via RB_EMPTY_NODE. The
+	 * index lets a later slice's restore path resolve a verb-supplied
+	 * (kind, fw_id) to its placeholder sibling chain in O(log n)
+	 * instead of walking the whole iova-sorted dom->pages.
+	 */
+	struct rb_node	 user_index_node;
 };
 
 /*
@@ -115,6 +128,15 @@ struct vfmig_iova_domain {
 
 	struct list_head     pages;	/* of vfmig_iova_page, sorted */
 	unsigned int	     n_pages;
+
+	/*
+	 * @user_index: (instance_key, iova) secondary index over the
+	 * subset of @pages carrying a non-NONE kind byte. Lets a later
+	 * restore-side bind path map a verb-supplied (kind, fw_id) to its
+	 * placeholder sibling chain without walking the whole iova-sorted
+	 * @pages list.
+	 */
+	struct rb_root	     user_index;
 
 	/*
 	 * Host-page replay accounting (LOAD/destination side).
@@ -284,6 +306,7 @@ vfmig_iova_install_page_locked(struct vfmig_iova_domain *dom,
 	p = kzalloc(sizeof(*p), gfp);
 	if (!p)
 		return -ENOMEM;
+	RB_CLEAR_NODE(&p->user_index_node);
 
 	order = get_order(len);
 	p->page = alloc_pages(gfp | __GFP_ZERO, order);
@@ -367,6 +390,7 @@ vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
 	p = kzalloc(sizeof(*p), gfp);
 	if (!p)
 		return -ENOMEM;
+	RB_CLEAR_NODE(&p->user_index_node);
 
 	p->page		= NULL;
 	p->vaddr	= NULL;
@@ -413,6 +437,8 @@ static void
 vfmig_iova_destroy_page_locked(struct vfmig_iova_domain *dom,
 			       struct vfmig_iova_page *p, bool unmap)
 {
+	if (!RB_EMPTY_NODE(&p->user_index_node))
+		rb_erase(&p->user_index_node, &dom->user_index);
 	if (unmap)
 		dma_iova_unlink(vfmig_dom_dev(dom), &dom->arena,
 				vfmig_arena_off(dom, p->iova), p->len,
@@ -480,6 +506,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 
 	mutex_init(&dom->lock);
 	INIT_LIST_HEAD(&dom->pages);
+	dom->user_index = RB_ROOT;
 	dom->vf_id = vf_id;
 	dom->base  = base;
 
@@ -915,6 +942,48 @@ out_unlock:
 	return err;
 }
 
+/* -------- (instance_key, iova) secondary index ------------------------- */
+
+/*
+ * dom->lock held. Insert @new into dom->user_index, keyed by the
+ * composite (instance_key, iova). A multi-page user object installs one
+ * sibling entry per source-side sg -- all sharing @instance_key but at
+ * distinct iovas -- so the iova tie-breaker keeps them from colliding.
+ * Returns -EEXIST on a truly-duplicate (instance_key, iova) pair (a
+ * kernel-state bug), else 0.
+ *
+ * Pre-condition: VFMIG_HUOBJ_KIND(@new->instance_key) != KIND_NONE
+ * (auto-numbered entries don't go in the tree). The caller is
+ * responsible for also linking @new in dom->pages.
+ */
+static int
+vfmig_iova_user_index_insert_locked(struct vfmig_iova_domain *dom,
+				    struct vfmig_iova_page *new)
+{
+	struct rb_node **link = &dom->user_index.rb_node;
+	struct rb_node *parent = NULL;
+	struct vfmig_iova_page *p;
+
+	while (*link) {
+		parent = *link;
+		p = rb_entry(parent, struct vfmig_iova_page,
+			     user_index_node);
+		if (new->instance_key < p->instance_key)
+			link = &parent->rb_left;
+		else if (new->instance_key > p->instance_key)
+			link = &parent->rb_right;
+		else if (new->iova < p->iova)
+			link = &parent->rb_left;
+		else if (new->iova > p->iova)
+			link = &parent->rb_right;
+		else
+			return -EEXIST;
+	}
+	rb_link_node(&new->user_index_node, parent, link);
+	rb_insert_color(&new->user_index_node, &dom->user_index);
+	return 0;
+}
+
 /*
  * Install a LOAD-side awaiting-bind placeholder: an external USER_PAGE
  * registry entry that reserves the wire-provided [iova, iova+len) window
@@ -933,6 +1002,7 @@ vfmig_iova_install_external_placeholder_locked(struct vfmig_iova_domain *dom,
 					       struct vfmig_iova_page **out_p)
 {
 	struct vfmig_iova_page *p;
+	int err;
 
 	if (!IS_ALIGNED(iova, VFMIG_IOVA_GRANULE) ||
 	    !IS_ALIGNED(len, VFMIG_IOVA_GRANULE) ||
@@ -960,6 +1030,13 @@ vfmig_iova_install_external_placeholder_locked(struct vfmig_iova_domain *dom,
 	p->instance_key	 = instance_key;
 	p->external	 = true;
 	p->awaiting_bind = true;
+	RB_CLEAR_NODE(&p->user_index_node);
+
+	err = vfmig_iova_user_index_insert_locked(dom, p);
+	if (err) {
+		kfree(p);
+		return err;
+	}
 
 	vfmig_iova_insert_locked(dom, p);
 	*out_p = p;
@@ -1061,7 +1138,19 @@ int vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 			err = -EEXIST;
 			break;
 		}
+		/*
+		 * Auto-numbered (kind == NONE) entry: claim the key and
+		 * add it to the (instance_key, iova) secondary index. With
+		 * the composite ordering this only fails on a duplicate
+		 * (key, iova) pair (a kernel-state bug); either way the
+		 * key write is reverted and the whole call rolls back.
+		 */
 		p->instance_key = new_instance_key;
+		err = vfmig_iova_user_index_insert_locked(dom, p);
+		if (err) {
+			p->instance_key = 0;
+			break;
+		}
 		retagged++;
 	}
 
@@ -1069,7 +1158,8 @@ int vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 		/*
 		 * Revert every entry we retagged in this call -- the only
 		 * entries in [base, limit) whose key now equals
-		 * @new_instance_key -- back to the auto-numbered sentinel.
+		 * @new_instance_key -- back to the auto-numbered sentinel,
+		 * removing each from the secondary index as we go.
 		 */
 		list_for_each_entry(p, &dom->pages, node) {
 			u64 p_end = p->iova + p->len;
@@ -1082,6 +1172,11 @@ int vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 				continue;
 			if (p->instance_key != new_instance_key)
 				continue;
+			if (!RB_EMPTY_NODE(&p->user_index_node)) {
+				rb_erase(&p->user_index_node,
+					 &dom->user_index);
+				RB_CLEAR_NODE(&p->user_index_node);
+			}
 			p->instance_key = 0;
 		}
 		goto out_unlock;
