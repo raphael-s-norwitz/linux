@@ -3271,6 +3271,164 @@ err_buf:
 }
 
 /*
+ * mlx5_ib_restore_qp: CRIU-managed user-QP restore. The destination
+ * VHCA inherits the source's QPC (PSNs, AV, MTU, retry, uar_page)
+ * byte-equal across LOAD_VHCA_STATE, so this builds a fresh kernel-side
+ * mlx5_ib_qp wrapping the adopted qpn without re-issuing FW CREATE_QP.
+ * The UHW (struct mlx5_ib_restore_qp_req) carries only the userspace-
+ * side identity the QPC cannot re-derive: the WQ-ring / doorbell source
+ * VAs and the WQ sizing.
+ *
+ * The generic dispatcher has already gated on
+ * mlx5_ib_ucontext_is_restore_mode, reserved target_handle in the ufile
+ * idr, resolved the PD / send_cq / recv_cq handles, and will stamp the
+ * ib_qp core fields and restrack after we return.
+ *
+ * v0: RC + UD user QPs only. This skeleton validates the request and
+ * initializes the kernel mlx5_ib_qp; FW adoption, callback wiring, umem
+ * / doorbell bind, and dev-list registration arrive in following
+ * patches, so it returns -EOPNOTSUPP until the QP can be made functional.
+ */
+static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
+			      const struct ib_qp_cap *cap,
+			      enum ib_qp_state qp_state,
+			      u32 create_flags,
+			      struct ib_udata *udata)
+{
+	struct mlx5_ib_qp *qp = to_mqp(ibqp);
+	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
+		udata, struct mlx5_ib_ucontext, ibucontext);
+	struct mlx5_ib_qp_base *base = &qp->trans_qp.base;
+	struct mlx5_ib_restore_qp_req req = {};
+	size_t buf_size;
+	int err;
+
+	if (!context)
+		return -EINVAL;
+
+	/*
+	 * Belt & suspenders: the generic dispatcher already gated on
+	 * mlx5_ib_ucontext_is_restore_mode, but a driver-direct caller
+	 * cannot bypass the per-ucontext sticky bool here.
+	 */
+	if (!context->vfmig_restore_mode)
+		return -EPERM;
+
+	/*
+	 * v0: RC + UD only. UC's mlx5_ib representation also lives in
+	 * trans_qp but is parked at the dispatcher gate; raw_packet, XRC,
+	 * GSI, DCT/DCI are dispatcher-rejected anyway. Guard here too
+	 * because driver-direct callers can supply any type.
+	 */
+	switch (ibqp->qp_type) {
+	case IB_QPT_RC:
+	case IB_QPT_UD:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	if (udata->inlen < sizeof(req) || udata->outlen != 0)
+		return -EINVAL;
+	err = ib_copy_from_udata(&req, udata, sizeof(req));
+	if (err)
+		return err;
+	if (req.reserved || req.reserved2)
+		return -EINVAL;
+	/* v0 has no RAW_PACKET split SQ; QUERY_QP always emits 0. */
+	if (req.sq_buf_addr)
+		return -EINVAL;
+	/* FW qpn is a 24-bit field (PRM "create_qp_out"); 0 reserved. */
+	if (req.qpn == 0 || (req.qpn & ~0xffffffU))
+		return -EINVAL;
+	if (req.uidx & ~0xffffffU)
+		return -EINVAL;
+	/*
+	 * bfreg_index / ece_options are QUERY_QP sentinels: the restore
+	 * forces bfregn invalid and lets FW re-negotiate ECE, so it never
+	 * consumes them. Enforce the sentinels the dump side emits so the
+	 * "validated-and-discarded" UHW contract actually holds.
+	 */
+	if (req.bfreg_index != MLX5_IB_INVALID_BFREG || req.ece_options)
+		return -EINVAL;
+
+	/*
+	 * WQ-ring layout. _create_user_qp's set_user_buf_size composes
+	 *   buf_size = (rq_wqe_count << rq_wqe_shift) +
+	 *              (sq_wqe_count << ilog2(MLX5_SEND_WQE_BB))
+	 * for QPC-managed (RC/UC/UD) QPs, RQ at offset 0 and SQ at
+	 * qp->sq.offset. The SAVE-side retag emitted exactly that
+	 * footprint as the (KIND_QP, qpn) HOST_USER_PAGE record, so the
+	 * restore MUST pin the same byte length for the placeholder bind's
+	 * length check to pass.
+	 */
+	if (req.rq_wqe_count &&
+	    (req.rq_wqe_shift < 4 || req.rq_wqe_shift > 16))
+		return -EINVAL;
+	buf_size = ((size_t)req.rq_wqe_count << req.rq_wqe_shift) +
+		   ((size_t)req.sq_wqe_count << ilog2(MLX5_SEND_WQE_BB));
+	if (buf_size && !req.buf_addr)
+		return -EINVAL;
+	if (!buf_size && req.buf_addr)
+		return -EINVAL;
+	if (req.db_addr == 0)
+		return -EINVAL;
+
+	/* Kernel-side mlx5_ib_qp init. */
+	mutex_init(&qp->mutex);
+	spin_lock_init(&qp->sq.lock);
+	spin_lock_init(&qp->rq.lock);
+	qp->type = ibqp->qp_type;
+	qp->state = qp_state;
+	qp->flags = create_flags;
+	qp->flags_en = req.flags;
+	/*
+	 * v0: single-port VF. multi-port would need port from the
+	 * inherited qpc.primary_address_path.port; WARN so CRIU on a
+	 * multi-port VF is caught before port-2 traffic mis-stamps.
+	 */
+	WARN_ON_ONCE(ibqp->device->phys_port_cnt > 1);
+	qp->port = 1;
+	/*
+	 * bfregn is a kernel-allocator slot; the source's UAR mapping is
+	 * encoded in the adopted qpc.uar_page. Mark the QP as managing its
+	 * own BFREG so destroy_qp skips a slot the kernel never allocated.
+	 */
+	qp->bfregn = MLX5_IB_INVALID_BFREG;
+	qp->has_rq = req.rq_wqe_count > 0;
+	qp->is_rss = false;
+	qp->is_ooo_rq = false;
+	if (create_flags & IB_UVERBS_QP_CREATE_SQ_SIG_ALL)
+		qp->sq_signal_bits = MLX5_WQE_CTRL_CQ_UPDATE;
+	INIT_LIST_HEAD(&qp->qps_list);
+	INIT_LIST_HEAD(&qp->cq_recv_list);
+	INIT_LIST_HEAD(&qp->cq_send_list);
+
+	/* WQ-ring sizing -- mirrors _create_user_qp's offset arithmetic. */
+	qp->rq.wqe_cnt = req.rq_wqe_count;
+	qp->rq.wqe_shift = req.rq_wqe_shift;
+	qp->rq.offset = 0;
+	qp->sq.wqe_cnt = req.sq_wqe_count;
+	qp->sq.wqe_shift = ilog2(MLX5_SEND_WQE_BB);
+	qp->sq.offset = (size_t)req.rq_wqe_count << req.rq_wqe_shift;
+
+	base->ubuffer.buf_addr = req.buf_addr;
+	base->ubuffer.buf_size = buf_size;
+
+	/*
+	 * mlx5_core_qp identity. uid: source's devx_uid for v0. req.uidx
+	 * is FW-side qpc.user_index, not mirrored on mlx5_core_qp; it is
+	 * validated-and-discarded above for forward-compat.
+	 */
+	base->container_mibqp = qp;
+	base->mqp.qpn = req.qpn;
+	base->mqp.uid = context->devx_uid;
+	base->mqp.pid = current->pid;
+
+	return -EOPNOTSUPP;
+}
+
+/*
  * mlx5_ib_restore_mr: CRIU-managed user-MR restore via FW mkey
  * adoption. The destination VHCA inherits the source's user-mode mkey
  * table across LOAD_VHCA_STATE, so this builds a fresh kernel-side
@@ -5329,6 +5487,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.restore_cq = mlx5_ib_restore_cq,
 	.restore_mr = mlx5_ib_restore_mr,
 	.restore_pd = mlx5_ib_restore_pd,
+	.restore_qp = mlx5_ib_restore_qp,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
 	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
 	.umem_place = mlx5_ib_umem_place,
