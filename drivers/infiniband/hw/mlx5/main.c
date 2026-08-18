@@ -3443,10 +3443,13 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	if (err)
 		return err;
 
+	/* Route async QP events to the standard handler. */
+	mlx5_ib_set_user_qp_event_callback(qp);
+
 	/*
-	 * Event-callback wiring, WQ-umem / doorbell bind, and dev-list
-	 * registration land in following patches; until then unwind the
-	 * adoption and report the QP as not yet restorable.
+	 * WQ-umem / doorbell bind and dev-list registration land in
+	 * following patches; until then unwind the adoption and report
+	 * the QP as not yet restorable.
 	 */
 	err = -EOPNOTSUPP;
 	goto err_adopt;

@@ -440,6 +440,21 @@ out_no_handler:
 	mlx5_core_res_put(&qp->common);
 }
 
+/*
+ * Wire @qp's mlx5_core_qp event callback for a user-mode QP created
+ * via the uverbs RESTORE path. Decouples mlx5_ib_restore_qp (in
+ * main.c) from the file-static mlx5_ib_qp_event symbol here in qp.c,
+ * mirroring mlx5_ib_set_user_cq_callbacks.
+ *
+ * Caller is mlx5_ib_restore_qp post-mlx5_qpc_adopt_qp; the kernel-
+ * side mlx5_core_qp is already in dev->qp_table, so async events
+ * routed through it land on this callback once it's set.
+ */
+void mlx5_ib_set_user_qp_event_callback(struct mlx5_ib_qp *qp)
+{
+	qp->trans_qp.base.mqp.event = mlx5_ib_qp_event;
+}
+
 static int set_rq_size(struct mlx5_ib_dev *dev, struct ib_qp_cap *cap,
 		       int has_rq, struct mlx5_ib_qp *qp, struct mlx5_ib_create_qp *ucmd)
 {
