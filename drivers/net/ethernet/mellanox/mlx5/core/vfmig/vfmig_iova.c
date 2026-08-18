@@ -904,17 +904,37 @@ out_unlock:
 void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom)
 {
 	unsigned int s;
+	u64 user_page_hwm;
 
 	if (!dom)
 		return;
 	mutex_lock(&dom->lock);
+	/*
+	 * Snapshot the USER_PAGE cursor BEFORE the per-slot reset.
+	 * Stage-2 replay (vfmig_iova_replay_external) bumps this cursor
+	 * monotonically to (highest_replayed_iova + length) so fresh
+	 * post-restore user_page_map_phys() calls land above source-side
+	 * replayed placeholders. The loop below would otherwise clobber
+	 * that high-water mark with slot_base, and the post-loop adjust
+	 * only lifts to user_page_start -- the bottom of the replay
+	 * region, where the lowest-IOVA placeholder lives. The first
+	 * fresh post-restore user_page allocation would then collide at
+	 * user_page_start with the replayed placeholder there and return
+	 * -EEXIST. max_t() with user_page_start preserves the replayed
+	 * high-water mark on LOAD probe arcs and still ratchets up to
+	 * user_page_start on first-time / non-replay arcs (where the
+	 * pre-loop value is slot_base, below user_page_start).
+	 */
+	user_page_hwm = dom->cursor[VFMIG_SLOT_USER_PAGE];
+
 	for (s = 0; s < VFMIG_IOVA_NR_SLOTS; s++) {
 		dom->cursor[s] = vfmig_iova_slot_base(dom,
 						      (enum vfmig_iova_slot)s);
 		dom->next_auto_key[s] = 0;
 	}
-	/* USER_PAGE cursor floors at user_page_start (past the carve). */
-	dom->cursor[VFMIG_SLOT_USER_PAGE] = vfmig_iova_user_page_start(dom);
+	/* USER_PAGE floors at user_page_start but preserves the HWM. */
+	dom->cursor[VFMIG_SLOT_USER_PAGE] =
+		max_t(u64, user_page_hwm, vfmig_iova_user_page_start(dom));
 	mutex_unlock(&dom->lock);
 }
 
