@@ -1344,6 +1344,8 @@ int mlx5_ib_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr, int qp_attr
 		     struct ib_qp_init_attr *qp_init_attr);
 int mlx5_ib_destroy_qp(struct ib_qp *qp, struct ib_udata *udata);
 void mlx5_ib_set_user_qp_event_callback(struct mlx5_ib_qp *qp);
+void mlx5_ib_register_user_qp_in_dev_lists(struct mlx5_ib_dev *dev,
+					   struct mlx5_ib_qp *qp);
 void mlx5_ib_drain_sq(struct ib_qp *qp);
 void mlx5_ib_drain_rq(struct ib_qp *qp);
 int mlx5_ib_read_wqe_sq(struct mlx5_ib_qp *qp, int wqe_index, void *buffer,
