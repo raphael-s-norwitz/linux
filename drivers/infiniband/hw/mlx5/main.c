@@ -3284,10 +3284,11 @@ err_buf:
  * idr, resolved the PD / send_cq / recv_cq handles, and will stamp the
  * ib_qp core fields and restrack after we return.
  *
- * v0: RC + UD user QPs only. This skeleton validates the request and
- * initializes the kernel mlx5_ib_qp; FW adoption, callback wiring, umem
- * / doorbell bind, and dev-list registration arrive in following
- * patches, so it returns -EOPNOTSUPP until the QP can be made functional.
+ * v0: RC + UD user QPs only. Validates the request, initializes the
+ * kernel mlx5_ib_qp, adopts the inherited qpn, wires the event callback,
+ * binds the WQ-ring and doorbell umems, and registers the QP in the
+ * reset-flow lists. On any failure the partial state is unwound in
+ * reverse (doorbell / umem / adoption).
  */
 static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 			      const struct ib_qp_cap *cap,
@@ -3477,13 +3478,24 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		goto err_buf;
 
 	/*
-	 * Dev-list registration + activation land in the next patch;
-	 * until then unwind the doorbell, WQ umem, and adoption and
-	 * report the QP as not yet restorable.
+	 * Reset-flow accounting: destroy_qp_common takes
+	 * reset_flow_resource_lock + per-CQ locks and unconditionally
+	 * unlinks qp->qps_list / cq_send_list / cq_recv_list. Mirror
+	 * create_user_qp's tail so the destroy path finds the QP wired
+	 * into the same lists.
 	 */
-	err = -EOPNOTSUPP;
-	mlx5_ib_db_unmap_user(context, &qp->db);
-	goto err_buf;
+	mlx5_ib_register_user_qp_in_dev_lists(dev, qp);
+
+	/* Stamp the user-visible qpn (the dispatcher echoes it back). */
+	ibqp->qp_num = req.qpn;
+
+	mlx5_ib_dbg(dev,
+		    "vfmig: restore_qp ibdev=%s qpn=0x%x type=%d state=%d uid=%u uidx=0x%x flags_en=0x%x buf_size=%zu db_user_virt=0x%lx\n",
+		    dev_name(&ibqp->device->dev), req.qpn, qp->type,
+		    qp_state, base->mqp.uid, req.uidx, qp->flags_en,
+		    buf_size, (unsigned long)(req.db_addr & PAGE_MASK));
+
+	return 0;
 
 err_buf:
 	if (base->ubuffer.umem) {

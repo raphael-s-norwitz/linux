@@ -2768,6 +2768,37 @@ static void get_cqs(enum ib_qp_type qp_type,
 	}
 }
 
+/*
+ * Register @qp into the reset-flow tracking lists (dev->qp_list and the
+ * send/recv CQ list_send_qp / list_recv_qp lists) under the usual
+ * reset_flow_resource_lock + per-CQ lock chain. Mirror of the tail of
+ * create_user_qp / create_kernel_qp, exported for the uverbs RESTORE
+ * path so mlx5_ib_restore_qp (in main.c) does not have to reach into the
+ * file-static mlx5_ib_lock_cqs / get_cqs helpers here.
+ *
+ * Must run AFTER mlx5_qpc_adopt_qp (qp is in dev->qp_table) and AFTER
+ * ubuffer.umem + qp->db are populated (the destroy path unwinds via
+ * list_del + mlx5_ib_db_unmap_user + ib_umem_release in that order).
+ */
+void mlx5_ib_register_user_qp_in_dev_lists(struct mlx5_ib_dev *dev,
+					   struct mlx5_ib_qp *qp)
+{
+	struct mlx5_ib_cq *send_cq, *recv_cq;
+	unsigned long flags;
+
+	get_cqs(qp->type, qp->ibqp.send_cq, qp->ibqp.recv_cq,
+		&send_cq, &recv_cq);
+	spin_lock_irqsave(&dev->reset_flow_resource_lock, flags);
+	mlx5_ib_lock_cqs(send_cq, recv_cq);
+	list_add_tail(&qp->qps_list, &dev->qp_list);
+	if (send_cq)
+		list_add_tail(&qp->cq_send_list, &send_cq->list_send_qp);
+	if (recv_cq)
+		list_add_tail(&qp->cq_recv_list, &recv_cq->list_recv_qp);
+	mlx5_ib_unlock_cqs(send_cq, recv_cq);
+	spin_unlock_irqrestore(&dev->reset_flow_resource_lock, flags);
+}
+
 static int modify_raw_packet_qp(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 				const struct mlx5_modify_raw_qp_param *raw_qp_param,
 				u8 lag_tx_affinity);
