@@ -3301,6 +3301,7 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 		udata, struct mlx5_ib_ucontext, ibucontext);
 	struct mlx5_ib_qp_base *base = &qp->trans_qp.base;
 	struct mlx5_ib_restore_qp_req req = {};
+	struct ib_umem *umem;
 	size_t buf_size;
 	int err;
 
@@ -3447,13 +3448,37 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	mlx5_ib_set_user_qp_event_callback(qp);
 
 	/*
-	 * WQ-umem / doorbell bind and dev-list registration land in
-	 * following patches; until then unwind the adoption and report
+	 * Pin the WQ-ring pages (buf_size bytes composed from the
+	 * req.{rq,sq}_wqe_count that match the source's pre-SAVE umem)
+	 * and iommu_map each sg onto the (KIND_QP, qpn) placeholder that
+	 * LOAD_VHCA_STATE installed. On failure the helper has already
+	 * unwound the pin + partial bind via ib_umem_release().
+	 */
+	if (buf_size) {
+		umem = mlx5_ib_umem_restore_qp(dev, req.qpn, req.buf_addr,
+					       buf_size);
+		if (IS_ERR(umem)) {
+			err = PTR_ERR(umem);
+			goto err_adopt;
+		}
+		base->ubuffer.umem = umem;
+	} else {
+		base->ubuffer.umem = NULL;
+	}
+
+	/*
+	 * Doorbell bind and dev-list registration land in following
+	 * patches; until then unwind the WQ umem + adoption and report
 	 * the QP as not yet restorable.
 	 */
 	err = -EOPNOTSUPP;
-	goto err_adopt;
+	goto err_buf;
 
+err_buf:
+	if (base->ubuffer.umem) {
+		ib_umem_release(base->ubuffer.umem);
+		base->ubuffer.umem = NULL;
+	}
 err_adopt:
 	mlx5_core_destroy_qp(dev, &base->mqp);
 	return err;

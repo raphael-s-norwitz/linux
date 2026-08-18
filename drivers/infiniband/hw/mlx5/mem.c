@@ -104,6 +104,45 @@ struct ib_umem *mlx5_ib_umem_restore_cq(struct mlx5_ib_dev *dev, u32 cqn,
 }
 
 /*
+ * Stage-3 destination-side umem bind for a CRIU-restored user QP's
+ * WQ-ring (RQ + SQ in one contiguous mapping). Same composition as
+ * mlx5_ib_umem_restore_cq modulo the kind: ib_umem_pin() with access 0
+ * (the FW reads WQE descriptors out of the buffer, matching the
+ * source-side _create_user_qp ib_umem_get(... 0); the doorbell records
+ * live in a separate page bound by mlx5_ib_db_map_user_restore) followed
+ * by mlx5_vfmig_bind_user_qp(), which iommu_maps each sg at the
+ * (KIND_QP, @qpn) placeholder IOVA range.
+ *
+ * @size must be (rq_wqe_count << rq_wqe_shift) + (sq_wqe_count <<
+ * ilog2(MLX5_SEND_WQE_BB)) -- the byte length set_user_buf_size composes
+ * for QPC-managed (RC / UC / UD) QPs and the length the SAVE-side retag
+ * emitted for the placeholder. This helper is QPC-only; raw_packet QPs
+ * split the ring across two umems and would need a separate helper.
+ *
+ * @qpn must match the source qpn the SAVE-side retag emitted. On bind
+ * failure the pinned umem is unwound via ib_umem_release(); returns the
+ * populated umem (stored by the caller in base->ubuffer.umem) or ERR_PTR.
+ */
+struct ib_umem *mlx5_ib_umem_restore_qp(struct mlx5_ib_dev *dev, u32 qpn,
+					unsigned long addr, size_t size)
+{
+	struct ib_umem *umem;
+	int err;
+
+	umem = ib_umem_pin(&dev->ib_dev, addr, size, 0);
+	if (IS_ERR(umem))
+		return umem;
+
+	err = mlx5_vfmig_bind_user_qp(dev->mdev, qpn,
+				      &umem->sgt_append.sgt);
+	if (err) {
+		ib_umem_release(umem);
+		return ERR_PTR(err);
+	}
+	return umem;
+}
+
+/*
  * Fill in a physical address list. ib_umem_num_dma_blocks() entries will be
  * filled in the pas array.
  */
