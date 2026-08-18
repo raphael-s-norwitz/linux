@@ -3295,6 +3295,7 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 			      u32 create_flags,
 			      struct ib_udata *udata)
 {
+	struct mlx5_ib_dev *dev = to_mdev(ibqp->device);
 	struct mlx5_ib_qp *qp = to_mqp(ibqp);
 	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
 		udata, struct mlx5_ib_ucontext, ibucontext);
@@ -3365,6 +3366,14 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	if (req.rq_wqe_count &&
 	    (req.rq_wqe_shift < 4 || req.rq_wqe_shift > 16))
 		return -EINVAL;
+	/*
+	 * Sanity-cap the WQE counts against the device max (mirrors
+	 * create_user_qp) so a crafted image cannot drive an absurd umem
+	 * pin; the inherited qpn means the QPC itself was source-validated.
+	 */
+	if (req.sq_wqe_count > (1 << MLX5_CAP_GEN(dev->mdev, log_max_qp_sz)) ||
+	    req.rq_wqe_count > (1 << MLX5_CAP_GEN(dev->mdev, log_max_qp_sz)))
+		return -EINVAL;
 	buf_size = ((size_t)req.rq_wqe_count << req.rq_wqe_shift) +
 		   ((size_t)req.sq_wqe_count << ilog2(MLX5_SEND_WQE_BB));
 	if (buf_size && !req.buf_addr)
@@ -3425,7 +3434,26 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	base->mqp.uid = context->devx_uid;
 	base->mqp.pid = current->pid;
 
-	return -EOPNOTSUPP;
+	/*
+	 * Register the inherited qpn in dev->qp_table (radix insert +
+	 * refcount, no FW command -- the QPC is already live post-LOAD)
+	 * so async events and the reset flow can find this QP.
+	 */
+	err = mlx5_qpc_adopt_qp(dev, &base->mqp);
+	if (err)
+		return err;
+
+	/*
+	 * Event-callback wiring, WQ-umem / doorbell bind, and dev-list
+	 * registration land in following patches; until then unwind the
+	 * adoption and report the QP as not yet restorable.
+	 */
+	err = -EOPNOTSUPP;
+	goto err_adopt;
+
+err_adopt:
+	mlx5_core_destroy_qp(dev, &base->mqp);
+	return err;
 }
 
 /*
