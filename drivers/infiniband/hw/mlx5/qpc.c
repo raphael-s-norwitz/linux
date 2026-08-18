@@ -276,6 +276,42 @@ err_cmd:
 	return err;
 }
 
+/*
+ * mlx5_qpc_adopt_qp -- VFMIG CRIU restore companion to
+ * mlx5_qpc_create_qp. Skips FW CREATE_QP because the source's
+ * qpn is already alive in the destination FW post-LOAD_VHCA_STATE
+ * (the FW QPC round-trips byte-equal across SAVE/LOAD, and the qpn
+ * allocator high-water survives LOAD) and only does the kernel-side
+ * mlx5_core_qp registration:
+ *
+ *   - radix_tree insert into dev->qp_table keyed on
+ *     qpn | (MLX5_RES_QP << MLX5_USER_INDEX_LEN), enabling
+ *     mlx5_get_rsc()-driven async event delivery and refcount
+ *     management identical to a fresh create.
+ *   - mlx5_debug_qp_add for /sys/kernel/debug parity (skipped on
+ *     SMI-class ib_devs, mirroring the create path).
+ *
+ * Caller is responsible for stamping qp->qpn and qp->uid before
+ * the call -- there is no FW round-trip here that would fill
+ * them in.
+ */
+int mlx5_qpc_adopt_qp(struct mlx5_ib_dev *dev, struct mlx5_core_qp *qp)
+{
+	int err;
+
+	if (qp->qpn == 0 || (qp->qpn & ~0xffffffU))
+		return -EINVAL;
+
+	err = create_resource_common(dev, qp, MLX5_RES_QP);
+	if (err)
+		return err;
+
+	if (dev->ib_dev.type != RDMA_DEVICE_TYPE_SMI)
+		mlx5_debug_qp_add(dev->mdev, qp);
+
+	return 0;
+}
+
 static int mlx5_core_drain_dct(struct mlx5_ib_dev *dev,
 			       struct mlx5_core_dct *dct)
 {
