@@ -422,6 +422,19 @@ enum mlx5_ib_vfmig_methods {
 	 * (no source userspace VAs) reject with -ENXIO.
 	 */
 	MLX5_IB_METHOD_VFMIG_QUERY_CQ,
+	/*
+	 * QUERY_QP: dump-side counterpart to UVERBS_METHOD_RESTORE_QP.
+	 * Emit, for the user QP resolved through UVERBS_OBJECT_QP on the
+	 * calling fd's ufile, the bytes a CRIU plugin needs to drive
+	 * RESTORE_QP on the destination that have no standard query_qp /
+	 * NLDEV surface: a struct mlx5_ib_restore_qp_req RESP_BLOB
+	 * (byte-equal to the restore UHW), plus the create user_handle and
+	 * create_flags. cap / qp_type / qp_state come from the standard
+	 * query_qp verb + NLDEV, so they are not re-exported here. Only
+	 * RC/UD user QPs are supported (matching RESTORE_QP); other types
+	 * and kernel-mode QPs reject with -EOPNOTSUPP / -ENXIO.
+	 */
+	MLX5_IB_METHOD_VFMIG_QUERY_QP,
 };
 
 /*
@@ -565,6 +578,29 @@ enum mlx5_ib_vfmig_query_cq_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_CQE,
 	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_COMP_VECTOR,
 	MLX5_IB_ATTR_VFMIG_QUERY_CQ_RESP_FLAGS,
+};
+
+/*
+ * Attrs for MLX5_IB_METHOD_VFMIG_QUERY_QP.
+ *
+ * The HANDLE is resolved via UVERBS_ATTR_IDR(UVERBS_OBJECT_QP,
+ * UVERBS_ACCESS_READ): the calling fd's ufile-idr must own this QP.
+ * The three RESP_* outs are the QP state with no standard query_qp /
+ * NLDEV surface:
+ *
+ *   RESP_BLOB          struct mlx5_ib_restore_qp_req, byte-equal to the
+ *                      RESTORE_QP UHW tail.
+ *   RESP_USER_HANDLE   __u64, the source's ibqp->uobject->user_handle.
+ *   RESP_CREATE_FLAGS  __u32, the source's qp->flags (IB_QP_CREATE_*).
+ *
+ * All outs are MANDATORY: a CRIU plugin that ignores any at dump time
+ * will produce an unrestorable image.
+ */
+enum mlx5_ib_vfmig_query_qp_attrs {
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE = (1U << UVERBS_ID_NS_SHIFT),
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
 };
 
 /*

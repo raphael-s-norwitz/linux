@@ -795,6 +795,118 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(u32),
 			    UA_MANDATORY));
 
+/*
+ * MLX5_IB_METHOD_VFMIG_QUERY_QP -- emit, for the user QP resolved through
+ * UVERBS_OBJECT_QP on the calling fd's ufile, the bytes a CRIU plugin
+ * needs to drive UVERBS_METHOD_RESTORE_QP on the destination side.
+ *
+ * Three RESP_* outs, only the QP state with no standard / NLDEV surface
+ * (cap / qp_type / qp_state come from the standard query_qp verb + NLDEV):
+ *   RESP_BLOB          struct mlx5_ib_restore_qp_req (64 bytes), byte-
+ *                      equal to what RESTORE_QP's UHW consumes. uidx /
+ *                      bfreg_index / ece_options are emitted as sentinels
+ *                      (0 / MLX5_IB_INVALID_BFREG / 0); the corresponding
+ *                      QPC fields round-trip across LOAD_VHCA_STATE and
+ *                      RESTORE_QP validates-and-discards them.
+ *   RESP_USER_HANDLE   ibqp->uobject->user_handle, the userspace tag
+ *                      ib_uverbs_create_qp recorded at create.
+ *   RESP_CREATE_FLAGS  mqp->flags (the IB_QP_CREATE_* mask at create).
+ *
+ * Only RC/UD user QPs are supported, matching mlx5_ib_restore_qp's v0
+ * type set. UC's mlx5_ib representation also lives in trans_qp but
+ * RESTORE_QP rejects it; raw_packet, XRC, GSI, DCT and DCI have no
+ * trans_qp.base to emit. All reject with -EOPNOTSUPP. Kernel-mode
+ * QPs (no umem) reject with -ENXIO. The IDR lookup grabs
+ * UVERBS_ACCESS_READ on the QP for the call, so a concurrent DESTROY_QP
+ * on the same fd cannot race.
+ */
+static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_QP)(struct uverbs_attr_bundle *attrs)
+{
+	struct ib_qp *ibqp = uverbs_attr_get_obj(attrs,
+		MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE);
+	struct mlx5_ib_restore_qp_req blob = {};
+	struct mlx5_ib_qp_base *base;
+	struct mlx5_ib_qp *mqp;
+	u64 user_handle;
+	u32 create_flags;
+	int err;
+
+	if (IS_ERR(ibqp))
+		return PTR_ERR(ibqp);
+
+	/*
+	 * v0 type gate: RC + UD only, matching RESTORE_QP. UC's mlx5_ib
+	 * representation also lives in mlx5_ib_qp.trans_qp, but RESTORE_QP
+	 * rejects it, so emitting it here would only produce an
+	 * unrestorable image. Other types have no trans_qp.base to emit.
+	 */
+	switch (ibqp->qp_type) {
+	case IB_QPT_RC:
+	case IB_QPT_UD:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	mqp = to_mqp(ibqp);
+	base = &mqp->trans_qp.base;
+
+	/*
+	 * Reject kernel-mode QPs: no source userspace state to emit.
+	 * base->ubuffer.umem is NULL iff the QP took the create_kernel_qp
+	 * path; mlx5_ib_db_user_virt returns 0 iff db->u is the pgdir
+	 * (kernel) branch of the union.
+	 */
+	if (!base->ubuffer.umem || mlx5_ib_db_user_virt(&mqp->db) == 0)
+		return -ENXIO;
+	if (!ibqp->uobject)
+		return -ENXIO;
+
+	blob.buf_addr = base->ubuffer.umem->address;
+	blob.db_addr = mlx5_ib_db_user_virt(&mqp->db);
+	blob.sq_buf_addr = 0;
+	blob.qpn = base->mqp.qpn;
+	blob.sq_wqe_count = mqp->sq.wqe_cnt;
+	blob.rq_wqe_count = mqp->rq.wqe_cnt;
+	blob.rq_wqe_shift = mqp->rq.wqe_shift;
+	blob.flags = mqp->flags_en;
+	blob.uidx = 0;
+	blob.bfreg_index = MLX5_IB_INVALID_BFREG;
+	blob.ece_options = 0;
+
+	user_handle = ib_qp_user_handle(ibqp);
+	create_flags = mqp->flags;
+
+	err = uverbs_copy_to(attrs, MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+			     &blob, sizeof(blob));
+	if (err)
+		return err;
+	err = uverbs_copy_to(attrs,
+			     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+			     &user_handle, sizeof(user_handle));
+	if (err)
+		return err;
+	return uverbs_copy_to(attrs,
+			      MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
+			      &create_flags, sizeof(create_flags));
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	MLX5_IB_METHOD_VFMIG_QUERY_QP,
+	UVERBS_ATTR_IDR(MLX5_IB_ATTR_VFMIG_QUERY_QP_HANDLE,
+			UVERBS_OBJECT_QP,
+			UVERBS_ACCESS_READ,
+			UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
+			    UVERBS_ATTR_TYPE(struct mlx5_ib_restore_qp_req),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
+			    UVERBS_ATTR_TYPE(u64),
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
+			    UVERBS_ATTR_TYPE(u32),
+			    UA_MANDATORY));
+
 DECLARE_UVERBS_GLOBAL_METHODS(
 	MLX5_IB_OBJECT_VFMIG,
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT),
@@ -802,7 +914,8 @@ DECLARE_UVERBS_GLOBAL_METHODS(
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_RESTORE_DYN_UARS),
 	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_PD),
-	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_CQ));
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_CQ),
+	&UVERBS_METHOD(MLX5_IB_METHOD_VFMIG_QUERY_QP));
 
 const struct uapi_definition mlx5_ib_vfmig_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(MLX5_IB_OBJECT_VFMIG),
