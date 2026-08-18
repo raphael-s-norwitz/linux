@@ -3467,11 +3467,22 @@ static int mlx5_ib_restore_qp(struct ib_qp *ibqp, u32 target_handle,
 	}
 
 	/*
-	 * Doorbell bind and dev-list registration land in following
-	 * patches; until then unwind the WQ umem + adoption and report
-	 * the QP as not yet restorable.
+	 * Destination-side doorbell-page bind (or refcount-up if a
+	 * previously-restored uobject in this ucontext already bound the
+	 * same DBR page; the dedup mirrors create-time
+	 * mlx5_ib_db_map_user). Populates qp->db.{u.user_page, dma}.
+	 */
+	err = mlx5_ib_db_map_user_restore(context, req.db_addr, &qp->db);
+	if (err)
+		goto err_buf;
+
+	/*
+	 * Dev-list registration + activation land in the next patch;
+	 * until then unwind the doorbell, WQ umem, and adoption and
+	 * report the QP as not yet restorable.
 	 */
 	err = -EOPNOTSUPP;
+	mlx5_ib_db_unmap_user(context, &qp->db);
 	goto err_buf;
 
 err_buf:
