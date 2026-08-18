@@ -3973,6 +3973,37 @@ int mlx5_vfmig_bind_user_cq(struct mlx5_core_dev *vf_dev, u32 cqn,
 EXPORT_SYMBOL(mlx5_vfmig_bind_user_cq);
 
 /*
+ * Public destination-side bind entry point for the mlx5_ib RESTORE_QP
+ * verb body's WQ-ring umem. Header docstring lives in
+ * include/linux/mlx5/driver.h.
+ *
+ * Identical shape and error semantics as mlx5_vfmig_bind_user_cq modulo
+ * the kind enum. The instance_key is VFMIG_HUOBJ_KEY(KIND_QP, qpn); the
+ * source-side retag (mlx5_vfmig_retag_user_qp, fired from create_user_qp
+ * post-FW-create) installed the matching placeholder in the SAVE-side
+ * IOVA domain, which LOAD_VHCA_STATE replays onto the destination ahead
+ * of this bind.
+ */
+int mlx5_vfmig_bind_user_qp(struct mlx5_core_dev *vf_dev, u32 qpn,
+			    struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+
+	if (!vf_dev || !sgt)
+		return -EINVAL;
+	if (qpn == 0 || (qpn & ~0xffffffU))
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (!dom)
+		return -ENODEV;
+
+	return vfmig_iova_bind_user_object(dom, VFMIG_HUOBJ_KIND_QP,
+					   (u64)qpn, sgt);
+}
+EXPORT_SYMBOL(mlx5_vfmig_bind_user_qp);
+
+/*
  * Public destination-side bind entry point for the doorbell-page umem
  * of the mlx5_ib RESTORE_CQ / RESTORE_QP / RESTORE_SRQ verb bodies.
  * Header docstring lives in include/linux/mlx5/driver.h.

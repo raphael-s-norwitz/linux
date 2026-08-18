@@ -1434,6 +1434,8 @@ struct ib_umem *mlx5_ib_umem_restore_mr(struct mlx5_ib_dev *dev,
 					size_t size, int access);
 struct ib_umem *mlx5_ib_umem_restore_cq(struct mlx5_ib_dev *dev, u32 cqn,
 					unsigned long addr, size_t size);
+struct ib_umem *mlx5_ib_umem_restore_qp(struct mlx5_ib_dev *dev, u32 qpn,
+					unsigned long addr, size_t size);
 int mlx5_ib_get_cqe_size(struct ib_cq *ibcq);
 int mlx5r_frmr_pools_init(struct ib_device *device);
 void mlx5r_frmr_pools_cleanup(struct ib_device *device);
