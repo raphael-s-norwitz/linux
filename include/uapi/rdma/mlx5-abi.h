@@ -264,6 +264,52 @@ struct mlx5_ib_restore_cq_req {
 	__u32	reserved2;	/* must be 0 */
 };
 
+/*
+ * mlx5_ib_restore_qp_req -- driver UHW for UVERBS_METHOD_RESTORE_QP,
+ * emitted byte-equal by MLX5_IB_METHOD_VFMIG_QUERY_QP. Carries only the
+ * userspace-side identity the FW QPC cannot re-derive across
+ * LOAD_VHCA_STATE (buf/db source VAs, FW qpn to adopt, WQ sizing); path
+ * state (PSNs, AV, MTU, retry) rides the preserved QPC, not this blob.
+ *
+ *   buf_addr      source userspace VA of the WQ ring (SQ+RQ combined for
+ *                 RC/UC/UD). Bound via mlx5_ib_umem_restore_qp into the
+ *                 KIND_QP placeholder LOAD installed from the SAVE-side
+ *                 retag.
+ *   db_addr       source userspace VA of the doorbell record; bound via
+ *                 mlx5_ib_db_map_user_restore, page-aligned like the CQ
+ *                 path (the in-page offset survives via FW qpc.dbr_addr).
+ *   sq_buf_addr   RAW_PACKET split-SQ VA; MUST be 0 for v0 RC/UC/UD.
+ *   qpn           FW qpn to adopt (24 bits); 0 rejects with -EINVAL.
+ *   sq_wqe_count, rq_wqe_count, rq_wqe_shift
+ *                 source WQ sizing; sizes the umem pin and stamps
+ *                 mlx5_ib_qp.{sq,rq}.
+ *   flags         create-time MLX5_QP_FLAG_* bitmask.
+ *   uidx          qpc.user_index (24 bits); validated-and-discarded, FW
+ *                 preserves it.
+ *   bfreg_index   source BFREG slot; sentinel MLX5_IB_INVALID_BFREG as
+ *                 the restore forces bfregn invalid.
+ *   ece_options   ECE word; FW re-negotiates and the QPC round-trips it.
+ *
+ * 64 bytes: above the 8-byte inline-UHW threshold so the dispatcher
+ * always takes the userspace-pointer path. Same dodge as
+ * mlx5_ib_restore_cq_req.
+ */
+struct mlx5_ib_restore_qp_req {
+	__aligned_u64 buf_addr;		/* source userspace VA of WQ ring */
+	__aligned_u64 db_addr;		/* source userspace VA of DBR page */
+	__aligned_u64 sq_buf_addr;	/* raw_packet split-SQ; 0 for v0 RC */
+	__u32	qpn;			/* FW qpn to adopt (24 bits) */
+	__u32	sq_wqe_count;		/* same as mlx5_ib_create_qp */
+	__u32	rq_wqe_count;
+	__u32	rq_wqe_shift;
+	__u32	flags;			/* MLX5_QP_FLAG_* bitmask */
+	__u32	uidx;			/* qpc.user_index (24 bits) */
+	__u32	bfreg_index;		/* source BFREG slot for SQ doorbell */
+	__u32	ece_options;
+	__u32	reserved;		/* must be 0 */
+	__u32	reserved2;		/* must be 0 */
+};
+
 struct mlx5_ib_tso_caps {
 	__u32 max_tso; /* Maximum tso payload size in bytes */
 
