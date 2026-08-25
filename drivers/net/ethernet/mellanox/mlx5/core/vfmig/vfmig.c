@@ -317,18 +317,37 @@ static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.reserved)
+	if (arg.flags & ~MLX5_VFMIG_MARK_RESTORED_FLAG_ALL)
 		return -EINVAL;
 
 	sriov = &vfmig->pf_mdev->priv.sriov;
 	if (arg.vf_id >= sriov->num_vfs || arg.vf_id >= vfmig->max_vfs)
 		return -EINVAL;
 
-	if (test_and_set_bit(arg.vf_id, vfmig->restored))
-		return -EALREADY;
+	/*
+	 * Defer-resume request (snapshot-ordering restore mirror): the next
+	 * probe applies LOAD_VHCA_STATE but leaves the VHCA parked (STOP) for
+	 * a later RESUME_VHCA. Stamp it before the restored latch below so a
+	 * VF whose restored bit was already installed (e.g. by the LOAD
+	 * ioctl's close()) still honors the hint rather than losing it.
+	 */
+	sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume =
+		(arg.flags & MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME) ? 1 : 0;
 
-	mlx5_core_dbg(vfmig->pf_mdev, "vfmig: VF %u marked restored\n",
-		      arg.vf_id);
+	if (test_and_set_bit(arg.vf_id, vfmig->restored)) {
+		/*
+		 * Latch already set by an earlier MARK_RESTORED or by the LOAD
+		 * ioctl's close(). Re-issuing it solely to (re)stamp a flag is
+		 * a no-op success; a flagless repeat keeps the -EALREADY
+		 * contract for callers that use it as a set-once probe.
+		 */
+		return arg.flags ? 0 : -EALREADY;
+	}
+
+	mlx5_core_dbg(vfmig->pf_mdev, "vfmig: VF %u marked restored%s\n",
+		      arg.vf_id,
+		      sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume ?
+		      " (resume deferred)" : "");
 
 	return 0;
 }
@@ -3058,6 +3077,23 @@ int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
 			       "vfmig: LOAD_VHCA_STATE vf %u (vhca_id 0x%04x) size %llu failed: %d\n",
 			       load->vf_id, load->vhca_id, load->record_size,
 			       err);
+		goto out_destroy;
+	}
+
+	/*
+	 * Snapshot-ordering restore mirror: if MARK_RESTORED { DEFER_RESUME }
+	 * stamped this VF, leave the freshly-loaded VHCA parked at STOP and
+	 * latch vfmig_dp_state = STOP. CRIU brings the datapath live with an
+	 * explicit RESUME_VHCA at RESUME_DEVICES_LATE, once every MR/ring VMA
+	 * has been restored. The one-shot hint is consumed here.
+	 */
+	if (pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_defer_resume) {
+		pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_dp_state =
+			MLX5_VFMIG_DP_STOP;
+		pf_mdev->priv.sriov.vfs_ctx[vf_id].vfmig_defer_resume = 0;
+		mlx5_core_info(pf_mdev,
+			       "vfmig: applied %llu bytes of LOAD state to vf %u (vhca_id 0x%04x); resume deferred (parked for RESUME_DEVICES_LATE)\n",
+			       load->record_size, load->vf_id, load->vhca_id);
 		goto out_destroy;
 	}
 

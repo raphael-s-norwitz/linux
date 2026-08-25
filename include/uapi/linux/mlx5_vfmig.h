@@ -27,12 +27,26 @@
  *   Latch VF @vf_id as having had its firmware state restored. A later
  *   mlx5_core probe of that VF consumes the bit to skip re-init of state
  *   that was loaded out of band. Returns 0 on success, -EINVAL if @vf_id
- *   is out of range or @reserved is non-zero, -EALREADY if the bit was
- *   already set.
+ *   is out of range or @flags carries unknown bits, -EALREADY if the bit
+ *   was already set and no @flags were requested.
+ *
+ *   @flags:
+ *     MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME -- snapshot-ordering restore
+ *       mirror: the next probe applies LOAD_VHCA_STATE but leaves the
+ *       VHCA parked (STOP) instead of resuming it, so CRIU can bring the
+ *       datapath live with an explicit MLX5_VFMIG_IOC_RESUME_VHCA at
+ *       RESUME_DEVICES_LATE, once every MR/ring VMA has been restored.
+ *       Honored even when the restored bit is already set (e.g. installed
+ *       by the LOAD ioctl's close()), in which case the call is a no-op
+ *       success rather than -EALREADY.
  */
+#define MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME	(1u << 0)
+#define MLX5_VFMIG_MARK_RESTORED_FLAG_ALL \
+	(MLX5_VFMIG_MARK_RESTORED_DEFER_RESUME)
+
 struct mlx5_vfmig_mark_restored {
 	__u32 vf_id;	/* in */
-	__u32 reserved;
+	__u32 flags;	/* in: subset of MLX5_VFMIG_MARK_RESTORED_FLAG_* */
 };
 
 #define MLX5_VFMIG_IOC_MARK_RESTORED \

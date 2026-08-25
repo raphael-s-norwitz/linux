@@ -535,6 +535,14 @@ struct mlx5_vf_context {
 	u8	node_guid_valid:1;
 	/* Current mlx5_vfmig_dp_state; driven by the vfmig SUSPEND/RESUME ioctls. */
 	u8	vfmig_dp_state;
+	/*
+	 * Set via MARK_RESTORED { DEFER_RESUME }: tells
+	 * mlx5_vfmig_vf_apply_pending_load() to run LOAD_VHCA_STATE but skip
+	 * the trailing RESUME, leaving the restored VHCA parked (STOP) until
+	 * CRIU issues RESUME_VHCA at RESUME_DEVICES_LATE (after all MR/ring
+	 * VMAs are restored). Consumed (cleared) when the load is applied.
+	 */
+	u8	vfmig_defer_resume;
 	enum port_state_policy	policy;
 	struct blocking_notifier_head notifier;
 };
