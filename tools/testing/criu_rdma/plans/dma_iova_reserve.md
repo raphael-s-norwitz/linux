@@ -558,8 +558,10 @@ prove the above:
 4. `reserve_merges_over_existing` -- documents that `reserve_iova()`
    returns the merged existing node (why we need `alloc_iova_fixed()`).
 
-It also carries a dormant contract suite (guarded by
-`IOVA_KUNIT_TEST_ALLOC_FIXED`) specifying `alloc_iova_fixed()`:
+It also carries a now-active contract suite (enabled by
+`IOVA_KUNIT_TEST_ALLOC_FIXED`, which the harness defines now that
+`alloc_iova_fixed()` has landed in `drivers/iommu/iova.c`) specifying
+`alloc_iova_fixed()`:
 
 * `fixed_exact_on_free_range` -- exact node inserted on a free range.
 * `fixed_ebusy_on_overlap` -- any overlap (a subset) returns `-EBUSY`.
@@ -573,8 +575,8 @@ It also carries a dormant contract suite (guarded by
   released, i.e. an ordinary allocation may reoccupy it (free is the
   non-caching `__free_iova`, not a mere not-busy flag).
 
-That suite activates in the same series that lands the primitive -- the
-test is written first, by design. Note there is deliberately **no**
+This suite landed in the same series as the primitive itself -- the test
+was written first, by design. Note there is deliberately **no**
 "`reserve_iova` fails on our range" case: `reserve_iova` cannot fail (it
 merges on overlap), so the meaningful negative is `-EBUSY` from
 `alloc_iova_fixed` plus the allocator-fencing cases above.
