@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# commit-msg hook (kernel + criu rebase worktrees).
+#
+# Enforces:
+#   - subject line <= 52 chars
+#   - body wrapped at <= 72 chars (trailers and unwrappable long tokens exempt)
+# Ensures (auto-appended at the end, in this order, deduplicated):
+#   - Assisted-by: Cursor:claude-opus-4.8-high
+#   - Signed-off-by: <derived from git config user.name/user.email>
+#
+# Bypass with:  git commit --no-verify
+#
+set -u
+
+MSG_FILE="$1"
+SUBJECT_MAX=52
+WRAP_MAX=72
+ASSISTED="Assisted-by: Cursor:claude-opus-4.8-high"
+
+# Signed-off-by is derived from the repo's git identity (user.name/user.email)
+# rather than hard-coded. If either is unset it is omitted -- git will reject
+# the commit for the missing identity anyway.
+git_name="$(git config user.name 2>/dev/null || true)"
+git_email="$(git config user.email 2>/dev/null || true)"
+if [ -n "$git_name" ] && [ -n "$git_email" ]; then
+	SIGNOFF="Signed-off-by: $git_name <$git_email>"
+else
+	SIGNOFF=""
+fi
+
+mapfile -t RAW < "$MSG_FILE"
+
+# Real message = drop comment lines and everything from the scissors line on
+# (git strips these itself; we validate/edit only the real content).
+msg=()
+for line in "${RAW[@]}"; do
+	case "$line" in
+		'# ------------------------ >8 ------------------------'*) break ;;
+		'#'*) continue ;;
+	esac
+	msg+=("$line")
+done
+
+# Trim trailing blank lines.
+while [ "${#msg[@]}" -gt 0 ] && [ -z "${msg[$((${#msg[@]} - 1))]}" ]; do
+	unset 'msg[$((${#msg[@]} - 1))]'
+done
+
+# Empty message: let git handle the abort.
+[ "${#msg[@]}" -eq 0 ] && exit 0
+
+subject="${msg[0]}"
+
+# Skip machine-generated / special commits.
+case "$subject" in
+	'Merge '*|'Revert "'*|'fixup! '*|'squash! '*|'amend! '*) exit 0 ;;
+esac
+
+is_trailer() { [[ "$1" =~ ^[A-Za-z][A-Za-z0-9-]*:[[:space:]] ]]; }
+
+longest_word() {
+	local w max=0
+	for w in $1; do [ "${#w}" -gt "$max" ] && max="${#w}"; done
+	printf '%s' "$max"
+}
+
+errors=()
+
+if [ "${#subject}" -gt "$SUBJECT_MAX" ]; then
+	errors+=("subject is ${#subject} chars (max ${SUBJECT_MAX}): \"$subject\"")
+fi
+
+if [ "${#msg[@]}" -ge 2 ] && [ -n "${msg[1]}" ]; then
+	errors+=("the line after the subject must be blank")
+fi
+
+i=0
+for line in "${msg[@]}"; do
+	i=$((i + 1))
+	[ "$i" -eq 1 ] && continue
+	[ "${#line}" -le "$WRAP_MAX" ] && continue
+	is_trailer "$line" && continue
+	[ "$(longest_word "$line")" -gt "$WRAP_MAX" ] && continue
+	errors+=("line $i is ${#line} chars (max ${WRAP_MAX}): \"$line\"")
+done
+
+if [ "${#errors[@]}" -gt 0 ]; then
+	{
+		echo "commit-msg: commit rejected:"
+		printf '  - %s\n' "${errors[@]}"
+		echo
+		echo "Fix the message, or bypass with: git commit --no-verify"
+	} >&2
+	exit 1
+fi
+
+# Trailers to ensure at the end, in order (skip any that are empty).
+trailers=("$ASSISTED")
+[ -n "$SIGNOFF" ] && trailers+=("$SIGNOFF")
+
+# Dedup our exact trailer lines from the existing body.
+filtered=()
+for line in "${msg[@]}"; do
+	skip=0
+	for t in "${trailers[@]}"; do
+		[ "$line" = "$t" ] && { skip=1; break; }
+	done
+	[ "$skip" -eq 1 ] && continue
+	filtered+=("$line")
+done
+while [ "${#filtered[@]}" -gt 0 ] && [ -z "${filtered[$((${#filtered[@]} - 1))]}" ]; do
+	unset 'filtered[$((${#filtered[@]} - 1))]'
+done
+
+out=("${filtered[@]}")
+if [ "${#out[@]}" -gt 0 ]; then
+	last="${out[$((${#out[@]} - 1))]}"
+	is_trailer "$last" || out+=("")
+fi
+out+=("${trailers[@]}")
+
+printf '%s\n' "${out[@]}" > "$MSG_FILE"
+exit 0
