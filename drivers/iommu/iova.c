@@ -549,6 +549,54 @@ finish:
 }
 EXPORT_SYMBOL_GPL(reserve_iova);
 
+/**
+ * alloc_iova_fixed - reserve an exact, caller-specified iova range
+ * @iovad: - iova domain in question
+ * @pfn_lo: - lower page frame of the requested range
+ * @pfn_hi: - upper page frame of the requested range
+ * Unlike reserve_iova(), which merges into any overlapping range and can
+ * never fail, this reserves precisely [pfn_lo, pfn_hi] as an independently
+ * owned node, or fails. It returns -EBUSY if any part of the range is already
+ * occupied -- by an allocation or a reservation, cached in the rcache or not
+ * (a cached pfn still owns its rbtree node) -- so the caller knows it got
+ * exactly the range it asked for. Release it later with free_iova() or
+ * __free_iova(). The overlap scan and the insert are done together under
+ * iova_rbtree_lock, so a concurrent allocator cannot claim part of the range
+ * between the check and the insert.
+ * Return: 0 on success, -EBUSY on any overlap, -ENOMEM on metadata OOM,
+ * -EINVAL on a nonsensical range.
+ */
+int alloc_iova_fixed(struct iova_domain *iovad, unsigned long pfn_lo, unsigned long pfn_hi)
+{
+	struct rb_node *node;
+	unsigned long flags;
+	struct iova *iova;
+	int ret;
+
+	/* Don't allow nonsensical pfns */
+	if (WARN_ON((pfn_hi | pfn_lo) > (ULLONG_MAX >> iova_shift(iovad))))
+		return -EINVAL;
+	if (pfn_lo > pfn_hi)
+		return -EINVAL;
+
+	spin_lock_irqsave(&iovad->iova_rbtree_lock, flags);
+
+	/* Any overlap at all is a hard failure -- no merge, no adjust. */
+	for (node = rb_first(&iovad->rbroot); node; node = rb_next(node)) {
+		if (__is_range_overlap(node, pfn_lo, pfn_hi)) {
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+
+	iova = __insert_new_range(iovad, pfn_lo, pfn_hi);
+	ret = iova ? 0 : -ENOMEM;
+out:
+	spin_unlock_irqrestore(&iovad->iova_rbtree_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(alloc_iova_fixed);
+
 /*
  * Magazine caches for IOVA ranges.  For an introduction to magazines,
  * see the USENIX 2001 paper "Magazines and Vmem: Extending the Slab
