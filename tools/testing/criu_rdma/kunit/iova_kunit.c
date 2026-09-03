@@ -19,6 +19,10 @@
  *
  * See tools/testing/criu_rdma/plans/dma_iova_reserve.md (Part II).
  */
+
+/* alloc_iova_fixed() has landed in the iova layer; activate its contract. */
+#define IOVA_KUNIT_TEST_ALLOC_FIXED
+
 #include <kunit/test.h>
 #include <linux/iova.h>
 #include <linux/mm.h>
