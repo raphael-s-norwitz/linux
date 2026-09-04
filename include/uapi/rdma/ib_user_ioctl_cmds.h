@@ -604,6 +604,7 @@ enum uverbs_methods_mr {
 	UVERBS_METHOD_QUERY_MR,
 	UVERBS_METHOD_REG_DMABUF_MR,
 	UVERBS_METHOD_REG_MR,
+	UVERBS_METHOD_MR_EXPORT_DMABUF_FD,
 };
 
 enum uverbs_attrs_mr_destroy_ids {
@@ -666,6 +667,18 @@ enum uverbs_attrs_reg_mr_cmd_attr_ids {
 	UVERBS_ATTR_REG_MR_FD_OFFSET,
 	UVERBS_ATTR_REG_MR_RESP_LKEY,
 	UVERBS_ATTR_REG_MR_RESP_RKEY,
+};
+
+/*
+ * UVERBS_METHOD_MR_EXPORT_DMABUF_FD attributes.
+ *
+ * Returns a new O_CLOEXEC fd referring to the exact struct dma_buf that
+ * the DMA-BUF-backed MR named by HANDLE was registered against. Fails
+ * with -EOPNOTSUPP for a live MR that is not DMA-BUF-backed.
+ */
+enum uverbs_attrs_mr_export_dmabuf_fd_ids {
+	UVERBS_ATTR_MR_EXPORT_DMABUF_FD_HANDLE,
+	UVERBS_ATTR_MR_EXPORT_DMABUF_FD_RESP_FD,
 };
 
 enum uverbs_attrs_create_counters_cmd_attr_ids {

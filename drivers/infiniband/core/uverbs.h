@@ -197,6 +197,18 @@ struct ib_ucq_object {
 	u32			comp_events_reported;
 };
 
+struct dma_buf;
+
+struct ib_umr_object {
+	struct ib_uobject uobject;
+	struct dma_buf *dmabuf;
+};
+
+static inline struct ib_umr_object *to_ib_umr_object(struct ib_uobject *uobj)
+{
+	return container_of(uobj, struct ib_umr_object, uobject);
+}
+
 extern const struct file_operations uverbs_event_fops;
 extern const struct file_operations uverbs_async_event_fops;
 void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue);
