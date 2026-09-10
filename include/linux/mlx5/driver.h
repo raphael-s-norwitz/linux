@@ -1292,6 +1292,42 @@ static inline int mlx5_st_dealloc_index(struct mlx5_core_dev *dev, u16 st_index)
 struct mlx5_core_dev *mlx5_vf_get_core_dev(struct pci_dev *pdev);
 void mlx5_vf_put_core_dev(struct mlx5_core_dev *mdev);
 
+struct sg_table;
+
+/*
+ * Place / unplace a VA umem's pinned pages into a vfmig-tracked VF's
+ * per-VF deterministic IOVA domain, backing the ib_core umem placement
+ * hook (ib_device_ops.umem_place / .umem_unplace). mlx5_ib sets
+ * ib_device.use_umem_placement on a tracked VF and points those ops at
+ * thin wrappers around these; the core then routes every VA umem
+ * (MR / CQ / QP / SRQ / doorbell) through here instead of the default
+ * dma-iommu streaming map, replacing the per-device vfmig_dma_ops.map_sg
+ * shim for the user-object path.
+ *
+ * mlx5_vfmig_map_umem() maps each scatter-gather segment of @sgt into the
+ * VFMIG_SLOT_USER_PAGE window, fills sg_dma_address()/sg_dma_len(), sets
+ * sgt->nents, and self-unwinds a partial mapping on error. It follows the
+ * dma_map_sgtable() return convention (0 / negative errno).
+ * mlx5_vfmig_unmap_umem() reverses it and zeroes the DMA fields so the
+ * core's page unpin sees a clean sgt. Both are only invoked on a tracked
+ * VF (the domain is established at probe), so a missing per-VF domain is
+ * a driver bug rather than a graceful no-op.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_map_umem(struct mlx5_core_dev *vf_dev, struct sg_table *sgt);
+void mlx5_vfmig_unmap_umem(struct mlx5_core_dev *vf_dev, struct sg_table *sgt);
+#else
+static inline int
+mlx5_vfmig_map_umem(struct mlx5_core_dev *vf_dev, struct sg_table *sgt)
+{
+	return -EOPNOTSUPP;
+}
+static inline void
+mlx5_vfmig_unmap_umem(struct mlx5_core_dev *vf_dev, struct sg_table *sgt)
+{
+}
+#endif
+
 /*
  * Source-side retag for a freshly-registered user MR's IOVA range in the
  * per-VF vfmig deterministic IOVA domain. Called by mlx5_ib after the FW
