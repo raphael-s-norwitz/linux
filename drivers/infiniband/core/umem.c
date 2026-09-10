@@ -53,9 +53,14 @@ static void __ib_umem_release(struct ib_device *dev, struct ib_umem *umem, int d
 	struct scatterlist *sg;
 	unsigned int i;
 
-	if (dirty)
-		ib_dma_unmap_sgtable_attrs(dev, &umem->sgt_append.sgt,
-					   DMA_BIDIRECTIONAL, umem->dma_attrs);
+	if (dirty) {
+		if (dev->use_umem_placement)
+			dev->ops.umem_unplace(umem);
+		else
+			ib_dma_unmap_sgtable_attrs(dev, &umem->sgt_append.sgt,
+						   DMA_BIDIRECTIONAL,
+						   umem->dma_attrs);
+	}
 
 	for_each_sgtable_sg(&umem->sgt_append.sgt, sg, i) {
 		unpin_user_page_range_dirty_lock(sg_page(sg),
@@ -330,8 +335,17 @@ static struct ib_umem *__ib_umem_get_va(struct ib_device *device,
 	if (IS_ERR(umem))
 		return umem;
 
-	ret = ib_dma_map_sgtable_attrs(device, &umem->sgt_append.sgt,
-				       DMA_BIDIRECTIONAL, umem->dma_attrs);
+	/*
+	 * A device may own umem placement (e.g. to map into a private IOVA
+	 * arena) in place of the default streaming DMA map. The provider
+	 * populates the sg DMA fields and self-unwinds on failure.
+	 */
+	if (device->use_umem_placement)
+		ret = device->ops.umem_place(umem);
+	else
+		ret = ib_dma_map_sgtable_attrs(device, &umem->sgt_append.sgt,
+					       DMA_BIDIRECTIONAL,
+					       umem->dma_attrs);
 	if (ret) {
 		__ib_umem_release(device, umem, 0);
 		atomic64_sub(ib_umem_num_pages(umem),
