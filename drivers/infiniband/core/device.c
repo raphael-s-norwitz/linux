@@ -3031,6 +3031,8 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
 	SET_DEVICE_OP(dev_ops, set_vf_link_state);
 	SET_DEVICE_OP(dev_ops, ucontext_is_restore_mode);
 	SET_DEVICE_OP(dev_ops, ufile_hw_cleanup);
+	SET_DEVICE_OP(dev_ops, umem_place);
+	SET_DEVICE_OP(dev_ops, umem_unplace);
 	SET_DEVICE_OP(dev_ops, report_port_event);
 
 	SET_OBJ_SIZE(dev_ops, ib_ah);

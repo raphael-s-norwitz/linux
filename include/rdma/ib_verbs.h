@@ -3086,6 +3086,24 @@ struct ib_device_ops {
 	void (*report_port_event)(struct ib_device *ibdev,
 				  struct net_device *ndev, unsigned long event);
 
+	/*
+	 * umem_place / umem_unplace - Optional driver-owned placement of a
+	 * VA umem's pinned pages into device-visible addresses, replacing the
+	 * core's default streaming DMA map/unmap step.
+	 *
+	 * When the device sets ib_device.use_umem_placement, the core calls
+	 * umem_place() instead of ib_dma_map_sgtable_attrs() after pinning a
+	 * VA umem (see __ib_umem_get_va()), and umem_unplace() instead of
+	 * ib_dma_unmap_sgtable_attrs() on release. The provider populates
+	 * sg_dma_address()/sg_dma_len() (and sgt->nents) on success and must
+	 * self-unwind any partial mapping on failure; umem_unplace() reverses
+	 * it and zeroes the DMA fields. Pinning/unpinning of the pages stays
+	 * with the core. A device that sets the flag must supply both ops.
+	 * These are never consulted for dmabuf or ODP umems.
+	 */
+	int (*umem_place)(struct ib_umem *umem);
+	void (*umem_unplace)(struct ib_umem *umem);
+
 	DECLARE_RDMA_OBJ_SIZE(ib_ah);
 	DECLARE_RDMA_OBJ_SIZE(ib_counters);
 	DECLARE_RDMA_OBJ_SIZE(ib_cq);
@@ -3165,6 +3183,8 @@ struct ib_device {
 	u16                          use_cq_dim:1;
 	/* CoCo guest with DMA bounce buffering required */
 	u16                          cc_dma_bounce:1;
+	/* Route VA umem placement through ops.umem_place/umem_unplace */
+	u16                          use_umem_placement:1;
 	u8                           node_type;
 	u32			     phys_port_cnt;
 	struct ib_device_attr        attrs;
