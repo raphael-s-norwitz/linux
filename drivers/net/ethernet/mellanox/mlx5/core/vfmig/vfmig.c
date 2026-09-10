@@ -33,6 +33,7 @@
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/rwsem.h>
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/uuid.h>
@@ -3826,6 +3827,117 @@ mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev)
 	mlx5_vf_put_core_dev(pf_mdev);
 	return dom;
 }
+
+/*
+ * Source-side umem placement for a vfmig-tracked VF (header docstring in
+ * include/linux/mlx5/driver.h). Backs the ib_core placement hook
+ * (ops.umem_place): maps each pinned scatter-gather segment of @sgt into
+ * the VFMIG_SLOT_USER_PAGE window via vfmig_iova_user_page_map_phys(),
+ * recording one external registry entry per segment, and fills
+ * sg_dma_address()/sg_dma_len() so the umem is device-visible without the
+ * default dma-iommu streaming map. A later mlx5_vfmig_retag_user_*()
+ * promotes the auto-numbered entries to a stable (kind, fw_id) identity
+ * for SAVE.
+ *
+ * Mirrors the dma_map_sgtable() contract: on success every segment is
+ * mapped and sgt->nents is set to the mapped count; on failure the
+ * segments mapped so far are unwound and their DMA fields cleared.
+ * Reads vf_dev->cmd.vfmig_iova_dom, the O(1) lockless probe-time load.
+ * Callers gate on a tracked VF (ib_device.use_umem_placement), so a
+ * NULL domain here is a driver bug (warn + -ENODEV).
+ */
+int mlx5_vfmig_map_umem(struct mlx5_core_dev *vf_dev, struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+	struct scatterlist *s;
+	unsigned int i, mapped = 0;
+	int err;
+
+	if (WARN_ON_ONCE(!vf_dev || !sgt))
+		return -EINVAL;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (WARN_ON_ONCE(!dom))
+		return -ENODEV;
+
+	for_each_sgtable_sg(sgt, s, i) {
+		phys_addr_t phys = sg_phys(s);
+		unsigned int off = s->offset & ~PAGE_MASK;
+		unsigned int len = s->length;
+		dma_addr_t iova;
+
+		/*
+		 * ib_umem_pin() hands us page-aligned segments; round @phys
+		 * down and @len up so a mid-page offset still maps cleanly.
+		 * The returned dma_address carries the byte offset back.
+		 */
+		err = vfmig_iova_user_page_map_phys(dom, phys & PAGE_MASK,
+						    PAGE_ALIGN(len + off),
+						    GFP_KERNEL, &iova);
+		if (err)
+			goto err_undo;
+
+		sg_dma_address(s) = iova + off;
+		sg_dma_len(s)	  = len;
+		mapped++;
+	}
+
+	sgt->nents = mapped;
+	return 0;
+
+err_undo:
+	for_each_sg(sgt->sgl, s, mapped, i) {
+		dma_addr_t iova = sg_dma_address(s);
+		unsigned int off = iova & ~PAGE_MASK;
+		unsigned int len = sg_dma_len(s);
+
+		(void)vfmig_iova_user_page_unmap_phys(dom, iova - off,
+						      PAGE_ALIGN(len + off));
+		sg_dma_address(s) = 0;
+		sg_dma_len(s)	  = 0;
+	}
+	return err;
+}
+EXPORT_SYMBOL(mlx5_vfmig_map_umem);
+
+/*
+ * Reverse of mlx5_vfmig_map_umem() (header docstring in
+ * include/linux/mlx5/driver.h). Backs the ib_core placement hook
+ * (ops.umem_unplace): iommu_unmaps every USER_PAGE segment of @sgt via
+ * vfmig_iova_user_page_unmap_phys(), drops its external registry entry,
+ * and zeroes sg_dma_address()/sg_dma_len() so the core's subsequent
+ * page unpin sees a clean sgt. Segments never mapped (iova == 0 &&
+ * len == 0, e.g. after a partial map that already unwound) are skipped.
+ */
+void mlx5_vfmig_unmap_umem(struct mlx5_core_dev *vf_dev, struct sg_table *sgt)
+{
+	struct vfmig_iova_domain *dom;
+	struct scatterlist *s;
+	unsigned int i;
+
+	if (WARN_ON_ONCE(!vf_dev || !sgt))
+		return;
+
+	dom = vf_dev->cmd.vfmig_iova_dom;
+	if (WARN_ON_ONCE(!dom))
+		return;
+
+	for_each_sgtable_sg(sgt, s, i) {
+		dma_addr_t iova = sg_dma_address(s);
+		unsigned int len = sg_dma_len(s);
+		unsigned int off;
+
+		if (!iova && !len)
+			continue;
+
+		off = iova & ~PAGE_MASK;
+		(void)vfmig_iova_user_page_unmap_phys(dom, iova - off,
+						      PAGE_ALIGN(len + off));
+		sg_dma_address(s) = 0;
+		sg_dma_len(s)	  = 0;
+	}
+}
+EXPORT_SYMBOL(mlx5_vfmig_unmap_umem);
 
 /*
  * Public Stage-2 source-side retag entry point for the mlx5_ib MR

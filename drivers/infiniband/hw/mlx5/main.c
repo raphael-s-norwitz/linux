@@ -5476,6 +5476,26 @@ static struct ib_device *mlx5_ib_add_sub_dev(struct ib_device *parent,
 					     const char *name);
 static void mlx5_ib_del_sub_dev(struct ib_device *sub_dev);
 
+/*
+ * ib_core VA umem placement hook (enabled via use_umem_placement below on
+ * vfmig-tracked VFs): route the umem's pinned pages into the per-VF
+ * deterministic IOVA domain instead of the default dma-iommu streaming
+ * map, so the mapping is snapshot-able and replayable across migration.
+ */
+static int mlx5_ib_umem_place(struct ib_umem *umem)
+{
+	struct mlx5_ib_dev *dev = to_mdev(umem->ibdev);
+
+	return mlx5_vfmig_map_umem(dev->mdev, &umem->sgt_append.sgt);
+}
+
+static void mlx5_ib_umem_unplace(struct ib_umem *umem)
+{
+	struct mlx5_ib_dev *dev = to_mdev(umem->ibdev);
+
+	mlx5_vfmig_unmap_umem(dev->mdev, &umem->sgt_append.sgt);
+}
+
 static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.owner = THIS_MODULE,
 	.driver_id = RDMA_DRIVER_MLX5,
@@ -5549,6 +5569,8 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.restore_qp = mlx5_ib_restore_qp,
 	.ucontext_is_restore_mode = mlx5_ib_ucontext_is_restore_mode,
 	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
+	.umem_place = mlx5_ib_umem_place,
+	.umem_unplace = mlx5_ib_umem_unplace,
 
 	INIT_RDMA_OBJ_SIZE(ib_ah, mlx5_ib_ah, ibah),
 	INIT_RDMA_OBJ_SIZE(ib_counters, mlx5_ib_mcounters, ibcntrs),
@@ -5713,6 +5735,14 @@ static int mlx5_ib_stage_caps_init(struct mlx5_ib_dev *dev)
 		ib_set_device_ops(&dev->ib_dev, &mlx5_ib_dev_dmah_ops);
 
 	ib_set_device_ops(&dev->ib_dev, &mlx5_ib_dev_ops);
+
+	/*
+	 * On a vfmig-tracked VF the per-VF deterministic IOVA domain is
+	 * established before mlx5_ib probes, so route VA umem placement
+	 * through umem_place/umem_unplace instead of the default DMA map.
+	 */
+	if (mdev->cmd.vfmig_iova_dom)
+		dev->ib_dev.use_umem_placement = 1;
 
 	if (IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS))
 		dev->ib_dev.driver_def = mlx5_ib_defs;
