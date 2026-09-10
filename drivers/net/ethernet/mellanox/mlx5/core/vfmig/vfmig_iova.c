@@ -2,18 +2,23 @@
 /* Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. */
 
 /*
- * vfmig_iova: per-VF unmanaged IOVA domain + deterministic slot
- * allocator. See vfmig_iova.h for the high-level rationale; this file
- * is the implementation. All entry points serialize on dom->lock; the
- * iommu_domain is reentrant under iommu_map / iommu_unmap, so no extra
- * serialization of the underlying iommu API is needed.
+ * vfmig_iova: per-VF fixed-IOVA arena + deterministic slot allocator.
+ * See vfmig_iova.h for the high-level rationale; this file is the
+ * implementation. The VF stays on its normal managed DMA-IOMMU domain;
+ * we reserve a fixed IOVA carveout in it (dma_iova_alloc_fixed) and
+ * populate it with dma_iova_link(). All entry points serialize on
+ * dom->lock; the DMA-IOVA API is reentrant under link/unlink, so no
+ * extra serialization of the underlying layer is needed.
  */
 
 #include <linux/align.h>
 #include <linux/atomic.h>
+#include <linux/dma-map-ops.h>
+#include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/gfp.h>
 #include <linux/iommu.h>
+#include <linux/iommu-dma.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
@@ -23,8 +28,15 @@
 #include <linux/slab.h>
 #include <linux/types.h>
 
-#include "vfmig_dma_ops.h"
 #include "vfmig_iova.h"
+
+/*
+ * Byte offset of a hardware IOVA within the per-VF arena reservation.
+ * dma_iova_link()/_unlink()/_sync() all address the arena by offset
+ * from its base (dom->arena.addr == dom->base).
+ */
+#define vfmig_arena_off(dom, iova)	((size_t)((iova) - (dom)->arena.addr))
+#define vfmig_dom_dev(dom)		(&(dom)->vf_pdev->dev)
 
 /*
  * One backing page (or higher-order compound page) registered in a
@@ -48,9 +60,10 @@ struct vfmig_iova_page {
 	 * @external: the backing page is owned by the caller, not by the
 	 * registry. Set on entries created by the
 	 * vfmig_iova_user_page_map_phys() path (umem-pinned MR / CQ / QP /
-	 * SRQ buffers + doorbell records flowing through vfmig_dma_ops).
-	 * For these entries the registry tracks the (iova, len) bookkeeping
-	 * and owns the iommu_map slot, but @page and @vaddr are NULL: it
+	 * SRQ buffers + doorbell records flowing through the ib_core
+	 * umem-placement hook). For these entries the registry tracks the
+	 * (iova, len) bookkeeping and owns the arena link, but @page and
+	 * @vaddr are NULL: it
 	 * does not alloc_pages() at install nor __free_pages() at destroy,
 	 * and vfmig_iova_for_each() skips them (its callback dereferences
 	 * @vaddr, which is meaningless here).
@@ -63,7 +76,7 @@ struct vfmig_iova_page {
 	 * from a HOST_USER_PAGE wire record, before any destination-side
 	 * umem has been pinned: the (iova, len) window is reserved and the
 	 * (kind, fw_id) identity recorded in @instance_key, but there is no
-	 * iommu_map yet (@page / @vaddr stay NULL, as for any external
+	 * arena link yet (@page / @vaddr stay NULL, as for any external
 	 * entry). A later slice's restore path consumes the placeholder,
 	 * maps the freshly-pinned umem at @iova, and clears this flag. Only
 	 * ever true when @external is; always false on a fresh / SAVE-side
@@ -98,8 +111,9 @@ struct vfmig_iova_page {
  * the list with arena->slots[idx] still pointing at it (handed out).
  *
  * The IOMMU mapping is set up exactly once when the page is first grown
- * into the arena; transient_get/put never call iommu_map / iommu_unmap
- * on the hot path. Pages are only unmapped at domain_destroy time.
+ * into the arena; transient_get/put never call dma_iova_link /
+ * dma_iova_unlink on the hot path. Pages are only unlinked at
+ * domain_destroy time.
  */
 struct vfmig_transient_page {
 	struct list_head free_node;	/* on arena->free when free */
@@ -132,34 +146,21 @@ struct vfmig_transient_arena {
 };
 
 /*
- * A per-VF unmanaged paging domain the PF driver fully owns, attached
- * in place of the VF's default DMA domain. @vf_pdev is pinned for the
- * domain's lifetime; @vf_id derives the IOVA window and labels log
- * lines. The deterministic range [base, base + NR_SLOTS * SLOT_BYTES)
- * is partitioned across the slot windows; the topmost
- * VFMIG_IOVA_TRANSIENT_BYTES of the per-VF window is the transient
- * arena (cmd mailboxes).
+ * A per-VF fixed-IOVA arena reserved inside the VF's managed DMA-IOMMU
+ * domain. The VF keeps its default (dma-iommu-managed) domain, so its
+ * ordinary DMA API traffic still works; we only reserve a fixed IOVA
+ * carveout in it and populate that carveout with dma_iova_link(). @arena
+ * is the reservation returned by dma_iova_alloc_fixed(); @arena.addr ==
+ * @base. @vf_pdev is pinned for the domain's lifetime; @vf_id derives
+ * the IOVA window and labels log lines. The deterministic range
+ * [base, base + NR_SLOTS * SLOT_BYTES) is partitioned across the slot
+ * windows; the topmost VFMIG_IOVA_TRANSIENT_BYTES of the per-VF window
+ * is the transient arena (cmd mailboxes).
  */
 struct vfmig_iova_domain {
-	struct iommu_domain *iommu_dom;
+	struct dma_iova_state arena;	/* reserved [base, base+PER_VF) */
 	struct pci_dev	    *vf_pdev;	/* held via pci_dev_get() */
 	u32		     vf_id;
-
-	/*
-	 * Set by vfmig_iova_domain_detach_dev() once the iommu_dom has
-	 * been detached from @vf_pdev. Guards vfmig_iova_domain_destroy()
-	 * from doing the detach a second time. The split exists because
-	 * the iommu_dom attach MUST be torn down before pci_disable_sriov()
-	 * fires device_del on the VF (otherwise the iommu core's
-	 * BUS_NOTIFY_REMOVED_DEVICE notifier WARNs -- the per-VF group goes
-	 * empty while still holding our unmanaged domain instead of the
-	 * default), but the rest of the domain teardown (page-list drain,
-	 * kfree) must run AFTER pci_disable_sriov returns because per-VF
-	 * mlx5_core remove_one paths free DMA mappings through
-	 * vfmig_iova_free_slot() which still derefs @dom. Splitting
-	 * "detach from device" from "destroy domain" lets both hold.
-	 */
-	bool		     dev_detached;
 
 	u64		     base;
 
@@ -318,8 +319,9 @@ vfmig_iova_insert_locked(struct vfmig_iova_domain *dom,
 
 /*
  * dom->lock held. Allocate a backing page or higher-order compound,
- * iommu_map it at @iova for @len bytes, and append the registry entry.
- * Does NOT advance the cursor; callers do that themselves.
+ * link it at @iova for @len bytes into the arena, and append the
+ * registry entry. Does NOT advance the cursor; callers do that
+ * themselves.
  *
  * @slot is used to validate that @iova falls inside that slot's window;
  * a callsite passing the wrong slot for an IOVA returns -ERANGE.
@@ -349,11 +351,10 @@ vfmig_iova_install_page_locked(struct vfmig_iova_domain *dom,
 		return -EEXIST;
 
 	/*
-	 * iommu_map() rejects __GFP_HIGHMEM/COMP/DMA/DMA32 with WARN +
-	 * -EINVAL, and we additionally need page_address() to work on
-	 * the backing page. Reject the offending flags here with a clear
-	 * errno so callers don't get a stack-trace-shaped surprise from
-	 * the iommu layer.
+	 * The backing page must be lowmem so page_address() works and the
+	 * DMA-IOVA layer can link its physical address; reject the
+	 * offending flags here with a clear errno rather than deep in the
+	 * link path.
 	 */
 	if (gfp & (__GFP_COMP | __GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM)) {
 		dev_warn_ratelimited(&dom->vf_pdev->dev,
@@ -379,10 +380,19 @@ vfmig_iova_install_page_locked(struct vfmig_iova_domain *dom,
 	p->slot		= slot;
 	p->instance_key	= instance_key;
 
-	err = iommu_map(dom->iommu_dom, iova, page_to_phys(p->page), len,
-			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp);
+	err = dma_iova_link(vfmig_dom_dev(dom), &dom->arena,
+			    page_to_phys(p->page), vfmig_arena_off(dom, iova),
+			    len, DMA_BIDIRECTIONAL, 0);
 	if (err)
 		goto err_free_page;
+	err = dma_iova_sync(vfmig_dom_dev(dom), &dom->arena,
+			    vfmig_arena_off(dom, iova), len);
+	if (err) {
+		dma_iova_unlink(vfmig_dom_dev(dom), &dom->arena,
+				vfmig_arena_off(dom, iova), len,
+				DMA_BIDIRECTIONAL, 0);
+		goto err_free_page;
+	}
 
 	vfmig_iova_insert_locked(dom, p);
 	*out_p = p;
@@ -397,9 +407,9 @@ err_free_p:
 
 /*
  * dom->lock held. Install one external (caller-owned-page) registry
- * entry at @iova, mapping @phys for @len bytes. Used by the
- * vfmig_dma_ops shim to plumb umem-pinned pages through the per-VF
- * iommu_domain.
+ * entry at @iova, linking @phys for @len bytes into the arena. Used by
+ * the ib_core umem-placement hook to plumb umem-pinned pages into the
+ * per-VF carveout.
  *
  * Differs from vfmig_iova_install_page_locked in that it does not
  * alloc_pages(): the caller supplies @phys directly (from sg_phys()).
@@ -450,9 +460,19 @@ vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
 	p->instance_key	= instance_key;
 	p->external	= true;
 
-	err = iommu_map(dom->iommu_dom, iova, phys, len,
-			IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, gfp);
+	err = dma_iova_link(vfmig_dom_dev(dom), &dom->arena, phys,
+			    vfmig_arena_off(dom, iova), len,
+			    DMA_BIDIRECTIONAL, 0);
 	if (err) {
+		kfree(p);
+		return err;
+	}
+	err = dma_iova_sync(vfmig_dom_dev(dom), &dom->arena,
+			    vfmig_arena_off(dom, iova), len);
+	if (err) {
+		dma_iova_unlink(vfmig_dom_dev(dom), &dom->arena,
+				vfmig_arena_off(dom, iova), len,
+				DMA_BIDIRECTIONAL, 0);
 		kfree(p);
 		return err;
 	}
@@ -463,17 +483,26 @@ vfmig_iova_install_external_phys_locked(struct vfmig_iova_domain *dom,
 }
 
 /*
- * dom->lock held. Tear down a single registry entry: iommu_unmap,
+ * dom->lock held. Tear down a single registry entry: dma_iova_unlink,
  * release backing pages, free the bookkeeping struct. List unlink is
  * the caller's responsibility (so we can be called from list iteration).
+ *
+ * @unmap governs the arena side only: pass false when the VF's managed
+ * DMA domain has already been torn down (device removal reclaimed the
+ * iovad, its mappings and the reservation), so dma_iova_unlink() would
+ * dereference a NULL iommu_group. The backing pages and bookkeeping are
+ * ours and are always freed.
  */
 static void
 vfmig_iova_destroy_page_locked(struct vfmig_iova_domain *dom,
-			       struct vfmig_iova_page *p)
+			       struct vfmig_iova_page *p, bool unmap)
 {
 	if (!RB_EMPTY_NODE(&p->user_index_node))
 		rb_erase(&p->user_index_node, &dom->user_index);
-	(void)iommu_unmap(dom->iommu_dom, p->iova, p->len);
+	if (unmap)
+		dma_iova_unlink(vfmig_dom_dev(dom), &dom->arena,
+				vfmig_arena_off(dom, p->iova), p->len,
+				DMA_BIDIRECTIONAL, 0);
 	if (p->page)
 		__free_pages(p->page, get_order(p->len));
 	kfree(p);
@@ -482,7 +511,7 @@ vfmig_iova_destroy_page_locked(struct vfmig_iova_domain *dom,
 /* -------- transient arena ----------------------------------------------- */
 
 /*
- * dom->lock held. Grow the arena by one page: alloc_pages, iommu_map at
+ * dom->lock held. Grow the arena by one page: alloc_pages, link at
  * the next cursor IOVA, install in slots[], return the new descriptor
  * (NOT on the freelist; caller hands it to its requester directly).
  */
@@ -511,10 +540,21 @@ vfmig_transient_grow_locked(struct vfmig_iova_domain *dom, gfp_t gfp)
 	tp->vaddr = page_address(tp->page);
 	tp->iova  = a->cursor;
 
-	err = iommu_map(dom->iommu_dom, tp->iova, page_to_phys(tp->page),
-			PAGE_SIZE, IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
-			gfp);
+	err = dma_iova_link(vfmig_dom_dev(dom), &dom->arena,
+			    page_to_phys(tp->page),
+			    vfmig_arena_off(dom, tp->iova), PAGE_SIZE,
+			    DMA_BIDIRECTIONAL, 0);
 	if (err) {
+		__free_pages(tp->page, 0);
+		kfree(tp);
+		return ERR_PTR(err);
+	}
+	err = dma_iova_sync(vfmig_dom_dev(dom), &dom->arena,
+			    vfmig_arena_off(dom, tp->iova), PAGE_SIZE);
+	if (err) {
+		dma_iova_unlink(vfmig_dom_dev(dom), &dom->arena,
+				vfmig_arena_off(dom, tp->iova), PAGE_SIZE,
+				DMA_BIDIRECTIONAL, 0);
 		__free_pages(tp->page, 0);
 		kfree(tp);
 		return ERR_PTR(err);
@@ -530,12 +570,13 @@ vfmig_transient_grow_locked(struct vfmig_iova_domain *dom, gfp_t gfp)
 
 /*
  * dom->lock held. Tear down every page in the transient arena: walk
- * arena->slots[], iommu_unmap each mapped page, free the backing page
- * and the bookkeeping. Drains via slots[] rather than the freelist so a
+ * arena->slots[], dma_iova_unlink each mapped page, free the backing
+ * page and the bookkeeping. Drains via slots[] rather than the freelist so a
  * leaked (never _put()) page is still torn down. Does not free the
  * slots[] array itself (the caller does).
  */
-static void vfmig_transient_drain_locked(struct vfmig_iova_domain *dom)
+static void vfmig_transient_drain_locked(struct vfmig_iova_domain *dom,
+					 bool unmap)
 {
 	struct vfmig_transient_arena *a = &dom->transient;
 	unsigned int i;
@@ -547,7 +588,10 @@ static void vfmig_transient_drain_locked(struct vfmig_iova_domain *dom)
 
 		if (!tp)
 			continue;
-		(void)iommu_unmap(dom->iommu_dom, tp->iova, PAGE_SIZE);
+		if (unmap)
+			dma_iova_unlink(vfmig_dom_dev(dom), &dom->arena,
+					vfmig_arena_off(dom, tp->iova),
+					PAGE_SIZE, DMA_BIDIRECTIONAL, 0);
 		__free_pages(tp->page, 0);
 		kfree(tp);
 		a->slots[i] = NULL;
@@ -563,7 +607,6 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 			     struct vfmig_iova_domain **out)
 {
 	struct vfmig_iova_domain *dom;
-	struct iommu_domain *idom;
 	u64 base;
 	unsigned int s;
 	int err;
@@ -576,6 +619,39 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	base = VFMIG_IOVA_BASE + (u64)vf_id * VFMIG_IOVA_PER_VF;
 	if (base < VFMIG_IOVA_BASE)	/* wrapped */
 		return -ERANGE;
+
+	/*
+	 * The arena lives inside the VF's managed dma-iommu domain: its IOVA
+	 * allocator is what dma_iova_alloc_fixed() reserves from and its page
+	 * tables are what dma_iova_link() programs. A VF in IOMMU passthrough
+	 * (an identity default domain, e.g. from iommu=pt) has neither -- the
+	 * device emits physical addresses, which are neither reservable nor
+	 * reproducible across a migration. Refuse tracking with an actionable
+	 * message instead of the opaque -EOPNOTSUPP the reservation call
+	 * would otherwise return.
+	 */
+	if (!use_dma_iommu(&vf_pdev->dev)) {
+		dev_warn(&vf_pdev->dev,
+			 "vfmig_iova: vf %u is in IOMMU passthrough (identity domain); migratable VFs require a managed DMA-IOMMU domain -- disable iommu=pt or set this VF's iommu_group type to DMA\n",
+			 vf_id);
+		return -EOPNOTSUPP;
+	}
+
+	/*
+	 * The arena keeps the VF on its managed DMA-IOMMU domain and backs
+	 * every migratable buffer with dma_iova_link(IOMMU_CACHE). That is
+	 * a valid substitute for dma_alloc_coherent() only on a coherent
+	 * device -- exactly the envelope user RDMA already requires (MR
+	 * pages are mapped once and accessed by HCA + CPU with no
+	 * dma_sync). Refuse tracking on a non-coherent device rather than
+	 * silently handing the firmware uncached memory.
+	 */
+	if (!dev_is_dma_coherent(&vf_pdev->dev)) {
+		dev_warn(&vf_pdev->dev,
+			 "vfmig_iova: vf %u device is not DMA-coherent; migration unsupported\n",
+			 vf_id);
+		return -EOPNOTSUPP;
+	}
 
 	dom = kzalloc(sizeof(*dom), GFP_KERNEL);
 	if (!dom)
@@ -624,68 +700,35 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 		goto err_free_dom;
 	}
 
-	idom = iommu_paging_domain_alloc(&vf_pdev->dev);
-	if (IS_ERR(idom)) {
-		err = PTR_ERR(idom);
-		dev_warn(&vf_pdev->dev,
-			 "vfmig_iova: paging_domain_alloc failed: %d\n", err);
-		goto err_free_dom;
-	}
-	dom->iommu_dom = idom;
-
-	err = iommu_attach_device(dom->iommu_dom, &vf_pdev->dev);
-	if (err) {
-		dev_warn(&vf_pdev->dev,
-			 "vfmig_iova: attach failed: %d\n", err);
-		goto err_free_idom;
-	}
-
-	/*
-	 * Validate that the full IOVA window (deterministic slots +
-	 * transient arena) fits inside the IOMMU's geometry aperture. The
-	 * underlying iommu driver picks aperture_end from the hardware
-	 * address width (e.g. 39 bits on some Intel VT-d), and iommu_map()
-	 * returns -ERANGE for any IOVA outside it. Catch the mismatch here
-	 * so the failure surfaces at "set_tracked enable=1" with a printed
-	 * reason rather than deep inside a later cmd-ring DMA.
-	 */
-	if (dom->base < dom->iommu_dom->geometry.aperture_start ||
-	    dom->transient.end - 1 > dom->iommu_dom->geometry.aperture_end) {
-		dev_warn(&vf_pdev->dev,
-			 "vfmig_iova: vf %u IOVA window [0x%llx, 0x%llx) does not fit IOMMU aperture [0x%llx, 0x%llx]\n",
-			 vf_id, dom->base, dom->transient.end,
-			 dom->iommu_dom->geometry.aperture_start,
-			 dom->iommu_dom->geometry.aperture_end);
-		err = -EOPNOTSUPP;
-		goto err_detach;
-	}
-
 	dom->vf_pdev = pci_dev_get(vf_pdev);
 
 	/*
-	 * Install the per-VF dma_map_ops shim now that the unmanaged
-	 * domain is attached. From here the DMA API on this VF dispatches
-	 * through vfmig_dma_ops instead of the (now-detached) default
-	 * dma-iommu path. Must be undone before iommu_detach_device on
-	 * every teardown path.
+	 * Reserve the fixed per-VF carveout in the VF's managed DMA-IOMMU
+	 * domain. dma_iova_alloc_fixed() grabs exactly [base, base+PER_VF)
+	 * or fails: an overlap with the SW-MSI cookie, an
+	 * iommu_dma_get_resv_regions() window, an already-allocated IOVA,
+	 * or a range past the IOMMU aperture all return an error, in which
+	 * case SET_TRACKED fails here with a printed reason rather than
+	 * deep inside a later cmd-ring DMA. Reserving before any other DMA
+	 * traffic on this VF is a correctness requirement.
 	 */
-	err = vfmig_dma_ops_attach(vf_pdev, dom);
+	err = dma_iova_alloc_fixed(&vf_pdev->dev, &dom->arena, base,
+				   VFMIG_IOVA_PER_VF);
 	if (err) {
 		dev_warn(&vf_pdev->dev,
-			 "vfmig_iova: dma_ops attach failed: %d\n", err);
+			 "vfmig_iova: vf %u could not reserve IOVA window [0x%llx, 0x%llx): %d\n",
+			 vf_id, dom->base, base + VFMIG_IOVA_PER_VF, err);
 		goto err_pci_put;
 	}
 
 	dev_info(&vf_pdev->dev,
-		 "vfmig_iova: vf %u domain attached: kernel slots [0x%llx, 0x%llx) (%u x 0x%llx) + kcoherent carve 0x%llx + USER_PAGE [0x%llx, 0x%llx) + transient [0x%llx, 0x%llx) within IOMMU aperture [0x%llx, 0x%llx]\n",
+		 "vfmig_iova: vf %u arena reserved on managed domain: kernel slots [0x%llx, 0x%llx) (%u x 0x%llx) + kcoherent carve 0x%llx + USER_PAGE [0x%llx, 0x%llx) + transient [0x%llx, 0x%llx)\n",
 		 vf_id, dom->base,
 		 vfmig_iova_slot_base(dom, VFMIG_SLOT_USER_PAGE),
 		 VFMIG_IOVA_KERNEL_NR_SLOTS, (u64)VFMIG_IOVA_SLOT_BYTES,
 		 (u64)VFMIG_IOVA_KCOHERENT_BYTES,
 		 vfmig_iova_user_page_start(dom), dom->transient.base,
-		 dom->transient.base, dom->transient.end,
-		 dom->iommu_dom->geometry.aperture_start,
-		 dom->iommu_dom->geometry.aperture_end);
+		 dom->transient.base, dom->transient.end);
 
 	*out = dom;
 	return 0;
@@ -693,10 +736,6 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 err_pci_put:
 	pci_dev_put(dom->vf_pdev);
 	dom->vf_pdev = NULL;
-err_detach:
-	iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
-err_free_idom:
-	iommu_domain_free(dom->iommu_dom);
 err_free_dom:
 	kfree(dom->transient.slots);
 	mutex_destroy(&dom->lock);
@@ -704,109 +743,51 @@ err_free_dom:
 	return err;
 }
 
-/*
- * Detach the per-VF iommu_dom from the VF's PCI device, leaving the
- * domain struct (page list, transient slots, iommu_dom pointer) intact
- * so vfmig_iova_free_slot() still works for any teardown DMA that races
- * after the detach. Idempotent: a second call is a no-op.
- *
- * Required call ordering for the SR-IOV teardown path:
- *
- *   pci_disable_sriov(pf_pdev)             // tears down each VF:
- *     for each bound vf:
- *       device_release_driver(vf)
- *         mlx5_core remove_one(vf)
- *           ... FW commands, EQ drain, DMA frees ...
- *           [HOOK] vfmig_iova_domain_detach_dev(dom_for_this_vf)
- *       pci_remove_bus_device(vf)
- *         device_del(vf)                   // iommu core: no WARN
- *   mlx5_vfmig_pf_drop_iova_domains(pf)    // frees the domain structs
- *       vfmig_iova_domain_destroy(dom)     // drain pages, skip detach
- */
-void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom)
-{
-	struct pci_dev *vf_pdev;
-
-	if (!dom || dom->dev_detached)
-		return;
-	vf_pdev = dom->vf_pdev;
-	if (!vf_pdev)
-		return;
-
-	/* Uninstall the shim before detaching the domain (reverse of create). */
-	vfmig_dma_ops_detach(vf_pdev);
-	iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
-	dom->dev_detached = true;
-
-	dev_info(&vf_pdev->dev,
-		 "vfmig_iova: vf %u domain detached from device (struct kept for cleanup)\n",
-		 dom->vf_id);
-}
-
-void vfmig_iova_domain_detach_dev_if_unbound(struct vfmig_iova_domain *dom)
-{
-	if (!dom || dom->dev_detached || !dom->vf_pdev)
-		return;
-	if (dom->vf_pdev->driver)
-		return;
-	vfmig_iova_domain_detach_dev(dom);
-}
-
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 {
 	struct vfmig_iova_page *p, *tmp;
 	struct pci_dev *vf_pdev;
+	bool arena_live;
 
 	if (!dom)
 		return;
 	vf_pdev = dom->vf_pdev;
 
+	/*
+	 * The arena lives in the VF's managed DMA-IOMMU domain. On the
+	 * SET_TRACKED{disable} path the VF (and that domain) are still
+	 * present, so we must dma_iova_unlink() every mapping and release
+	 * the reservation. On the teardown path this runs from
+	 * mlx5_sriov_disable() *after* pci_disable_sriov() has removed the
+	 * VF pci_dev: the device's iommu_group -- and with it the iovad,
+	 * its page tables and our reservation -- are already gone, so any
+	 * dma_iova_*() call here would dereference a NULL iommu_group. Skip
+	 * the arena side in that case and only free memory we own.
+	 */
+	arena_live = vf_pdev && iommu_get_domain_for_dev(&vf_pdev->dev);
+
 	mutex_lock(&dom->lock);
-	vfmig_transient_drain_locked(dom);
+	vfmig_transient_drain_locked(dom, arena_live);
 	list_for_each_entry_safe(p, tmp, &dom->pages, node) {
 		list_del(&p->node);
-		vfmig_iova_destroy_page_locked(dom, p);
+		vfmig_iova_destroy_page_locked(dom, p, arena_live);
 	}
 	dom->n_pages = 0;
+	if (arena_live)
+		dma_iova_free_fixed(&vf_pdev->dev, &dom->arena);
 	mutex_unlock(&dom->lock);
 
 	if (vf_pdev) {
-		/*
-		 * If the caller already invoked
-		 * vfmig_iova_domain_detach_dev() during the VF's mlx5_core
-		 * remove_one (bound VFs) or the PF-side detach-unbound pass
-		 * (never-bound VFs), this is a no-op; otherwise do the
-		 * detach now.
-		 */
-		if (!dom->dev_detached) {
-			vfmig_dma_ops_detach(vf_pdev);
-			iommu_detach_device(dom->iommu_dom, &vf_pdev->dev);
-			dom->dev_detached = true;
-		}
 		dev_info(&vf_pdev->dev,
-			 "vfmig_iova: vf %u domain detached and freed\n",
-			 dom->vf_id);
-	}
-	iommu_domain_free(dom->iommu_dom);
-	if (vf_pdev)
+			 "vfmig_iova: vf %u arena %s\n", dom->vf_id,
+			 arena_live ? "released" :
+				      "reclaimed with VF domain");
 		pci_dev_put(vf_pdev);
+	}
 
 	kfree(dom->transient.slots);
 	mutex_destroy(&dom->lock);
 	kfree(dom);
-}
-
-int vfmig_iova_kcoherent_window(struct vfmig_iova_domain *dom,
-				struct iommu_domain **iommu_dom,
-				u64 *base, u64 *len)
-{
-	if (!dom || !iommu_dom || !base || !len)
-		return -EINVAL;
-
-	*iommu_dom = dom->iommu_dom;
-	*base = vfmig_iova_slot_base(dom, VFMIG_SLOT_USER_PAGE);
-	*len = VFMIG_IOVA_KCOHERENT_BYTES;
-	return 0;
 }
 
 int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
@@ -947,7 +928,7 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 	}
 	list_del(&p->node);
 	dom->n_pages--;
-	vfmig_iova_destroy_page_locked(dom, p);
+	vfmig_iova_destroy_page_locked(dom, p, true);
 
 out_unlock:
 	mutex_unlock(&dom->lock);
@@ -1052,7 +1033,7 @@ int vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
 
 	list_del(&p->node);
 	dom->n_pages--;
-	vfmig_iova_destroy_page_locked(dom, p);
+	vfmig_iova_destroy_page_locked(dom, p, true);
 	err = 0;
 
 out_unlock:
@@ -1233,7 +1214,7 @@ vfmig_iova_user_index_next_sibling_locked(struct vfmig_iova_page *p)
  * Install a LOAD-side awaiting-bind placeholder: an external USER_PAGE
  * registry entry that reserves the wire-provided [iova, iova+len) window
  * and records the (kind, fw_id) identity in @instance_key, but installs
- * no iommu_map (there is no umem to point at yet -- @page / @vaddr stay
+ * no arena link (there is no umem to point at yet -- @page / @vaddr stay
  * NULL). @instance_key must already be retagged (kind byte != NONE); the
  * placeholder is what a later slice's restore path looks up and binds.
  * Same window/alignment/duplicate validation as the phys installer.
@@ -1534,10 +1515,10 @@ int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 	}
 
 	/*
-	 * One iommu_map per dst sg. sg->offset is 0 and sg->length is
+	 * One dma_iova_link per dst sg. sg->offset is 0 and sg->length is
 	 * PAGE_SIZE-aligned for umem-pinned sg_tables; validate per sg
 	 * so a future non-umem caller fails loudly rather than tripping
-	 * iommu_map's internal alignment WARN.
+	 * the link path's internal alignment WARN.
 	 */
 	iova_start = head->iova;
 	iova_cur   = iova_start;
@@ -1555,9 +1536,9 @@ int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 			err = -EINVAL;
 			goto out_rollback;
 		}
-		err = iommu_map(dom->iommu_dom, iova_cur, phys, sg->length,
-				IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
-				GFP_KERNEL);
+		err = dma_iova_link(vfmig_dom_dev(dom), &dom->arena, phys,
+				    vfmig_arena_off(dom, iova_cur),
+				    sg->length, DMA_BIDIRECTIONAL, 0);
 		if (err)
 			goto out_rollback;
 
@@ -1565,6 +1546,12 @@ int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 		sg_dma_len(sg)	   = sg->length;
 		iova_cur += sg->length;
 	}
+
+	err = dma_iova_sync(vfmig_dom_dev(dom), &dom->arena,
+			    vfmig_arena_off(dom, iova_start),
+			    iova_cur - iova_start);
+	if (err)
+		goto out_rollback;
 
 	/*
 	 * All-or-nothing: every sibling flips together so a partial
@@ -1583,15 +1570,15 @@ out_unlock:
 
 out_rollback:
 	/*
-	 * Undo the iommu_maps issued in this call. Per design §A.H L2
-	 * the caller treats the umem as opaque on error and drops pins
-	 * via ib_umem_release(); vfmig_dma_ops.unmap_sg skips
-	 * zero-iova sgs, so partially-populated sgs see no double
-	 * unmap. Every sibling stays awaiting_bind=true for retry.
+	 * Undo the dma_iova_links issued in this call. The caller treats
+	 * the umem as opaque on error and drops pins via
+	 * ib_umem_release(); every sibling stays awaiting_bind=true for
+	 * retry.
 	 */
 	if (iova_cur > iova_start)
-		(void)iommu_unmap(dom->iommu_dom, iova_start,
-				  iova_cur - iova_start);
+		dma_iova_unlink(vfmig_dom_dev(dom), &dom->arena,
+				vfmig_arena_off(dom, iova_start),
+				iova_cur - iova_start, DMA_BIDIRECTIONAL, 0);
 	goto out_unlock;
 }
 EXPORT_SYMBOL(vfmig_iova_bind_user_object);

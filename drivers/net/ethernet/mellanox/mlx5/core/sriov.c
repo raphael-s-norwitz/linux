@@ -148,14 +148,14 @@ mlx5_device_disable_sriov(struct mlx5_core_dev *dev, int num_vfs, bool clear_vf,
 	mlx5_vfmig_pf_drop_vf_uuids(dev);
 
 	/*
-	 * Backstop detach + free of per-VF vfmig IOVA domains for the
-	 * driver-unload path (mlx5_sriov_detach() -> here), where the VFs
-	 * are disabled without going through mlx5_sriov_disable(). The VFs
-	 * still exist as PCI devices at this point, so the unmanaged domain
-	 * is detached (restoring the default DMA domain) before they go
-	 * away. Idempotent: on the sriov_numvfs=0 path mlx5_sriov_disable()
-	 * has already dropped the domains before pci_disable_sriov(), so
-	 * this is a no-op there.
+	 * Backstop free of per-VF vfmig IOVA domains for the driver-unload
+	 * path (mlx5_sriov_detach() -> here), where the VFs are disabled
+	 * without going through mlx5_sriov_disable(). The VFs still exist as
+	 * PCI devices here, so each domain releases its arena reservation
+	 * back to the VF's still-live managed DMA-IOMMU domain before the VF
+	 * goes away. Idempotent: on the sriov_numvfs=0 path
+	 * mlx5_sriov_disable() has already freed the domains after
+	 * pci_disable_sriov(), so this is a no-op there.
 	 */
 	mlx5_vfmig_pf_drop_iova_domains(dev);
 
@@ -245,19 +245,7 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	 * vfmig_iova_free_slot() caller remains -- dropping first is a
 	 * use-after-free, and yanking the cmd ring's IOVA backing out from
 	 * under a still-bound VF's teardown hangs its FW commands.
-	 *
-	 * Before pci_disable_sriov() we still must detach the iommu_dom from
-	 * any driverless VF that has one attached: such a VF has no
-	 * remove_one() to run mlx5_vfmig_vf_detach_iova_domain(), so without
-	 * a pre-detach the iommu core WARNs when device_del() empties its
-	 * group while our unmanaged domain is still in place of the default.
-	 * The pre-detach is gated on vf_pdev->driver == NULL so it never
-	 * races a bound VF's still-active FW DMA -- bound VFs detach from
-	 * remove_one()'s tail, after mlx5_pci_close() drains the cmd ring +
-	 * EQs. vfmig_iova_domain_detach_dev() sets @dev_detached so the drop
-	 * below skips the redundant detach.
 	 */
-	mlx5_vfmig_pf_detach_unbound_iova_domains(dev);
 	pci_disable_sriov(pdev);
 	mlx5_vfmig_pf_drop_iova_domains(dev);
 	devl_lock(devlink);

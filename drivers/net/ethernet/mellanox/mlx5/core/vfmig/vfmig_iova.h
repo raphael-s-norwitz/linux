@@ -13,8 +13,11 @@
  * out fresh, unrelated IOVAs, so after LOAD the firmware would
  * dereference addresses that point nowhere. The fix, built in layers:
  *
- *   1. Give each migratable VF an unmanaged paging iommu_domain that
- *      the PF driver fully owns (this file's domain lifecycle).
+ *   1. Keep each migratable VF on its normal managed DMA-IOMMU domain
+ *      and reserve a fixed IOVA carveout in it with
+ *      dma_iova_alloc_fixed() (this file's domain lifecycle). The VF's
+ *      ordinary DMA-API traffic still works; only the carveout is
+ *      PF-managed.
  *   2. Lay out a fixed per-VF IOVA window at a high, well-known base so
  *      the source's IOVAs are reproducible on the destination.
  *   3. Provide a slot-tagged allocator (vfmig_iova_alloc_slot) that the
@@ -39,12 +42,13 @@
  *
  * Coexistence with dma-iommu
  * --------------------------
- * Attaching an IOMMU_DOMAIN_UNMANAGED displaces the device's
- * dma-iommu-managed default DMA domain, so while our domain is attached
- * dma_alloc_coherent() on the VF WILL fail -- nothing routes DMA-API
- * calls into our domain yet. That is intentional: a tracked VF has no
- * usable DMA until the allocator routing lands, so it must stay unbound
- * from its driver while tracked (SET_TRACKED enforces this).
+ * The VF keeps its dma-iommu-managed default domain, so ordinary
+ * dma_alloc_coherent() / dma_map_*() on the VF continue to work
+ * (streaming netdev traffic, cmd mailboxes) outside the carveout. The
+ * reserved arena is populated with dma_iova_link(); those IOVAs are the
+ * only PF-managed, migration-recorded addresses. Because the reservation
+ * must grab its exact fixed range before any other DMA races it, the
+ * carveout is reserved at SET_TRACKED.
  */
 
 #ifndef __MLX5_CORE_VFMIG_IOVA_H__
@@ -92,9 +96,8 @@ struct vfmig_iova_domain;
  *                          VF's probe path routes through the allocator,
  *                          so a fresh tracked VF can bind.
  *   VFMIG_SLOT_USER_PAGE -- user-space-pinned MR / CQ / QP / SRQ buffers
- *                          and doorbell records. ib_umem_get ->
- *                          dma_map_sgtable lands here (via the per-VF
- *                          dma_ops shim added in a later patch); the
+ *                          and doorbell records. ib_umem_get lands here
+ *                          via the ib_core umem-placement hook; the
  *                          backing pages are umem-owned, so entries here
  *                          are external and skip page alloc/free. Unlike
  *                          the fixed kernel slots this slot is
@@ -216,60 +219,27 @@ static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
 	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
 
 /*
- * Allocate an unmanaged paging iommu_domain, attach it to @vf_pdev, and
- * return the handle in *@out. @vf_pdev must be unbound and its
- * device_lock held by the caller. Returns 0 on success (with a pinned
- * reference on @vf_pdev held for the domain's lifetime), -EOPNOTSUPP if
- * the per-VF IOVA window does not fit the device's IOMMU aperture, or a
- * negative errno from the iommu core.
+ * Reserve the fixed per-VF IOVA carveout in @vf_pdev's managed DMA-IOMMU
+ * domain and return the handle in *@out. Returns 0 on success (with a
+ * pinned reference on @vf_pdev held for the domain's lifetime),
+ * -EOPNOTSUPP if the VF is not a DMA-coherent, dma-iommu-managed device,
+ * or a negative errno if the exact IOVA range could not be reserved.
  */
 int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 			      struct vfmig_iova_domain **out);
 
 /*
- * Detach @dom's iommu_dom from its VF's PCI device, keeping the domain
- * struct alive for a later vfmig_iova_domain_destroy(). Must run while
- * the VF's struct device still exists (before pci_disable_sriov fires
- * device_del) to avoid the iommu core's empty-group WARN. Idempotent;
- * safe with @dom == NULL. See the implementation for the teardown
- * ordering contract.
- */
-void vfmig_iova_domain_detach_dev(struct vfmig_iova_domain *dom);
-
-/*
- * Like vfmig_iova_domain_detach_dev(), but only acts when @dom's VF is
- * not currently driver-bound. Bound VFs detach their own domain from
- * mlx5_core's remove_one() tail (after the cmd ring + EQs are drained);
- * this covers tracked VFs that were never bound and thus have no
- * remove_one() to run that hook. Safe with @dom == NULL.
- */
-void vfmig_iova_domain_detach_dev_if_unbound(struct vfmig_iova_domain *dom);
-
-/*
- * Detach @dom from its VF, unmap + free every registry page, free the
- * iommu_domain, and drop the pinned VF reference. The VF must be
- * unbound. Safe with @dom == NULL.
+ * Unlink + free every registry page, release the arena reservation, and
+ * drop the pinned VF reference. Safe with @dom == NULL.
  */
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
 
 /*
- * Expose the per-VF iommu_domain and the kcoherent IOVA sub-window to
- * the dma_ops shim, which owns the non-migrated kcoherent arena
- * allocator itself. This is a passive accessor: it returns the domain
- * layout (@iommu_dom, and the window [*@base, *@base + *@len)), not an
- * allocation. The window is the bottom VFMIG_IOVA_KCOHERENT_BYTES of
- * VFMIG_SLOT_USER_PAGE's range and never overlaps a deterministic slot.
- * Returns 0, or -EINVAL on a bad argument.
- */
-int  vfmig_iova_kcoherent_window(struct vfmig_iova_domain *dom,
-				 struct iommu_domain **iommu_dom,
-				 u64 *base, u64 *len);
-
-/*
  * Allocate @size bytes of DMA-able memory from @slot's sub-window at the
  * slot's next deterministic IOVA. Backing pages are kernel-owned and
- * zeroed; the mapping is installed in the per-VF iommu_domain with
- * IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE.
+ * zeroed; the mapping is linked into the per-VF arena with
+ * dma_iova_link(DMA_BIDIRECTIONAL) (IOMMU_CACHE on the coherent device
+ * the arena requires).
  *
  * @instance_key: caller-pinned per-slot identity, or 0 for per-slot
  *		  auto-numbering.
@@ -298,8 +268,8 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 
 /*
  * Map a caller-owned physical address into the VFMIG_SLOT_USER_PAGE
- * window. Backs vfmig_dma_ops's .map_sg on tracked VFs: one IOMMU
- * mapping per umem-pinned scatter-gather segment (user MR / CQ / QP /
+ * window. Backs the ib_core umem-placement hook on tracked VFs: one
+ * arena link per umem-pinned scatter-gather segment (user MR / CQ / QP /
  * SRQ buffers, doorbell records). Unlike vfmig_iova_alloc_slot() this
  * does not allocate backing memory -- @phys is supplied by the caller
  * (from sg_phys()) and stays pinned by the umem for the mapping's life.

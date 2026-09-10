@@ -2196,15 +2196,6 @@ static void remove_one(struct pci_dev *pdev)
 	mlx5_uninit_one(dev);
 	mlx5_shd_uninit(dev);
 	mlx5_pci_close(dev);
-	/*
-	 * On a tracked VF, detach its per-VF unmanaged iommu_domain now,
-	 * after mlx5_pci_close() has drained the cmd ring + EQs and before
-	 * the PCI core fires device_del: the iommu core WARNs if a VF's
-	 * group empties while our domain is still attached in place of the
-	 * default. No-op on PFs and untracked VFs. The domain struct is
-	 * freed later by the PF's mlx5_vfmig_pf_drop_iova_domains().
-	 */
-	mlx5_vfmig_vf_detach_iova_domain(dev);
 	mlx5_mdev_uninit(dev);
 	mlx5_adev_idx_free(dev->priv.adev_idx);
 	mlx5_devlink_free(devlink);
