@@ -1853,6 +1853,88 @@ void dma_iova_free(struct device *dev, struct dma_iova_state *state)
 }
 EXPORT_SYMBOL_GPL(dma_iova_free);
 
+/**
+ * dma_iova_alloc_fixed - Reserve a caller-chosen IOVA range
+ * @dev: Device to reserve the IOVA space for
+ * @state: IOVA state to populate on success
+ * @addr: exact IOVA base to reserve (IOMMU-granule aligned)
+ * @size: size of the range (IOMMU-granule aligned)
+ *
+ * Unlike dma_iova_try_alloc(), which returns an allocator-chosen base, this
+ * reserves the exact [@addr, @addr + @size) range so it is excluded from
+ * ordinary streaming maps and dma_iova_try_alloc(), and can later be
+ * re-linked at the same address (e.g. to restore firmware-referenced IOVAs
+ * across migration).
+ * Only address space is reserved: no physical memory and no IOMMU PTEs.
+ * Undo with dma_iova_free_fixed() after unlinking any dma_iova_link() ranges.
+ *
+ * Return:
+ * * 0		- range reserved and recorded in @state.
+ * * -EOPNOTSUPP	- @dev is not using DMA-IOMMU.
+ * * -EINVAL	- zero/misaligned size or base.
+ * * -EBUSY	- range overlaps an existing allocation or reservation.
+ * * -ENOMEM	- allocator metadata allocation failed.
+ */
+int dma_iova_alloc_fixed(struct device *dev, struct dma_iova_state *state,
+		dma_addr_t addr, size_t size)
+{
+	struct iommu_domain *domain;
+	struct iommu_dma_cookie *cookie;
+	struct iova_domain *iovad;
+	unsigned long pfn_lo, pfn_hi;
+	int ret;
+
+	memset(state, 0, sizeof(*state));
+	if (!use_dma_iommu(dev))
+		return -EOPNOTSUPP;
+	if (!size || ((u64)size & DMA_IOVA_USE_SWIOTLB))
+		return -EINVAL;
+
+	domain = iommu_get_dma_domain(dev);
+	cookie = domain->iova_cookie;
+	iovad = &cookie->iovad;
+
+	if (!IS_ALIGNED(addr, iovad->granule) ||
+	    !IS_ALIGNED(size, iovad->granule))
+		return -EINVAL;
+
+	pfn_lo = addr >> iova_shift(iovad);
+	pfn_hi = (addr + size - 1) >> iova_shift(iovad);
+
+	ret = alloc_iova_fixed(iovad, pfn_lo, pfn_hi);
+	if (ret)
+		return ret;
+
+	state->addr = addr;
+	state->__size = size;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(dma_iova_alloc_fixed);
+
+/**
+ * dma_iova_free_fixed - Release a range reserved by dma_iova_alloc_fixed()
+ * @dev: Device the range was reserved for
+ * @state: IOVA state populated by dma_iova_alloc_fixed()
+ *
+ * Non-caching counterpart to dma_iova_alloc_fixed(): the range is returned to
+ * the IOVA rbtree immediately (it never enters the per-CPU rcache), so an
+ * identical dma_iova_alloc_fixed() at the same base succeeds afterwards. All
+ * dma_iova_link() mappings within the range must be unlinked first.
+ */
+void dma_iova_free_fixed(struct device *dev, struct dma_iova_state *state)
+{
+	struct iommu_domain *domain = iommu_get_dma_domain(dev);
+	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+	struct iova_domain *iovad = &cookie->iovad;
+
+	if (!state->__size)
+		return;
+
+	free_iova(iovad, state->addr >> iova_shift(iovad));
+	memset(state, 0, sizeof(*state));
+}
+EXPORT_SYMBOL_GPL(dma_iova_free_fixed);
+
 static int __dma_iova_link(struct device *dev, dma_addr_t addr,
 		phys_addr_t phys, size_t size, enum dma_data_direction dir,
 		unsigned long attrs)
