@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0
 #
-# Out-of-tree KUnit module for fixed-address IOVA reservation.
+# Out-of-tree KUnit modules for fixed-address IOVA reservation:
+#   iova_kunit  - pure allocator invariant on a synthetic iova_domain.
+#   arena_kunit - DMA-API wrappers + dma_iova_link on a real DMA-IOMMU
+#                 device (pass bdf=<DDDD:BB:DD.F>).
 #
-# This test is deliberately kept OUT of drivers/iommu so the in-tree
+# These tests are deliberately kept OUT of drivers/iommu so the in-tree
 # subsystem stays free of project test wiring (no Kconfig, no Makefile
-# edits). It builds as an external kernel module against a KUnit-enabled
+# edits). They build as external kernel modules against a KUnit-enabled
 # kernel tree:
 #
 #     make -C /path/to/linux M=$(pwd) modules
@@ -17,15 +20,19 @@
 # satisfied by an ordinary dma-iommu kernel with KUnit enabled); no
 # in-tree Kconfig symbol is required.
 #
-# Run the suite by loading the module -- results appear in dmesg and under
-# /sys/kernel/debug/kunit/iova_fixed/results:
+# Run a suite by loading its module -- results appear in dmesg and under
+# /sys/kernel/debug/kunit/<suite>/results:
 #
 #     sudo insmod iova_kunit.ko
 #     sudo rmmod  iova_kunit
 #
+#     sudo insmod arena_kunit.ko bdf=0000:03:00.1
+#     sudo rmmod  arena_kunit
+#
 ifneq ($(KERNELRELEASE),)
 
 obj-m += iova_kunit.o
+obj-m += arena_kunit.o
 
 else
 
