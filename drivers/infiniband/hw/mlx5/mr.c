@@ -914,6 +914,30 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 }
 
 /*
+ * Is @mkey disabled (free)?
+ *
+ * Decides which UMR a bind can use. A free mkey takes the
+ * MLX5_IB_UPD_XLT_ENABLE update -- enable, PD, access and translations in
+ * one WQE, asserting CHECK_NOT_FREE -- which is how create_real_mr()
+ * brings a fresh MR live. A live mkey can only take a plain xlt rewrite,
+ * which asserts CHECK_FREE.
+ *
+ * Returns 1 free, 0 live, negative on a failed query.
+ */
+static int mlx5_ib_mkey_is_free(struct mlx5_ib_dev *dev, u32 mkey)
+{
+	u32 out[MLX5_ST_SZ_DW(query_mkey_out)] = {};
+	int err;
+
+	err = mlx5_core_query_mkey(dev->mdev, mkey, out, sizeof(out));
+	if (err)
+		return err;
+
+	return MLX5_GET(mkc, MLX5_ADDR_OF(query_mkey_out, out,
+					  memory_key_mkey_entry), free);
+}
+
+/*
  * Detach a DMA-BUF MR from its backing, keeping the mkey.
  *
  * Zap the translations, tear down the exporter's mapping, and mark the
@@ -1041,6 +1065,219 @@ static const struct dma_buf_attach_ops mlx5_ib_dmabuf_attach_ops = {
 	.allow_peer2peer = true,
 	.invalidate_mappings = mlx5_ib_dmabuf_invalidate_cb,
 };
+
+/*
+ * Point an unbound DMA-BUF MR at a new dma_buf, keeping the mkey.
+ *
+ * The restore half of the pair UVERBS_METHOD_MR_UNBIND_DMABUF opens. It
+ * accepts an MR in either shape the unbound state comes in:
+ *
+ *   - unbind detached the umem in place (mr->umem is a revoked, exporter-less
+ *     ib_umem_dmabuf husk), or
+ *   - RESTORE_MR adopted the mkey with nothing behind it (mr->umem NULL).
+ *
+ * Geometry comes from whichever is available; ibmr.length and ibmr.iova are
+ * authoritative for a restored shell, since the dispatcher stamped them from
+ * the image. The offset keeps uverbs' (offset & ~PAGE_MASK) == (iova &
+ * ~PAGE_MASK) invariant against the iova the mkey still holds.
+ *
+ * The mkey must be disabled, which is what UVERBS_METHOD_MR_UNBIND_DMABUF
+ * leaves behind on both paths in. That is checked rather than assumed: the
+ * state came from a checkpoint image, so nothing here may take on faith
+ * that the dump unbound.
+ * Rewriting the translations of a live mkey is known to work for an MR this
+ * driver registered and to fail for one RESTORE_MR adopted, with a vendor
+ * syndrome that attributes no cause; since this verb serves both, it takes
+ * the one route that works for either.
+ *
+ * A disabled mkey takes the single MLX5_IB_UPD_XLT_ENABLE update
+ * create_real_mr() uses on a fresh MR: enable, PD, access and translations in
+ * one WQE. That also repairs the placeholder mr->page_shift a restored MR
+ * carries -- RESTORE_MR sets PAGE_SHIFT on the grounds that an adopted MR
+ * never runs UMR, which this verb falsifies -- because log_page_size goes out
+ * in the same update.
+ */
+int mlx5_ib_bind_dmabuf_mr(struct ib_mr *ibmr, int fd)
+{
+	struct mlx5_ib_mr *mr = to_mmr(ibmr);
+	struct mlx5_ib_dev *dev = to_mdev(ibmr->device);
+	struct ib_umem_dmabuf *old_umem_dmabuf = NULL;
+	struct ib_umem_dmabuf *new_umem_dmabuf;
+	unsigned int page_shift;
+	unsigned long page_size;
+	u64 offset, length, iova;
+	int mkey_free;
+	int err;
+
+	if (mr->data_direct)
+		return -EOPNOTSUPP;
+
+	/*
+	 * The UMR QP, its CQ and umrc.sem are allocated lazily by the first
+	 * user, which everywhere else is a registration -- an MR could not
+	 * exist on a device that had never run this. Mkey adoption breaks
+	 * that: RESTORE_MR installs an MR on a freshly probed device without
+	 * registering anything, so a bind can be the first UMR the device
+	 * ever sees. Without this, umrc.sem is still a zeroed semaphore and
+	 * mlx5r_umr_post_send_wait()'s down() blocks forever, before the WQE
+	 * is ever posted.
+	 */
+	err = mlx5r_umr_resource_init(dev);
+	if (err)
+		return err;
+
+	iova = ibmr->iova;
+	length = ibmr->length;
+	offset = iova & ~PAGE_MASK;
+
+	if (mr->umem) {
+		old_umem_dmabuf = to_ib_umem_dmabuf(mr->umem);
+		offset = old_umem_dmabuf->umem.address;
+		length = old_umem_dmabuf->umem.length;
+		iova = old_umem_dmabuf->umem.iova;
+	}
+
+	/*
+	 * ibmr.access_flags, not mr->access_flags: the latter is in the
+	 * union's user-MR arm, which a restored shell deliberately leaves
+	 * zeroed because that storage is the kernel-MR arm's descs while
+	 * umem is NULL. The core copy is stamped by the restore dispatcher
+	 * and is valid either way.
+	 *
+	 * The attach goes through the same helper registration uses, so a
+	 * rebind cannot turn a statically attached MR into an ODP one --
+	 * which would need a page-fault EQ and an odp_mkeys entry that
+	 * registration deliberately did not create.
+	 */
+	new_umem_dmabuf = ib_umem_dmabuf_get_auto(&dev->ib_dev, offset, length,
+						  fd, ibmr->access_flags,
+						  &mlx5_ib_dmabuf_attach_ops);
+	if (IS_ERR(new_umem_dmabuf))
+		return PTR_ERR(new_umem_dmabuf);
+
+	if (new_umem_dmabuf->umem.length != length) {
+		err = -EINVAL;
+		goto err_release_new;
+	}
+
+	/* Not a property of the dma_buf; find_best_pgsz() reads it. */
+	new_umem_dmabuf->umem.iova = iova;
+
+	dma_resv_lock(new_umem_dmabuf->attach->dmabuf->resv, NULL);
+	/* ib_umem_dmabuf_get_pinned() has already mapped a pinned umem. */
+	if (!new_umem_dmabuf->pinned) {
+		err = ib_umem_dmabuf_map_pages(new_umem_dmabuf);
+		if (err) {
+			dma_resv_unlock(new_umem_dmabuf->attach->dmabuf->resv);
+			goto err_release_new;
+		}
+	}
+
+	page_size = mlx5_umem_dmabuf_find_best_pgsz(new_umem_dmabuf,
+						    MLX5_MKC_ACCESS_MODE_MTT);
+	if (!page_size) {
+		err = -EINVAL;
+		goto err_unmap_new;
+	}
+
+	/*
+	 * Publish before the UMR: the update walks mr->umem to build the
+	 * translation, and the new buffer's invalidate callback resolves its
+	 * mr through umem_dmabuf->private.
+	 */
+	mr->umem = &new_umem_dmabuf->umem;
+	new_umem_dmabuf->private = mr;
+	/*
+	 * With a umem again the union's user-MR arm is live, so the copy of
+	 * access_flags a restored shell left zeroed has to come back; the
+	 * pgsz update below assigns page_shift, the other field in that arm.
+	 */
+	mr->access_flags = ibmr->access_flags;
+
+	page_shift = order_base_2(page_size);
+	mkey_free = mlx5_ib_mkey_is_free(dev, mr->mmkey.key);
+	if (mkey_free < 0) {
+		err = mkey_free;
+		goto err_unmap_new;
+	}
+
+	if (!mkey_free) {
+		/*
+		 * Every path into this verb goes through
+		 * UVERBS_METHOD_MR_UNBIND_DMABUF,
+		 * which revokes, so the mkey should be disabled here. A live
+		 * one means it was not unbound -- an MR checkpointed by
+		 * something that did not, say. Refuse rather than attempt
+		 * it: updating a live mkey's translations succeeds for an MR
+		 * this driver registered but fails for one RESTORE_MR
+		 * adopted, and the failure arrives as a vendor syndrome that
+		 * attributes no cause. A caller can act on -EINVAL.
+		 */
+		mlx5_ib_warn(dev,
+			     "bind: mkey 0x%x is not free; unbind it first\n",
+			     mr->mmkey.key);
+		err = -EINVAL;
+		goto err_unmap_new;
+	}
+
+	/*
+	 * Bring the disabled mkey live the way create_real_mr() does: one
+	 * MLX5_IB_UPD_XLT_ENABLE update carrying enable, PD, access and
+	 * translations together. That also repairs the placeholder
+	 * page_shift a restored MR carries, since log_page_size goes out in
+	 * the same update.
+	 */
+	mr->page_shift = page_shift;
+	err = mlx5r_umr_update_mr_pas(mr, MLX5_IB_UPD_XLT_ENABLE,
+				      to_mpd(ibmr->pd)->pdn);
+	dma_resv_unlock(new_umem_dmabuf->attach->dmabuf->resv);
+	if (err)
+		goto err_unpublish;
+
+	if (old_umem_dmabuf) {
+		/*
+		 * The husk has no exporter left to lock against, and nothing
+		 * can reach it through ->private anymore now that mr->umem
+		 * points elsewhere.
+		 */
+		old_umem_dmabuf->private = NULL;
+		ib_umem_release(&old_umem_dmabuf->umem);
+	}
+
+	mlx5_ib_dbg(dev, "bound mkey 0x%x to fd %d, page_shift=%u npages=%zu\n",
+		    mr->mmkey.key, fd, page_shift,
+		    ib_umem_num_pages(mr->umem));
+	return 0;
+
+err_unmap_new:
+	ib_umem_dmabuf_unmap_pages(new_umem_dmabuf);
+	dma_resv_unlock(new_umem_dmabuf->attach->dmabuf->resv);
+err_unpublish:
+	/*
+	 * Undo the publish above. Every failure past it has to come through
+	 * here: mr->umem names the umem this label is about to free, so
+	 * leaving it set hands a dangling pointer to the next dereg, which
+	 * releases it a second time. The mkey query is the one that makes
+	 * this reachable in practice -- it is a firmware command, and a
+	 * command to a function whose datapath is parked simply times out.
+	 */
+	new_umem_dmabuf->private = NULL;
+	mr->umem = old_umem_dmabuf ? &old_umem_dmabuf->umem : NULL;
+	if (!mr->umem) {
+		/*
+		 * Back to an unbacked shell, so put the union back the way a
+		 * shell has to be: with umem NULL this storage is the
+		 * kernel-MR arm, and a stale access_flags or page_shift reads
+		 * there as a descs pointer that __mlx5_ib_dereg_mr() will
+		 * hand to dma_unmap_single().
+		 */
+		mr->access_flags = 0;
+		mr->page_shift = 0;
+	}
+err_release_new:
+	ib_umem_release(&new_umem_dmabuf->umem);
+	return err;
+}
 
 static struct ib_mr *
 reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,

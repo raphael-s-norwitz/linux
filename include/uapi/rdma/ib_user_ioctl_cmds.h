@@ -628,6 +628,7 @@ enum uverbs_methods_mr {
 	UVERBS_METHOD_REG_MR,
 	UVERBS_METHOD_MR_EXPORT_DMABUF_FD,
 	UVERBS_METHOD_MR_UNBIND_DMABUF,
+	UVERBS_METHOD_MR_BIND_DMABUF,
 };
 
 enum uverbs_attrs_mr_destroy_ids {
@@ -724,6 +725,23 @@ enum uverbs_attrs_mr_export_dmabuf_fd_ids {
  */
 enum uverbs_attrs_mr_unbind_dmabuf_ids {
 	UVERBS_ATTR_MR_UNBIND_DMABUF_HANDLE,
+};
+
+/*
+ * UVERBS_METHOD_MR_BIND_DMABUF attributes.
+ *
+ * Point an unbound DMA-BUF MR at the dma_buf named by FD, keeping the MR's
+ * lkey, rkey, length and iova: the key is never destroyed, only its
+ * translations are written. Peers holding (rkey, iova) stay valid.
+ *
+ * The restore half of the pair UVERBS_METHOD_MR_UNBIND_DMABUF opens. Valid
+ * only on an MR that verb unbound, or that RESTORE_MR adopted with no
+ * backing; anything else returns -EINVAL. The new buffer must cover the
+ * MR's original length.
+ */
+enum uverbs_attrs_mr_bind_dmabuf_ids {
+	UVERBS_ATTR_MR_BIND_DMABUF_HANDLE,
+	UVERBS_ATTR_MR_BIND_DMABUF_FD,
 };
 
 enum uverbs_attrs_create_counters_cmd_attr_ids {

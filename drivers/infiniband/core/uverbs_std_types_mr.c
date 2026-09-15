@@ -746,6 +746,45 @@ DECLARE_UVERBS_NAMED_METHOD(
 			UVERBS_ACCESS_WRITE,
 			UA_MANDATORY));
 
+/*
+ * Refusing a bound MR here rather than in the driver keeps the "unbound"
+ * bookkeeping in one place: the bit is set by UNBIND above and by
+ * RESTORE_MR, which are the only two ways an MR reaches that state.
+ */
+static int UVERBS_HANDLER(UVERBS_METHOD_MR_BIND_DMABUF)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_mr *mr =
+		uverbs_attr_get_obj(attrs, UVERBS_ATTR_MR_BIND_DMABUF_HANDLE);
+	int fd;
+	int ret;
+
+	if (!mr->device->ops.bind_dmabuf_mr)
+		return -EOPNOTSUPP;
+
+	if (!mr->dmabuf_unbound)
+		return -EINVAL;
+
+	ret = uverbs_get_raw_fd(&fd, attrs, UVERBS_ATTR_MR_BIND_DMABUF_FD);
+	if (ret)
+		return ret;
+
+	ret = mr->device->ops.bind_dmabuf_mr(mr, fd);
+	if (ret)
+		return ret;
+
+	mr->dmabuf_unbound = 0;
+	return 0;
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_MR_BIND_DMABUF,
+	UVERBS_ATTR_IDR(UVERBS_ATTR_MR_BIND_DMABUF_HANDLE,
+			UVERBS_OBJECT_MR,
+			UVERBS_ACCESS_WRITE,
+			UA_MANDATORY),
+	UVERBS_ATTR_RAW_FD(UVERBS_ATTR_MR_BIND_DMABUF_FD, UA_MANDATORY));
+
 DECLARE_UVERBS_NAMED_METHOD_DESTROY(
 	UVERBS_METHOD_MR_DESTROY,
 	UVERBS_ATTR_IDR(UVERBS_ATTR_DESTROY_MR_HANDLE,
@@ -763,7 +802,8 @@ DECLARE_UVERBS_NAMED_OBJECT(
 	&UVERBS_METHOD(UVERBS_METHOD_REG_DMABUF_MR),
 	&UVERBS_METHOD(UVERBS_METHOD_REG_MR),
 	&UVERBS_METHOD(UVERBS_METHOD_MR_EXPORT_DMABUF_FD),
-	&UVERBS_METHOD(UVERBS_METHOD_MR_UNBIND_DMABUF));
+	&UVERBS_METHOD(UVERBS_METHOD_MR_UNBIND_DMABUF),
+	&UVERBS_METHOD(UVERBS_METHOD_MR_BIND_DMABUF));
 
 const struct uapi_definition uverbs_def_obj_mr[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_MR,
