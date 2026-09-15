@@ -782,6 +782,7 @@ static inline bool is_odp_mr(struct mlx5_ib_mr *mr)
 }
 
 int mlx5_ib_unbind_dmabuf_mr(struct ib_mr *ibmr);
+int mlx5_ib_bind_dmabuf_mr(struct ib_mr *ibmr, int fd);
 
 static inline bool is_dmabuf_mr(struct mlx5_ib_mr *mr)
 {

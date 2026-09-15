@@ -2029,10 +2029,11 @@ struct ib_mr {
 	enum ib_mr_type	   type;
 	bool		   need_inval;
 	/*
-	 * Set while the MR holds its key but has no backing, which
-	 * UVERBS_METHOD_MR_UNBIND_DMABUF is the only way into so far.
-	 * Written by the core handlers for the DMA-BUF unbind/bind verbs;
-	 * drivers may read it.
+	 * Set while the MR holds its key but has no backing: either
+	 * UVERBS_METHOD_MR_UNBIND_DMABUF revoked it, or RESTORE_MR adopted
+	 * the key with nothing behind it. UVERBS_METHOD_MR_BIND_DMABUF is
+	 * the only way out. Written by the core handlers for those verbs
+	 * and by the driver's restore_mr; drivers may read it.
 	 */
 	u8		   dmabuf_unbound : 1;
 	union {
@@ -2875,10 +2876,14 @@ struct ib_device_ops {
 					    struct ib_dmah *dmah,
 					    struct uverbs_attr_bundle *attrs);
 	/*
-	 * Detach a DMA-BUF-backed MR from its backing without destroying
-	 * the key. See UVERBS_METHOD_MR_UNBIND_DMABUF. Optional.
+	 * Detach a DMA-BUF-backed MR from its backing, and re-point an
+	 * unbound one at a new dma_buf, both without destroying the key.
+	 * See UVERBS_METHOD_MR_UNBIND_DMABUF / _BIND_DMABUF. Optional; a
+	 * driver implementing either must implement both, since an MR
+	 * unbound by the first can only be made usable by the second.
 	 */
 	int (*unbind_dmabuf_mr)(struct ib_mr *mr);
+	int (*bind_dmabuf_mr)(struct ib_mr *mr, int fd);
 	struct ib_mr *(*rereg_user_mr)(struct ib_mr *mr, int flags, u64 start,
 				       u64 length, u64 virt_addr,
 				       int mr_access_flags, struct ib_pd *pd,
