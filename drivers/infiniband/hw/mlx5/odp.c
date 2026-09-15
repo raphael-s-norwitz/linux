@@ -851,6 +851,10 @@ static int pagefault_dmabuf_mr(struct mlx5_ib_mr *mr, size_t bcnt,
 	if (flags & MLX5_PF_FLAGS_ENABLE)
 		xlt_flags |= MLX5_IB_UPD_XLT_ENABLE;
 
+	/* Nothing to fault in while the MR is unbound. */
+	if (!umem_dmabuf->attach)
+		return -EINVAL;
+
 	dma_resv_lock(umem_dmabuf->attach->dmabuf->resv, NULL);
 	err = ib_umem_dmabuf_map_pages(umem_dmabuf);
 	if (err) {

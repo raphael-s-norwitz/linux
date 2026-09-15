@@ -5571,6 +5571,7 @@ static const struct ib_device_ops mlx5_ib_dev_ops = {
 	.ufile_hw_cleanup = mlx5_ib_ufile_hw_cleanup,
 	.umem_place = mlx5_ib_umem_place,
 	.umem_unplace = mlx5_ib_umem_unplace,
+	.unbind_dmabuf_mr = mlx5_ib_unbind_dmabuf_mr,
 
 	INIT_RDMA_OBJ_SIZE(ib_ah, mlx5_ib_ah, ibah),
 	INIT_RDMA_OBJ_SIZE(ib_counters, mlx5_ib_mcounters, ibcntrs),

@@ -913,6 +913,115 @@ struct ib_mr *mlx5_ib_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	return create_real_mr(pd, umem, iova, access_flags, dmah);
 }
 
+/*
+ * Detach a DMA-BUF MR from its backing, keeping the mkey.
+ *
+ * Zap the translations, tear down the exporter's mapping, and mark the
+ * umem revoked so no page fault can put it back -- ib_umem_dmabuf_map_pages()
+ * refuses a revoked umem. What survives is an identity shell: same mkey
+ * index, and so the same lkey and rkey, same length and iova, with nothing
+ * mapped behind them.
+ *
+ * This is the checkpoint half of a checkpoint/restore pair. Saving device
+ * state while the MR still described the exporter's memory would bake DMA
+ * addresses into the image that cannot be reproduced on the restore side --
+ * a dma_buf's addresses come from its exporter, not from anything the
+ * importer chooses. Unbinding first means what comes back is an mkey
+ * waiting for translations rather than one naming memory that is gone.
+ *
+ * The order mirrors mlx5_ib_dmabuf_invalidate_cb(): zap, then unmap, so the
+ * mkey never names memory that is already unmapped. ib_umem_dmabuf_revoke()
+ * alone would not do -- it unmaps without zapping, because it is registered
+ * as .invalidate_mappings for revocable *pinned* attachments where there is
+ * no mkey to clear, while mlx5's dynamic attachments put the zap in their
+ * own callback.
+ *
+ * The attachment is then dropped, which releases the exporter's buffer --
+ * the point of unbinding across a checkpoint is that the GPU allocation
+ * behind it can go away. What is left is a dma-buf umem with no exporter:
+ * is_dmabuf_mr() is mr->umem && mr->umem->is_dmabuf, neither of which the
+ * detach touches, so the MR stays in the dma-buf regime and the dma-buf
+ * paths keep taking the right branch. MR_EXPORT_DMABUF_FD still answers
+ * too -- it hands out the uobject's own dma_buf reference, not the umem's.
+ *
+ * Idempotent: unbinding an already-unbound MR succeeds and does nothing.
+ */
+int mlx5_ib_unbind_dmabuf_mr(struct ib_mr *ibmr)
+{
+	struct mlx5_ib_mr *mr = to_mmr(ibmr);
+	struct mlx5_ib_dev *dev = to_mdev(ibmr->device);
+	struct ib_umem_dmabuf *umem_dmabuf;
+	int err;
+
+	if (!is_dmabuf_mr(mr))
+		return -EOPNOTSUPP;
+
+	/*
+	 * data-direct MRs carry a second mkey on the data-direct device;
+	 * clearing only this one would leave the pair inconsistent. Refused
+	 * for the same reason rebind refuses them.
+	 */
+	if (mr->data_direct)
+		return -EOPNOTSUPP;
+
+	umem_dmabuf = to_ib_umem_dmabuf(mr->umem);
+
+	/*
+	 * Zap first, under the resv lock the xlt update expects, so the mkey
+	 * stops naming the buffer before the mapping goes away. Only if
+	 * something is mapped: an MR that has never faulted has no
+	 * translations to clear.
+	 */
+	ib_umem_dmabuf_revoke_lock(umem_dmabuf);
+	if (umem_dmabuf->sgt)
+		mlx5r_umr_update_mr_pas(mr, MLX5_IB_UPD_XLT_ZAP, 0);
+	ib_umem_dmabuf_revoke_unlock(umem_dmabuf);
+
+	/*
+	 * Then unmap, unpin, set revoked and detach, leaving attach, sgt and
+	 * the scatterlist fields NULL. ib_core does this rather than us
+	 * because the unpin needs dma_buf_unpin(), which lives in the DMA_BUF
+	 * symbol namespace that ib_core imports and mlx5_ib does not. It
+	 * retakes the resv lock; the gap is harmless because the mkey is
+	 * already non-present, and an exporter that invalidates in between
+	 * only does the same unmap early.
+	 */
+	ib_umem_dmabuf_detach(umem_dmabuf);
+
+	/*
+	 * Return the mkey to the disabled state, identity intact.
+	 *
+	 * Unbind is not an ODP invalidation. mlx5_ib_dmabuf_invalidate_cb()
+	 * zaps because the exporter merely moved the pages and the next
+	 * fault will put them back, with the MR live throughout because the
+	 * application still holds it. Here the buffer is not coming back at
+	 * all -- the MR will be re-pointed at a different dma_buf, possibly
+	 * on another host, possibly much later. That is the situation
+	 * rereg_mr() is in when it revokes "before we start to mess with
+	 * it".
+	 *
+	 * It is also what lets the MR be re-pointed afterwards. Rewriting the
+	 * translations of a live mkey works for an MR this driver
+	 * registered, but not for one RESTORE_MR adopted: there the device
+	 * rejects the fast-register with a vendor syndrome that attributes
+	 * no cause, and why the two differ is not understood. Enabling a
+	 * disabled mkey works for both, and restore does not touch the mkc,
+	 * so an adopted mkey arrives exactly as unbind left it.
+	 *
+	 * mlx5r_umr_revoke_mr() preserves mkey_7_0, so the lkey and rkey
+	 * that unbind exists to protect survive it.
+	 */
+	err = mlx5r_umr_revoke_mr(mr);
+	if (err) {
+		mlx5_ib_warn(dev, "unbind: revoke mkey 0x%x failed: %d\n",
+			     mr->mmkey.key, err);
+		return err;
+	}
+
+	mlx5_ib_dbg(dev, "unbound mkey 0x%x\n", mr->mmkey.key);
+	return 0;
+}
+
 static void mlx5_ib_dmabuf_invalidate_cb(struct dma_buf_attachment *attach)
 {
 	struct ib_umem_dmabuf *umem_dmabuf = attach->importer_priv;
@@ -1403,8 +1512,13 @@ void mlx5_ib_revoke_data_direct_mrs(struct mlx5_ib_dev *dev)
 
 static int mlx5_umr_revoke_mr_with_lock(struct mlx5_ib_mr *mr)
 {
+	/*
+	 * An unbound dma-buf MR has no attachment, so there is no reservation
+	 * object to take -- and nothing mapped that would need it.
+	 */
 	bool is_odp_dma_buf = is_dmabuf_mr(mr) &&
-			      !to_ib_umem_dmabuf(mr->umem)->pinned;
+			      !to_ib_umem_dmabuf(mr->umem)->pinned &&
+			      to_ib_umem_dmabuf(mr->umem)->attach;
 	bool is_odp = is_odp_mr(mr);
 	int ret;
 
@@ -1435,8 +1549,13 @@ static int mlx5_umr_revoke_mr_with_lock(struct mlx5_ib_mr *mr)
 
 static int mlx5r_handle_mkey_cleanup(struct mlx5_ib_mr *mr)
 {
+	/*
+	 * An unbound dma-buf MR has no attachment, so there is no reservation
+	 * object to take -- and nothing mapped that would need it.
+	 */
 	bool is_odp_dma_buf = is_dmabuf_mr(mr) &&
-			      !to_ib_umem_dmabuf(mr->umem)->pinned;
+			      !to_ib_umem_dmabuf(mr->umem)->pinned &&
+			      to_ib_umem_dmabuf(mr->umem)->attach;
 	struct mlx5_ib_dev *dev = to_mdev(mr->ibmr.device);
 	bool is_odp = is_odp_mr(mr);
 	int ret;
