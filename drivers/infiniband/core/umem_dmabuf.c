@@ -368,39 +368,86 @@ struct ib_umem_dmabuf *ib_umem_dmabuf_get_pinned(struct ib_device *device,
 }
 EXPORT_SYMBOL(ib_umem_dmabuf_get_pinned);
 
+/*
+ * A detached umem -- attach == NULL -- is a dma-buf umem with no exporter
+ * behind it. It keeps umem.is_dmabuf, so it stays a DMA-BUF MR to every
+ * caller that asks, but there is nothing to lock, unmap or detach. The
+ * lock/revoke helpers below are no-ops on one, which lets callers treat
+ * "already detached" the same as "already revoked".
+ */
 void ib_umem_dmabuf_revoke_lock(struct ib_umem_dmabuf *umem_dmabuf)
 {
-	struct dma_buf *dmabuf = umem_dmabuf->attach->dmabuf;
+	if (!umem_dmabuf->attach)
+		return;
 
-	dma_resv_lock(dmabuf->resv, NULL);
+	dma_resv_lock(umem_dmabuf->attach->dmabuf->resv, NULL);
 }
 EXPORT_SYMBOL(ib_umem_dmabuf_revoke_lock);
 
 void ib_umem_dmabuf_revoke_unlock(struct ib_umem_dmabuf *umem_dmabuf)
 {
-	struct dma_buf *dmabuf = umem_dmabuf->attach->dmabuf;
+	if (!umem_dmabuf->attach)
+		return;
 
-	dma_resv_unlock(dmabuf->resv);
+	dma_resv_unlock(umem_dmabuf->attach->dmabuf->resv);
 }
 EXPORT_SYMBOL(ib_umem_dmabuf_revoke_unlock);
 
 void ib_umem_dmabuf_revoke(struct ib_umem_dmabuf *umem_dmabuf)
 {
-	struct dma_buf *dmabuf = umem_dmabuf->attach->dmabuf;
+	struct dma_buf *dmabuf;
 
+	if (!umem_dmabuf->attach)
+		return;
+
+	dmabuf = umem_dmabuf->attach->dmabuf;
 	dma_resv_lock(dmabuf->resv, NULL);
 	ib_umem_dmabuf_revoke_locked(umem_dmabuf->attach);
 	dma_resv_unlock(dmabuf->resv);
 }
 EXPORT_SYMBOL(ib_umem_dmabuf_revoke);
 
-void ib_umem_dmabuf_release(struct ib_umem_dmabuf *umem_dmabuf)
+/*
+ * Drop the exporter, keep the umem.
+ *
+ * Revoke first -- unmap, unpin, set revoked -- then detach and release the
+ * dma_buf reference, so the exporter is free to reclaim its memory while
+ * the umem lives on as a husk. The caller keeps a DMA-BUF-typed umem it
+ * can later re-point at a different buffer, without the MR it belongs to
+ * ever ceasing to be a DMA-BUF MR.
+ *
+ * Idempotent.
+ */
+void ib_umem_dmabuf_detach(struct ib_umem_dmabuf *umem_dmabuf)
 {
-	struct dma_buf *dmabuf = umem_dmabuf->attach->dmabuf;
+	struct dma_buf *dmabuf;
+
+	if (!umem_dmabuf->attach)
+		return;
+
+	dmabuf = umem_dmabuf->attach->dmabuf;
 
 	ib_umem_dmabuf_revoke(umem_dmabuf);
 
 	dma_buf_detach(dmabuf, umem_dmabuf->attach);
 	dma_buf_put(dmabuf);
+	umem_dmabuf->attach = NULL;
+
+	/*
+	 * ib_umem_dmabuf_unmap_pages() clears sgt, first_sg and last_sg, but
+	 * leaves the umem's own sg_table pointing into the exporter's list.
+	 * That is harmless while an attachment keeps the list alive and a
+	 * dangling pointer once it does not -- and
+	 * rdma_umem_for_each_dma_block() walks exactly this table.
+	 */
+	umem_dmabuf->umem.sgt_append.sgt.sgl = NULL;
+	umem_dmabuf->umem.sgt_append.sgt.nents = 0;
+	umem_dmabuf->umem.sgt_append.sgt.orig_nents = 0;
+}
+EXPORT_SYMBOL(ib_umem_dmabuf_detach);
+
+void ib_umem_dmabuf_release(struct ib_umem_dmabuf *umem_dmabuf)
+{
+	ib_umem_dmabuf_detach(umem_dmabuf);
 	kfree(umem_dmabuf);
 }
