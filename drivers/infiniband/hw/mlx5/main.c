@@ -3534,7 +3534,8 @@ err_adopt:
 static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 					u64 addr, u64 length, u64 iova,
 					int access, u32 lkey_hint,
-					u32 rkey_hint, struct ib_udata *udata)
+					u32 rkey_hint, u32 restore_flags,
+					struct ib_udata *udata)
 {
 	struct mlx5_ib_dev *dev = to_mdev(ibpd->device);
 	struct mlx5_ib_pd *mpd = to_mpd(ibpd);
@@ -3594,13 +3595,34 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	 * population so a bind failure never leaves a half-initialised
 	 * mr->mmkey. On success the umem is owned by mr and released by
 	 * __mlx5_ib_dereg_mr's ib_umem_release(mr->umem) path.
+	 *
+	 * Which lane this is comes from the caller, not from inspecting a
+	 * value. IB_UVERBS_RESTORE_MR_DMABUF says the MR being restored was
+	 * created by reg_dmabuf_mr(); an address of 0 says nothing, being
+	 * equally what a device-memory MR and an implicit ODP MR look like.
+	 *
+	 * In that lane there is nothing to pin, and nothing was placed in the
+	 * deterministic IOVA window either, since a dma-buf umem never
+	 * traverses the ib_umem placement hook and LOAD_VHCA_STATE replayed
+	 * no placeholder for it. Adopt the mkey identity and leave the MR
+	 * unbacked; UVERBS_METHOD_MR_BIND_DMABUF must point it at a
+	 * recreated buffer before it can carry traffic again.
 	 */
-	umem = mlx5_ib_umem_restore_mr(dev, req.mkey_index, addr, length,
-				       access);
-	if (IS_ERR(umem)) {
-		err = PTR_ERR(umem);
-		kfree(mr);
-		return ERR_PTR(err);
+	if (!(restore_flags & IB_UVERBS_RESTORE_MR_DMABUF)) {
+		umem = mlx5_ib_umem_restore_mr(dev, req.mkey_index, addr,
+					       length, access);
+		if (IS_ERR(umem)) {
+			err = PTR_ERR(umem);
+			kfree(mr);
+			return ERR_PTR(err);
+		}
+	} else {
+		umem = NULL;
+		/*
+		 * Only UVERBS_METHOD_MR_BIND_DMABUF can give this mkey
+		 * a backing again.
+		 */
+		mr->ibmr.dmabuf_unbound = 1;
 	}
 
 	/*
@@ -3624,14 +3646,26 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	 */
 
 	mr->umem = umem;
-	mr->access_flags = access;
+	/*
+	 * access_flags and page_shift live in the mlx5_ib_mr union's user-MR
+	 * arm, which shares storage with the kernel-MR arm's descs/desc_map.
+	 * That arm is only valid while umem is non-NULL: writing it on an
+	 * unbacked shell makes mr->descs read back non-NULL, and teardown
+	 * then DMA-unmaps a desc_map that is really these two fields.
+	 * Leave the union zeroed; ibmr.access_flags carries the access the
+	 * dispatcher stamps, and bind assigns page_shift when it programs
+	 * the translations.
+	 */
+	if (umem)
+		mr->access_flags = access;
 	/*
 	 * The adopted FW mkey carries its own mkc.log_page_size from the
 	 * source CREATE_MKEY (preserved across LOAD); the kernel-side
 	 * mr->page_shift is only consulted by UMR descriptor generation,
 	 * which adopted MRs never run. PAGE_SHIFT is safe.
 	 */
-	mr->page_shift = PAGE_SHIFT;
+	if (umem)
+		mr->page_shift = PAGE_SHIFT;
 
 	/*
 	 * Wire-visible identity, echoed back to userspace by the
@@ -3646,12 +3680,14 @@ static struct ib_mr *mlx5_ib_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	 * ib_umem_num_pages() so the symmetric atomic_sub() in
 	 * __mlx5_ib_dereg_mr does not underflow.
 	 */
-	atomic_add(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
+	if (umem)
+		atomic_add(ib_umem_num_pages(umem), &dev->mdev->priv.reg_pages);
 
 	mlx5_ib_dbg(dev,
-		    "vfmig: restore_mr mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x umem_npages=%zu\n",
+		    "vfmig: restore_mr mkey_index=0x%x lkey=0x%x pdn=0x%x uid=%u target_handle=0x%x umem_npages=%zu%s\n",
 		    req.mkey_index, lkey_hint, mpd->pdn, mpd->uid,
-		    target_handle, ib_umem_num_pages(umem));
+		    target_handle, umem ? ib_umem_num_pages(umem) : 0,
+		    umem ? "" : " (unbacked: no user VA)");
 
 	return &mr->ibmr;
 }
