@@ -939,7 +939,8 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 		   int fd, int access_flags, int access_mode,
 		   struct ib_dmah *dmah)
 {
-	bool pinned_mode = (access_mode == MLX5_MKC_ACCESS_MODE_KSM);
+	bool data_direct = (access_mode == MLX5_MKC_ACCESS_MODE_KSM);
+	bool pinned_mode = data_direct;
 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
 	struct mlx5_ib_mr *mr = NULL;
 	struct ib_umem_dmabuf *umem_dmabuf;
@@ -951,11 +952,19 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 	if (err)
 		return ERR_PTR(err);
 
+	/*
+	 * Not ib_umem_dmabuf_get(): an exporter that cannot move its pages
+	 * never faults, so the ODP machinery a dynamic attachment exists to
+	 * drive is unreachable for it. ib_umem_dmabuf_get_auto() attaches
+	 * statically in that case and says so through umem_dmabuf->pinned,
+	 * which is then what decides whether this MR needs the page-fault EQ
+	 * and an odp_mkeys entry at all.
+	 */
 	if (!pinned_mode)
-		umem_dmabuf = ib_umem_dmabuf_get(&dev->ib_dev,
-						 offset, length, fd,
-						 access_flags,
-						 &mlx5_ib_dmabuf_attach_ops);
+		umem_dmabuf = ib_umem_dmabuf_get_auto(&dev->ib_dev,
+						      offset, length, fd,
+						      access_flags,
+						      &mlx5_ib_dmabuf_attach_ops);
 	else if (dma_device)
 		umem_dmabuf = ib_umem_dmabuf_get_pinned_with_dma_device(&dev->ib_dev,
 				dma_device, offset, length,
@@ -989,7 +998,7 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 
 	atomic_add(ib_umem_num_pages(mr->umem), &dev->mdev->priv.reg_pages);
 	umem_dmabuf->private = mr;
-	if (!pinned_mode) {
+	if (!umem_dmabuf->pinned) {
 		err = mlx5r_odp_create_eq(dev, &dev->odp_pf_eq);
 		if (err)
 			goto err_dereg_mr;
@@ -997,7 +1006,7 @@ reg_user_mr_dmabuf(struct ib_pd *pd, struct device *dma_device,
 		err = mlx5r_store_odp_mkey(dev, &mr->mmkey);
 		if (err)
 			goto err_dereg_mr;
-	} else {
+	} else if (data_direct) {
 		mr->data_direct = true;
 	}
 

@@ -314,6 +314,50 @@ void ib_umem_dmabuf_set_revoke_locked(struct ib_umem_dmabuf *umem_dmabuf,
 }
 EXPORT_SYMBOL(ib_umem_dmabuf_set_revoke_locked);
 
+/*
+ * Get a DMA-BUF umem, attached the way the exporter warrants.
+ *
+ * A dynamic attachment exists so an importer can follow a buffer whose
+ * pages move: the exporter announces a relocation through move_notify()
+ * and the importer re-reads the mapping, which for an RDMA device means
+ * standing up fault machinery. An exporter that does not implement .pin
+ * cannot relocate anything -- dma_buf_is_dynamic() is exactly
+ * !!dmabuf->ops->pin -- so none of that can ever run, and attaching
+ * statically is equivalent and cheaper. dma_buf_pin() returns 0 without
+ * doing anything on such an exporter, so the pinned attachment pins
+ * nothing that was not already immovable.
+ *
+ * @ops is used only if the exporter turns out to be dynamic. Callers tell
+ * the two apart afterwards by umem_dmabuf->pinned, which also says whether
+ * the pages are already mapped: a pinned umem comes back mapped, a dynamic
+ * one comes back empty and faults later.
+ *
+ * The inspection happens here because this is where the dma_buf is already
+ * held; asking a caller to look first would mean a second dma_buf_get() on
+ * the same fd, and a second place for a bad fd to be reported from.
+ */
+struct ib_umem_dmabuf *ib_umem_dmabuf_get_auto(struct ib_device *device,
+					       unsigned long offset, size_t size,
+					       int fd, int access,
+					       const struct dma_buf_attach_ops *ops)
+{
+	struct dma_buf *dmabuf;
+	bool is_static;
+
+	dmabuf = dma_buf_get(fd);
+	if (IS_ERR(dmabuf))
+		return ERR_CAST(dmabuf);
+	is_static = !dma_buf_is_dynamic(dmabuf);
+	dma_buf_put(dmabuf);
+
+	if (is_static)
+		return ib_umem_dmabuf_get_pinned(device, offset, size, fd,
+						 access);
+
+	return ib_umem_dmabuf_get(device, offset, size, fd, access, ops);
+}
+EXPORT_SYMBOL(ib_umem_dmabuf_get_auto);
+
 struct ib_umem_dmabuf *ib_umem_dmabuf_get_pinned(struct ib_device *device,
 						 unsigned long offset,
 						 size_t size, int fd,
