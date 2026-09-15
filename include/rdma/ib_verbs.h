@@ -2028,6 +2028,13 @@ struct ib_mr {
 	unsigned int	   page_size;
 	enum ib_mr_type	   type;
 	bool		   need_inval;
+	/*
+	 * Set while the MR holds its key but has no backing, which
+	 * UVERBS_METHOD_MR_UNBIND_DMABUF is the only way into so far.
+	 * Written by the core handlers for the DMA-BUF unbind/bind verbs;
+	 * drivers may read it.
+	 */
+	u8		   dmabuf_unbound : 1;
 	union {
 		struct ib_uobject	*uobject;	/* user */
 		struct list_head	qp_entry;	/* FR */
@@ -2866,6 +2873,11 @@ struct ib_device_ops {
 					    int mr_access_flags,
 					    struct ib_dmah *dmah,
 					    struct uverbs_attr_bundle *attrs);
+	/*
+	 * Detach a DMA-BUF-backed MR from its backing without destroying
+	 * the key. See UVERBS_METHOD_MR_UNBIND_DMABUF. Optional.
+	 */
+	int (*unbind_dmabuf_mr)(struct ib_mr *mr);
 	struct ib_mr *(*rereg_user_mr)(struct ib_mr *mr, int flags, u64 start,
 				       u64 length, u64 virt_addr,
 				       int mr_access_flags, struct ib_pd *pd,

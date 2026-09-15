@@ -728,7 +728,6 @@ struct mlx5_ib_mr {
 	struct ib_umem *umem;
 	/* The mr is data direct related */
 	u8 data_direct :1;
-
 	union {
 		/* Used only by kernel MRs (umem == NULL) */
 		struct {
@@ -781,6 +780,8 @@ static inline bool is_odp_mr(struct mlx5_ib_mr *mr)
 	return IS_ENABLED(CONFIG_INFINIBAND_ON_DEMAND_PAGING) && mr->umem &&
 	       mr->umem->is_odp;
 }
+
+int mlx5_ib_unbind_dmabuf_mr(struct ib_mr *ibmr);
 
 static inline bool is_dmabuf_mr(struct mlx5_ib_mr *mr)
 {

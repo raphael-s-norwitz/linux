@@ -605,6 +605,7 @@ enum uverbs_methods_mr {
 	UVERBS_METHOD_REG_DMABUF_MR,
 	UVERBS_METHOD_REG_MR,
 	UVERBS_METHOD_MR_EXPORT_DMABUF_FD,
+	UVERBS_METHOD_MR_UNBIND_DMABUF,
 };
 
 enum uverbs_attrs_mr_destroy_ids {
@@ -679,6 +680,28 @@ enum uverbs_attrs_reg_mr_cmd_attr_ids {
 enum uverbs_attrs_mr_export_dmabuf_fd_ids {
 	UVERBS_ATTR_MR_EXPORT_DMABUF_FD_HANDLE,
 	UVERBS_ATTR_MR_EXPORT_DMABUF_FD_RESP_FD,
+};
+
+/*
+ * UVERBS_METHOD_MR_UNBIND_DMABUF attributes.
+ *
+ * Detach a DMA-BUF-backed MR from its current backing without destroying
+ * the mkey: the translations are zapped, the exporter's mapping is torn
+ * down, and the umem is marked revoked so no page fault can re-establish
+ * it. The MR survives as an identity shell -- same lkey, rkey, length and
+ * iova, no memory behind them -- until something binds it again.
+ *
+ * Intended for checkpoint. Zapping before the device state is saved keeps
+ * the exporter's DMA addresses, which are not reproducible on the restore
+ * side, out of the saved image; what comes back is a key that needs new
+ * translations rather than one describing memory that no longer exists.
+ *
+ * Fails with -EOPNOTSUPP on a device whose driver does not implement the
+ * verb, and on an MR that is not DMA-BUF-backed. Unbinding an already
+ * unbound MR succeeds and changes nothing.
+ */
+enum uverbs_attrs_mr_unbind_dmabuf_ids {
+	UVERBS_ATTR_MR_UNBIND_DMABUF_HANDLE,
 };
 
 enum uverbs_attrs_create_counters_cmd_attr_ids {

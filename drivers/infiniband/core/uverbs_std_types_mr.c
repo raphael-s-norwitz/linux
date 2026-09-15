@@ -710,6 +710,42 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(s32),
 			    UA_MANDATORY));
 
+/*
+ * Security policy: none beyond resolving the MR handle, which happens in
+ * the caller's own ufile -- there is no way to name another process's MR.
+ * Unbinding only detaches the caller's own MR from the caller's own
+ * buffer; an unprivileged caller can already reach a strictly more
+ * destructive end state with MR_DESTROY. Ungated for the same reason.
+ *
+ * The handle is taken UVERBS_ACCESS_WRITE, which holds the uobject
+ * exclusively and so serialises against a concurrent MR_EXPORT_DMABUF_FD
+ * (shared access) and against destroy.
+ */
+static int UVERBS_HANDLER(UVERBS_METHOD_MR_UNBIND_DMABUF)(
+	struct uverbs_attr_bundle *attrs)
+{
+	struct ib_mr *mr =
+		uverbs_attr_get_obj(attrs, UVERBS_ATTR_MR_UNBIND_DMABUF_HANDLE);
+	int ret;
+
+	if (!mr->device->ops.unbind_dmabuf_mr)
+		return -EOPNOTSUPP;
+
+	ret = mr->device->ops.unbind_dmabuf_mr(mr);
+	if (ret)
+		return ret;
+
+	mr->dmabuf_unbound = 1;
+	return 0;
+}
+
+DECLARE_UVERBS_NAMED_METHOD(
+	UVERBS_METHOD_MR_UNBIND_DMABUF,
+	UVERBS_ATTR_IDR(UVERBS_ATTR_MR_UNBIND_DMABUF_HANDLE,
+			UVERBS_OBJECT_MR,
+			UVERBS_ACCESS_WRITE,
+			UA_MANDATORY));
+
 DECLARE_UVERBS_NAMED_METHOD_DESTROY(
 	UVERBS_METHOD_MR_DESTROY,
 	UVERBS_ATTR_IDR(UVERBS_ATTR_DESTROY_MR_HANDLE,
@@ -726,7 +762,8 @@ DECLARE_UVERBS_NAMED_OBJECT(
 	&UVERBS_METHOD(UVERBS_METHOD_QUERY_MR),
 	&UVERBS_METHOD(UVERBS_METHOD_REG_DMABUF_MR),
 	&UVERBS_METHOD(UVERBS_METHOD_REG_MR),
-	&UVERBS_METHOD(UVERBS_METHOD_MR_EXPORT_DMABUF_FD));
+	&UVERBS_METHOD(UVERBS_METHOD_MR_EXPORT_DMABUF_FD),
+	&UVERBS_METHOD(UVERBS_METHOD_MR_UNBIND_DMABUF));
 
 const struct uapi_definition uverbs_def_obj_mr[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(UVERBS_OBJECT_MR,
