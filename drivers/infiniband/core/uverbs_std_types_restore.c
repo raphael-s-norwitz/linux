@@ -127,7 +127,9 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_MR)(
 	struct ib_pd *pd;
 	struct ib_mr *mr;
 	u32 target_handle, lkey_hint, rkey_hint, access_flags;
-	u64 addr, length, iova;
+	u32 restore_flags = 0;
+	u64 addr = 0, length, iova;
+	bool has_addr, has_dmabuf;
 	int ret;
 
 	ret = restore_check_ucontext(attrs, &ctx);
@@ -153,9 +155,33 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_MR)(
 	if (ret)
 		return ret;
 
-	ret = uverbs_copy_from(&addr, attrs, UVERBS_ATTR_RESTORE_MR_ADDR);
-	if (ret)
-		return ret;
+	/*
+	 * Pick the lane. RESTORE_MR takes the union of the arguments the
+	 * three registration verbs accept, and the caller says which kind of
+	 * MR this is by supplying that verb's argument. Nothing here infers
+	 * a lane from a value: an MR with no user VA is what a DMA-BUF MR,
+	 * a device-memory MR and an implicit ODP MR all look like.
+	 */
+	if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_RESTORE_MR_FLAGS)) {
+		ret = uverbs_get_flags32(&restore_flags, attrs,
+					 UVERBS_ATTR_RESTORE_MR_FLAGS,
+					 IB_UVERBS_RESTORE_MR_DMABUF);
+		if (ret)
+			return ret;
+	}
+	has_dmabuf = restore_flags & IB_UVERBS_RESTORE_MR_DMABUF;
+	has_addr = uverbs_attr_is_valid(attrs, UVERBS_ATTR_RESTORE_MR_ADDR);
+
+	if (has_addr == has_dmabuf)
+		return -EINVAL;
+
+	if (has_addr) {
+		ret = uverbs_copy_from(&addr, attrs,
+				       UVERBS_ATTR_RESTORE_MR_ADDR);
+		if (ret)
+			return ret;
+	}
+
 	ret = uverbs_copy_from(&length, attrs,
 			       UVERBS_ATTR_RESTORE_MR_LENGTH);
 	if (ret)
@@ -191,7 +217,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_MR)(
 
 	mr = ib_dev->ops.restore_mr(pd, target_handle, addr, length, iova,
 				    access_flags, lkey_hint, rkey_hint,
-				    &attrs->driver_udata);
+				    restore_flags, &attrs->driver_udata);
 	if (IS_ERR(mr)) {
 		ret = PTR_ERR(mr);
 		goto err_uobj;
@@ -242,7 +268,7 @@ DECLARE_UVERBS_NAMED_METHOD(
 			UVERBS_ACCESS_READ,
 			UA_MANDATORY),
 	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_ADDR,
-			   UVERBS_ATTR_TYPE(__u64), UA_MANDATORY),
+			   UVERBS_ATTR_TYPE(__u64), UA_OPTIONAL),
 	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_LENGTH,
 			   UVERBS_ATTR_TYPE(__u64), UA_MANDATORY),
 	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_MR_IOVA,
@@ -258,6 +284,9 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_RESTORE_MR_RESP_RKEY,
 			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_FLAGS_IN(UVERBS_ATTR_RESTORE_MR_FLAGS,
+			     enum ib_uverbs_restore_mr_flags,
+			     UA_OPTIONAL),
 	UVERBS_ATTR_UHW());
 
 static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)(

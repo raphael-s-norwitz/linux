@@ -2736,6 +2736,7 @@ struct ib_device_ops {
 				    u64 addr, u64 length, u64 iova,
 				    int access_flags,
 				    u32 lkey_hint, u32 rkey_hint,
+				    u32 restore_flags,
 				    struct ib_udata *udata);
 	/*
 	 * CRIU-restore variant of create_cq. The generic

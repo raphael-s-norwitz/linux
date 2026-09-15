@@ -149,7 +149,19 @@ enum uverbs_attrs_restore_mr {
 	 * installed against this PD.
 	 */
 	UVERBS_ATTR_RESTORE_MR_PD_HANDLE,
-	/* Mandatory u64 inputs: user virtual address + length + iova. */
+	/*
+	 * Mandatory u64 inputs: length + iova.
+	 *
+	 * ADDR is optional and selects the lane. RESTORE_MR restores what
+	 * one of three registration verbs created, and takes the union of
+	 * their arguments; which one is being restored is said by *which*
+	 * argument is supplied, never inferred from a value. Supplying ADDR
+	 * restores a reg_mr()/reg_mr_iova() MR against a user VA. Supplying
+	 * the DMABUF flag restores a reg_dmabuf_mr() MR. Supplying neither
+	 * is an error -- not a shorthand for anything -- because an MR with
+	 * no user VA is also what a device-memory MR looks like, and an
+	 * implicit ODP MR is legitimately registered at address 0.
+	 */
 	UVERBS_ATTR_RESTORE_MR_ADDR,
 	UVERBS_ATTR_RESTORE_MR_LENGTH,
 	UVERBS_ATTR_RESTORE_MR_IOVA,
@@ -168,6 +180,16 @@ enum uverbs_attrs_restore_mr {
 	 */
 	UVERBS_ATTR_RESTORE_MR_RESP_LKEY,
 	UVERBS_ATTR_RESTORE_MR_RESP_RKEY,
+	/*
+	 * Optional enum ib_uverbs_restore_mr_flags input. See ADDR above
+	 * for how the lane is chosen.
+	 */
+	UVERBS_ATTR_RESTORE_MR_FLAGS,
+};
+
+enum ib_uverbs_restore_mr_flags {
+	/* The MR being restored was created by reg_dmabuf_mr(). */
+	IB_UVERBS_RESTORE_MR_DMABUF = 1 << 0,
 };
 
 /*

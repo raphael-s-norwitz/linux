@@ -1841,6 +1841,7 @@ err_free:
 static struct ib_mr *rxe_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 				    u64 addr, u64 length, u64 iova,
 				    int access, u32 lkey_hint, u32 rkey_hint,
+				    u32 restore_flags,
 				    struct ib_udata *udata)
 {
 	struct rxe_dev *rxe = to_rdev(ibpd->device);
@@ -1849,6 +1850,9 @@ static struct ib_mr *rxe_restore_mr(struct ib_pd *ibpd, u32 target_handle,
 	u32 index_hint;
 	int err, cleanup_err;
 
+	/* rxe has no DMA-BUF support to restore. */
+	if (restore_flags & IB_UVERBS_RESTORE_MR_DMABUF)
+		return ERR_PTR(-EOPNOTSUPP);
 	if (access & IB_ACCESS_ON_DEMAND)
 		return ERR_PTR(-EOPNOTSUPP);
 	if (access & ~RXE_ACCESS_SUPPORTED_MR)
