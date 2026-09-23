@@ -235,11 +235,16 @@ void mlx5_sriov_disable(struct pci_dev *pdev, bool num_vf_change)
 	int num_vfs = pci_num_vf(dev->pdev);
 
 	/*
-	 * Free any per-VF vfmig IOVA arenas after pci_disable_sriov() has
-	 * removed the VFs. Each arena is a fixed reservation inside the VF's
-	 * own managed DMA-IOMMU domain, reclaimed automatically when the VF
-	 * (and its domain) go away, so there is no ordering hazard against
-	 * the VF teardown -- we just free the bookkeeping structs here.
+	 * pci_disable_sriov() below runs the full teardown for every VF
+	 * synchronously: for a driver-bound VF, device_release_driver ->
+	 * mlx5_core remove_one, which frees cmd-ring / EQ / MR DMA through
+	 * vfmig_iova_free_slot() and issues FW teardown commands over the
+	 * VF's own cmd ring. Both dereference the per-VF IOVA domain, so the
+	 * domain MUST outlive pci_disable_sriov(). Drop (free) the domains
+	 * AFTER it returns, by which point every VF is unbound and no
+	 * vfmig_iova_free_slot() caller remains -- dropping first is a
+	 * use-after-free, and yanking the cmd ring's IOVA backing out from
+	 * under a still-bound VF's teardown hangs its FW commands.
 	 */
 	pci_disable_sriov(pdev);
 	mlx5_vfmig_pf_drop_iova_domains(dev);
