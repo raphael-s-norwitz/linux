@@ -19,6 +19,7 @@ config MLX5_CORE
 config MLX5_VFMIG
 	bool "Mellanox MLX5 host-driven VF migration / CRIU restore plumbing"
 	depends on MLX5_CORE
+	depends on IOMMU_API
 	default y
 	help
 	  Builds the in-driver SAVE+LOAD plumbing for mlx5 SR-IOV VFs that

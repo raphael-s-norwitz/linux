@@ -316,6 +316,15 @@ struct mlx5_cmd {
 	int		alloc_size;
 	void	       *cmd_buf;
 	dma_addr_t	dma;
+	/*
+	 * Non-NULL iff this device's cmd ring was allocated through the
+	 * vfmig per-VF deterministic IOVA allocator (a vfmig-tracked VF at
+	 * probe time) rather than the default dma_alloc_coherent(). Set by
+	 * alloc_cmd_page(), consumed by free_cmd_page(). Opaque on purpose:
+	 * struct vfmig_iova_domain is mlx5_core-internal, so the route-through
+	 * is gated on CONFIG_MLX5_VFMIG via mlx5_vf_get_vfmig_iova_domain().
+	 */
+	void	       *vfmig_iova_dom;
 
 	/* protect command queue allocations
 	 */

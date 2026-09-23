@@ -44,6 +44,8 @@
 #include "mlx5_core.h"
 #include "lib/eq.h"
 #include "lib/tout.h"
+#include "vfmig/vfmig.h"
+#include "vfmig/vfmig_iova.h"
 #define CREATE_TRACE_POINTS
 #include "diag/cmd_tracepoint.h"
 
@@ -2392,6 +2394,50 @@ static void create_msg_cache(struct mlx5_core_dev *dev)
 
 static int alloc_cmd_page(struct mlx5_core_dev *dev, struct mlx5_cmd *cmd)
 {
+	struct vfmig_iova_domain *vfmig_dom;
+
+	/*
+	 * vfmig-tracked VFs route the cmd ring page through the per-VF
+	 * deterministic IOVA allocator instead of dma_alloc_coherent(), so
+	 * that the IOVA the firmware sees is reproducible across a SAVE on
+	 * one host and a LOAD on another. The default DMA path is preserved
+	 * for everything else (PFs, untracked VFs).
+	 *
+	 * vfmig_iova_alloc_slot() returns PAGE_SIZE-aligned IOVAs by
+	 * construction (the per-slot bump cursor advances at PAGE_SIZE
+	 * granule and PAGE_SIZE >= MLX5_ADAPTER_PAGE_SIZE on all supported
+	 * architectures), so the unalign-and-retry dance the default path
+	 * does is unnecessary here.
+	 *
+	 * Slot: VFMIG_SLOT_CMD_RING (singleton). instance_key=0 picks up the
+	 * per-slot auto-numbering, which yields key=1 for this one-and-only
+	 * allocation.
+	 */
+	vfmig_dom = mlx5_vf_get_vfmig_iova_domain(dev);
+	if (vfmig_dom) {
+		dma_addr_t iova;
+		void *vaddr;
+		int err;
+
+		err = vfmig_iova_alloc_slot(vfmig_dom, VFMIG_SLOT_CMD_RING,
+					    /*instance_key=*/0,
+					    MLX5_ADAPTER_PAGE_SIZE,
+					    GFP_KERNEL, &iova, &vaddr);
+		if (err)
+			return err;
+		cmd->vfmig_iova_dom = vfmig_dom;
+		cmd->cmd_alloc_buf = vaddr;
+		cmd->alloc_dma = iova;
+		cmd->cmd_buf = vaddr;
+		cmd->dma = iova;
+		cmd->alloc_size = MLX5_ADAPTER_PAGE_SIZE;
+		mlx5_core_dbg(dev,
+			      "vfmig: cmd ring at iova 0x%llx (deterministic)\n",
+			      (unsigned long long)iova);
+		return 0;
+	}
+
+	cmd->vfmig_iova_dom = NULL;
 	cmd->cmd_alloc_buf = dma_alloc_coherent(mlx5_core_dma_dev(dev), MLX5_ADAPTER_PAGE_SIZE,
 						&cmd->alloc_dma, GFP_KERNEL);
 	if (!cmd->cmd_alloc_buf)
@@ -2421,6 +2467,13 @@ static int alloc_cmd_page(struct mlx5_core_dev *dev, struct mlx5_cmd *cmd)
 
 static void free_cmd_page(struct mlx5_core_dev *dev, struct mlx5_cmd *cmd)
 {
+	if (cmd->vfmig_iova_dom) {
+		vfmig_iova_free_slot(cmd->vfmig_iova_dom, VFMIG_SLOT_CMD_RING,
+				     cmd->alloc_dma, cmd->alloc_size);
+		cmd->vfmig_iova_dom = NULL;
+		return;
+	}
+
 	dma_free_coherent(mlx5_core_dma_dev(dev), cmd->alloc_size, cmd->cmd_alloc_buf,
 			  cmd->alloc_dma);
 }
