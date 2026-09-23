@@ -562,6 +562,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_QP)(
 	atomic_set(&qp->usecnt, 0);
 
 	spin_lock_init(&qp->mr_lock);
+	xa_init(&qp->comp_cntrs);
 	INIT_LIST_HEAD(&qp->rdma_mrs);
 	INIT_LIST_HEAD(&qp->sig_mrs);
 	init_completion(&qp->srq_completion);
