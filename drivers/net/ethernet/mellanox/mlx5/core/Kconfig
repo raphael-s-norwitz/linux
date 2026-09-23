@@ -19,6 +19,7 @@ config MLX5_CORE
 config MLX5_VFMIG
 	bool "Mellanox MLX5 host-driven VF migration / CRIU restore plumbing"
 	depends on MLX5_CORE
+	depends on IOMMU_API
 	default y
 	help
 	  Builds the in-driver SAVE+LOAD plumbing for mlx5 SR-IOV VFs that
@@ -36,6 +37,27 @@ config MLX5_VFMIG
 	  needed.
 
 	  If unsure, say Y.
+
+config MLX5_VFMIG_IOVA_PER_VF_GIB
+	int "MLX5 vfmig: per-VF deterministic IOVA window size, in GiB"
+	depends on MLX5_VFMIG
+	range 4 65536
+	default 4
+	help
+	  Size, in GiB, of the deterministic IOVA window allocated to each
+	  tracked VF. The window is partitioned into fixed-size 510 MiB
+	  per-purpose slots that give the firmware reproducible IOVAs across
+	  a SAVE/LOAD. The whole window [4 GiB + vf_id * this, ...) must fit
+	  inside the platform's IOMMU geometry aperture (e.g. 512 GiB on a
+	  39-bit Intel VT-d), which vfmig_iova_domain_create() validates at
+	  SET_TRACKED time, failing with -EOPNOTSUPP if it does not.
+
+	  The default of 4 GiB comfortably holds the kernel-slot footprint
+	  (cmd ring + MANAGE_PAGES + EQ/UAR buffers) and packs ~126 VFs
+	  under a 39-bit aperture. Raise it once the user-space ib_umem_get
+	  path is hooked through this allocator and pinned MR pages
+	  dominate. Below 4 GiB the slot partition no longer fits and
+	  vfmig_iova.h's static_assert fires at build time.
 
 config MLX5_FPGA
 	bool "Mellanox Technologies Innova support"

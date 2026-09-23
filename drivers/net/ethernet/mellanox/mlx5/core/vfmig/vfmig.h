@@ -34,6 +34,8 @@
 
 #include <linux/mlx5/driver.h>
 
+struct vfmig_iova_domain;
+
 #ifdef CONFIG_MLX5_VFMIG
 
 /* Per-PF cdev create/destroy; no-ops on VFs. */
@@ -72,6 +74,17 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev);
 bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *vf_dev,
 				    u16 *vhca_id_out);
 int  mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev);
+
+/*
+ * Return the per-VF deterministic IOVA domain for @vf_dev if its VF was
+ * vfmig-tracked (SET_TRACKED { enable=1 }) when probe fired, else NULL.
+ * Called from the VF's cmd-ring allocation (cmd.c) to decide whether to
+ * route DMA through the vfmig allocator; NULL on PFs and untracked VFs
+ * keeps them on the default dma-iommu path. See the implementation for
+ * the lifetime contract that makes the unlocked domain read safe.
+ */
+struct vfmig_iova_domain *
+mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev);
 
 /* Module init/exit hooks for the cdev region. */
 int  mlx5_vfmig_module_init(void);
@@ -112,6 +125,12 @@ static inline bool mlx5_vfmig_vf_consume_restored(struct mlx5_core_dev *vf_dev,
 static inline int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
 {
 	return 0;
+}
+
+static inline struct vfmig_iova_domain *
+mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev)
+{
+	return NULL;
 }
 
 static inline int mlx5_vfmig_module_init(void)

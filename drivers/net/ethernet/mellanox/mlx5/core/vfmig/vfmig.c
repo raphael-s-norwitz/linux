@@ -2582,6 +2582,49 @@ void mlx5_vfmig_pf_drop_iova_domains(struct mlx5_core_dev *pf_mdev)
 	vfmig_pf_put(vfmig);
 }
 
+struct vfmig_iova_domain *
+mlx5_vf_get_vfmig_iova_domain(struct mlx5_core_dev *vf_dev)
+{
+	struct pci_dev *vf_pdev = vf_dev->pdev;
+	struct vfmig_iova_domain *dom = NULL;
+	struct mlx5_core_dev *pf_mdev;
+	struct mlx5_vfmig_pf *vfmig;
+	int vf_id;
+
+	if (!vf_pdev || !vf_pdev->is_virtfn)
+		return NULL;
+
+	vf_id = pci_iov_vf_id(vf_pdev);
+	if (vf_id < 0)
+		return NULL;
+
+	pf_mdev = mlx5_vf_get_core_dev(vf_pdev);
+	if (!pf_mdev)
+		return NULL;
+
+	/*
+	 * The PF mdev is pinned by mlx5_vf_get_core_dev() until put, so its
+	 * priv.vfmig (and the iova_dom array) stay alive for this read.
+	 * iova_dom[vf_id] is published/taken under @ctxs_lock by the
+	 * SET_TRACKED handler, so read it under the same lock.
+	 *
+	 * The returned pointer is used unlocked by the caller (cmd.c, at VF
+	 * probe time). That is safe because a tracked VF's domain is only
+	 * freed by SET_TRACKED { enable=0 } or SR-IOV teardown, both of which
+	 * require the VF to be unbound -- and we are mid-probe of this VF, so
+	 * it is bound and the domain cannot be torn down underneath us.
+	 */
+	vfmig = pf_mdev->priv.vfmig;
+	if (vfmig) {
+		mutex_lock(&vfmig->ctxs_lock);
+		if (vf_id < vfmig->max_vfs)
+			dom = vfmig->iova_dom[vf_id];
+		mutex_unlock(&vfmig->ctxs_lock);
+	}
+	mlx5_vf_put_core_dev(pf_mdev);
+	return dom;
+}
+
 int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 {
 	struct mlx5_vfmig_pf *vfmig;
