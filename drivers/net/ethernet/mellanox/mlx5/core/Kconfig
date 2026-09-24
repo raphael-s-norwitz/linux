@@ -42,21 +42,28 @@ config MLX5_VFMIG_IOVA_PER_VF_GIB
 	int "MLX5 vfmig: per-VF deterministic IOVA window size, in GiB"
 	depends on MLX5_VFMIG
 	range 4 65536
-	default 4
+	default 16
 	help
 	  Size, in GiB, of the deterministic IOVA window allocated to each
-	  tracked VF. The window is partitioned into fixed-size 510 MiB
-	  per-purpose slots that give the firmware reproducible IOVAs across
-	  a SAVE/LOAD. The whole window [4 GiB + vf_id * this, ...) must fit
-	  inside the platform's IOMMU geometry aperture (e.g. 512 GiB on a
-	  39-bit Intel VT-d), which vfmig_iova_domain_create() validates at
+	  tracked VF. The window holds fixed-size 510 MiB per-purpose kernel
+	  slots (cmd ring + MANAGE_PAGES + EQ/UAR buffers) that give the
+	  firmware reproducible IOVAs across a SAVE/LOAD, a 1 GiB non-migrated
+	  kcoherent carve, and an expand-to-fill USER_PAGE slot for
+	  user-space-pinned MR/CQ/QP/SRQ buffers -- whose
+	  budget is whatever is left over, so it grows directly with this
+	  value. The whole window [4 GiB + vf_id * this, ...) must fit inside
+	  the platform's IOMMU geometry aperture (e.g. 512 GiB on a 39-bit
+	  Intel VT-d), which vfmig_iova_domain_create() validates at
 	  SET_TRACKED time, failing with -EOPNOTSUPP if it does not.
 
-	  The default of 4 GiB comfortably holds the kernel-slot footprint
-	  (cmd ring + MANAGE_PAGES + EQ/UAR buffers) and packs ~126 VFs
-	  under a 39-bit aperture. Raise it once the user-space ib_umem_get
-	  path is hooked through this allocator and pinned MR pages
-	  dominate. Below 4 GiB the slot partition no longer fits and
+	  The default of 16 GiB leaves a ~11.5 GiB user-MR budget per VF and
+	  keeps a single VF's window [4 GiB, 20 GiB) below the PCI MMIO
+	  windows that dma-iommu identity-reserves (commonly placed at or
+	  above ~32 GiB), so tracking works with the shipped default and no
+	  per-host tuning. Raise it for a larger user-MR budget only after
+	  confirming the wider window still clears the platform's reserved
+	  IOVA regions and aperture. The value must be large enough to hold
+	  the kernel slots + kcoherent carve + at least one user-MR IOVA, or
 	  vfmig_iova.h's static_assert fires at build time.
 
 config MLX5_FPGA

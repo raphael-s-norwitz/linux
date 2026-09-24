@@ -54,6 +54,7 @@
 #ifndef __MLX5_CORE_VFMIG_IOVA_H__
 #define __MLX5_CORE_VFMIG_IOVA_H__
 
+#include <linux/bits.h>
 #include <linux/types.h>
 
 struct pci_dev;
@@ -92,6 +93,19 @@ struct vfmig_iova_domain;
  *                          slot every coherent allocation on a tracked
  *                          VF's probe path routes through the allocator,
  *                          so a fresh tracked VF can bind.
+ *   VFMIG_SLOT_USER_PAGE -- user-space-pinned MR / CQ / QP / SRQ buffers
+ *                          and doorbell records. ib_umem_get lands here
+ *                          via the ib_core umem-placement hook; the
+ *                          backing pages are umem-owned, so entries here
+ *                          are external and skip page alloc/free. Unlike
+ *                          the fixed kernel slots this slot is
+ *                          "expand-to-fill": it spans from the kcoherent
+ *                          carve's end (VFMIG_IOVA_KCOHERENT_BYTES) up to
+ *                          the top of the per-VF window, so raising
+ *                          CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB grows the
+ *                          user-MR budget without shifting any kernel
+ *                          slot's IOVAs. No call site routes through it
+ *                          yet; this patch only carves the window.
  */
 enum vfmig_iova_slot {
 	VFMIG_SLOT_INVALID	= 0,
@@ -101,6 +115,7 @@ enum vfmig_iova_slot {
 	VFMIG_SLOT_FRAG_BUF	= 4,
 	VFMIG_SLOT_DB_PAGE	= 5,
 	VFMIG_SLOT_DMA_COHERENT	= 6,
+	VFMIG_SLOT_USER_PAGE	= 7,
 	VFMIG_SLOT_NR,		/* count; drives VFMIG_IOVA_NR_SLOTS */
 };
 
@@ -142,26 +157,52 @@ enum vfmig_iova_slot {
 #define VFMIG_IOVA_GRANULE	PAGE_SIZE
 
 /*
- * The deterministic per-VF range is partitioned across
- * VFMIG_IOVA_NR_SLOTS fixed-size slot windows, each
- * VFMIG_IOVA_SLOT_BYTES wide. Slot N occupies
- *   [base + N * SLOT_BYTES, base + (N + 1) * SLOT_BYTES).
- * Slot 0 (VFMIG_SLOT_INVALID) is reserved and never allocated from.
- * NR_SLOTS tracks the enum, so appending a slot enumerator grows the
- * deterministic window (and the per-slot cursor arrays) by one slot;
- * existing slots keep their IOVA base offset.
+ * The deterministic per-VF range has an asymmetric layout since
+ * VFMIG_SLOT_USER_PAGE was added:
  *
- * The 510 MiB slot size is pinned (not scaled with PER_VF): the kernel
- * call-site footprint is bounded by hardware capabilities, not by how
- * much IOVA the admin hands us, and pinning it keeps a SAVE blob's
- * kernel-slot IOVAs PER_VF-independent.
+ *   - Kernel slots 0..VFMIG_IOVA_KERNEL_NR_SLOTS-1 (every slot except
+ *     USER_PAGE) are fixed-size, each VFMIG_IOVA_SLOT_BYTES (510 MiB)
+ *     wide. Slot N occupies [base + N*SLOT_BYTES, base + (N+1)*SLOT_BYTES).
+ *     Slot 0 (VFMIG_SLOT_INVALID) is reserved and never allocated from.
+ *   - The last slot, VFMIG_SLOT_USER_PAGE, is "expand-to-fill": its
+ *     window runs from slot_base(USER_PAGE) up to the top of the per-VF
+ *     window. The bottom VFMIG_IOVA_KCOHERENT_BYTES are reserved for the
+ *     (future) non-migrated kcoherent sub-arena, so the user-MR IOVA
+ *     range proper starts at slot_base(USER_PAGE) + KCOHERENT_BYTES.
+ *
+ * The 510 MiB kernel slot size is pinned (not scaled with PER_VF): the
+ * kernel call-site footprint is bounded by hardware capabilities, not by
+ * how much IOVA the admin hands us, and pinning it keeps a SAVE blob's
+ * kernel-slot IOVAs PER_VF-independent -- only USER_PAGE's upper bound
+ * scales with CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB.
  */
-#define VFMIG_IOVA_NR_SLOTS	((unsigned int)VFMIG_SLOT_NR)
-#define VFMIG_IOVA_SLOT_BYTES	(510ULL << 20)	/* 510 MiB, fixed */
+#define VFMIG_IOVA_NR_SLOTS		((unsigned int)VFMIG_SLOT_NR)
+#define VFMIG_IOVA_KERNEL_NR_SLOTS	(VFMIG_IOVA_NR_SLOTS - 1U)
+#define VFMIG_IOVA_SLOT_BYTES		(510ULL << 20)	/* 510 MiB, fixed */
+
+/*
+ * KCOHERENT sub-arena: reserved from the BOTTOM of VFMIG_SLOT_USER_PAGE's
+ * window for the (future) non-migrated kernel-DMA arena that will back
+ * the per-VF dma_ops .alloc/.free/.map_phys callbacks (e.g. mlx5e on a
+ * tracked VF). Allocations there are never recorded in a SAVE manifest
+ * and their IOVAs are not stable across migration.
+ *
+ * This patch only RESERVES the range; the arena allocator itself lands
+ * in a later patch. Reserving it here pins USER_PAGE's effective start
+ * (vfmig_iova_user_page_start()) so the user-MR sub-window base will not
+ * shift when the arena is wired up.
+ *
+ * Introducing this carve shifts USER_PAGE's base up by KCOHERENT_BYTES,
+ * a wire-incompatible change for USER_PAGE entries in any pre-existing
+ * SAVE blob -- acceptable because USER_PAGE replay is not wired yet, so
+ * no blob in the wild carries USER_PAGE records.
+ */
+#define VFMIG_IOVA_KCOHERENT_BYTES	BIT_ULL(30)	/* 1 GiB */
 
 static_assert(VFMIG_IOVA_PER_VF >
-	      (u64)VFMIG_IOVA_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES,
-	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit all fixed 510-MiB slots");
+	      (u64)VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES +
+	      VFMIG_IOVA_KCOHERENT_BYTES,
+	      "CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB too small: must fit the fixed 510-MiB kernel slots + the kcoherent carve + at least one user-MR IOVA");
 static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
 	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
 
