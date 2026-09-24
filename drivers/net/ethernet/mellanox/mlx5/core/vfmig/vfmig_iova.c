@@ -12,6 +12,7 @@
  */
 
 #include <linux/align.h>
+#include <linux/atomic.h>
 #include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/gfp.h>
@@ -22,6 +23,7 @@
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/rbtree.h>
+#include <linux/scatterlist.h>
 #include <linux/slab.h>
 #include <linux/types.h>
 
@@ -87,9 +89,9 @@ struct vfmig_iova_page {
 	 * @instance_key has a non-NONE kind byte (source-side retagged or
 	 * LOAD-side placeholders); RB_CLEAR_NODE for every other entry so
 	 * destroy_page_locked can tell membership via RB_EMPTY_NODE. The
-	 * index lets a later slice's restore path resolve a verb-supplied
-	 * (kind, fw_id) to its placeholder sibling chain in O(log n)
-	 * instead of walking the whole iova-sorted dom->pages.
+	 * index lets the destination RESTORE_X bind path resolve a verb-
+	 * supplied (kind, fw_id) to its placeholder sibling chain in
+	 * O(log n) instead of walking the whole iova-sorted dom->pages.
 	 */
 	struct rb_node	 user_index_node;
 };
@@ -131,12 +133,18 @@ struct vfmig_iova_domain {
 
 	/*
 	 * @user_index: (instance_key, iova) secondary index over the
-	 * subset of @pages carrying a non-NONE kind byte. Lets a later
-	 * restore-side bind path map a verb-supplied (kind, fw_id) to its
-	 * placeholder sibling chain without walking the whole iova-sorted
-	 * @pages list.
+	 * subset of @pages carrying a non-NONE kind byte. Lets the
+	 * destination-side RESTORE_X bind path map a verb-supplied
+	 * (kind, fw_id) to its awaiting_bind placeholder sibling chain
+	 * without walking the whole iova-sorted @pages list.
+	 *
+	 * @awaiting_bind_hits: incremented once per successful
+	 * vfmig_iova_bind_user_object() (one bind == one uobject). A
+	 * diagnostic residency counter surfaced later to the SAVE/LOAD
+	 * tooling; only written here in this slice.
 	 */
 	struct rb_root	     user_index;
+	atomic_long_t	     awaiting_bind_hits;
 
 	/*
 	 * Host-page replay accounting (LOAD/destination side).
@@ -507,6 +515,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	mutex_init(&dom->lock);
 	INIT_LIST_HEAD(&dom->pages);
 	dom->user_index = RB_ROOT;
+	atomic_long_set(&dom->awaiting_bind_hits, 0);
 	dom->vf_id = vf_id;
 	dom->base  = base;
 
@@ -985,6 +994,53 @@ vfmig_iova_user_index_insert_locked(struct vfmig_iova_domain *dom,
 }
 
 /*
+ * dom->lock held. Look up the LEFTMOST (lowest-iova) external registry
+ * entry whose @instance_key equals @key, or NULL if none. For a single-
+ * page uobject the leftmost match is the only match; for a multi-page
+ * uobject it is the head of the iova-ascending sibling chain, walked by
+ * vfmig_iova_user_index_next_sibling_locked().
+ */
+static struct vfmig_iova_page *
+vfmig_iova_user_index_lookup_locked(struct vfmig_iova_domain *dom, u64 key)
+{
+	struct rb_node *n = dom->user_index.rb_node;
+	struct vfmig_iova_page *found = NULL;
+	struct vfmig_iova_page *p;
+
+	while (n) {
+		p = rb_entry(n, struct vfmig_iova_page, user_index_node);
+		if (key < p->instance_key) {
+			n = n->rb_left;
+		} else if (key > p->instance_key) {
+			n = n->rb_right;
+		} else {
+			found = p;
+			n = n->rb_left;
+		}
+	}
+	return found;
+}
+
+/*
+ * dom->lock held. Return the next sibling of @p sharing @p's
+ * instance_key, or NULL if @p is the trailing sibling. Sibling order is
+ * iova-ascending, mirroring the dom->pages primary index.
+ */
+static struct vfmig_iova_page *
+vfmig_iova_user_index_next_sibling_locked(struct vfmig_iova_page *p)
+{
+	struct rb_node *next = rb_next(&p->user_index_node);
+	struct vfmig_iova_page *q;
+
+	if (!next)
+		return NULL;
+	q = rb_entry(next, struct vfmig_iova_page, user_index_node);
+	if (q->instance_key != p->instance_key)
+		return NULL;
+	return q;
+}
+
+/*
  * Install a LOAD-side awaiting-bind placeholder: an external USER_PAGE
  * registry entry that reserves the wire-provided [iova, iova+len) window
  * and records the (kind, fw_id) identity in @instance_key, but installs
@@ -1196,20 +1252,164 @@ out_unlock:
 	return err;
 }
 
-/*
- * Skeleton. The destination-side bind resolves the placeholder chain
- * through a secondary index, validates it against @sgt and issues the
- * iommu_maps; that logic is built out incrementally in follow-on
- * commits. Until then the RESTORE_MR verb chain reaches this entry
- * point and fails cleanly with -EOPNOTSUPP, so the caller's
- * ib_umem_release() unwinds the freshly-pinned pages and the
- * awaiting_bind placeholder is left intact for a later retry.
- */
 int vfmig_iova_bind_user_object(struct vfmig_iova_domain *dom,
 				u8 kind, u64 fw_id,
 				struct sg_table *sgt)
 {
-	return -EOPNOTSUPP;
+	struct vfmig_iova_page *head, *sib;
+	u64 instance_key;
+	u64 iova_cur, iova_start, sib_walk;
+	size_t reg_total = 0;
+	size_t sgt_total = 0;
+	unsigned int n_siblings = 0;
+	struct scatterlist *sg;
+	unsigned int i;
+	int err;
+
+	if (!dom || !sgt || sgt->orig_nents == 0)
+		return -EINVAL;
+	if (kind == VFMIG_HUOBJ_KIND_NONE || kind >= VFMIG_HUOBJ_KIND_NR)
+		return -EINVAL;
+
+	instance_key = VFMIG_HUOBJ_KEY(kind, fw_id);
+
+	mutex_lock(&dom->lock);
+
+	head = vfmig_iova_user_index_lookup_locked(dom, instance_key);
+	if (!head) {
+		err = -ENOENT;
+		goto out_unlock;
+	}
+
+	/*
+	 * Walk every sibling under @instance_key (a multi-page user
+	 * object produces one registry entry per source-side sg, all
+	 * sharing the key at distinct iovas) and validate in one pass:
+	 * each is an external USER_PAGE entry, still awaiting bind
+	 * (all-or-nothing: a partial-bound chain is a kernel-state
+	 * bug), and its iova is tightly contiguous with the previous
+	 * sibling's end (replay_external re-installs the exact source
+	 * layout, so contiguity always holds). Accumulate reg_total so
+	 * the destination umem's byte coverage can be cross-checked.
+	 */
+	sib_walk = head->iova;
+	for (sib = head; sib;
+	     sib = vfmig_iova_user_index_next_sibling_locked(sib)) {
+		if (!sib->external || sib->slot != VFMIG_SLOT_USER_PAGE) {
+			dev_err_ratelimited(&dom->vf_pdev->dev,
+					    "vfmig_iova: vf %u bind: kind=%u fw_id=0x%llx sibling %u not a USER_PAGE entry (slot=%u external=%d)\n",
+					    dom->vf_id, kind,
+					    (unsigned long long)fw_id,
+					    n_siblings, sib->slot,
+					    sib->external);
+			err = -EINVAL;
+			goto out_unlock;
+		}
+		if (!sib->awaiting_bind) {
+			err = -EBUSY;
+			goto out_unlock;
+		}
+		if (sib->iova != sib_walk) {
+			dev_err_ratelimited(&dom->vf_pdev->dev,
+					    "vfmig_iova: vf %u bind: kind=%u fw_id=0x%llx sibling %u iova 0x%llx not contiguous with 0x%llx\n",
+					    dom->vf_id, kind,
+					    (unsigned long long)fw_id,
+					    n_siblings,
+					    (unsigned long long)sib->iova,
+					    (unsigned long long)sib_walk);
+			err = -EINVAL;
+			goto out_unlock;
+		}
+		sib_walk = sib->iova + sib->len;
+		reg_total += sib->len;
+		n_siblings++;
+	}
+
+	/*
+	 * The destination's ib_umem_pin sg_table must cover the same
+	 * byte length the source SAVE'd (summed across siblings); a
+	 * mismatch means the verb is binding the wrong umem. The dst sg
+	 * split need not match the source sibling split -- we map the
+	 * dst sgs sequentially at consecutive iovas from head->iova.
+	 */
+	for_each_sgtable_sg(sgt, sg, i)
+		sgt_total += sg->length;
+	if (sgt_total != reg_total) {
+		dev_warn_ratelimited(&dom->vf_pdev->dev,
+				     "vfmig_iova: vf %u bind: kind=%u fw_id=0x%llx sgt total %zu != registry total %zu (%u sibling(s))\n",
+				     dom->vf_id, kind,
+				     (unsigned long long)fw_id, sgt_total,
+				     reg_total, n_siblings);
+		err = -EINVAL;
+		goto out_unlock;
+	}
+
+	/*
+	 * One dma_iova_link per dst sg. sg->offset is 0 and sg->length is
+	 * PAGE_SIZE-aligned for umem-pinned sg_tables; validate per sg
+	 * so a future non-umem caller fails loudly rather than tripping
+	 * the link path's internal alignment WARN.
+	 */
+	iova_start = head->iova;
+	iova_cur   = iova_start;
+	for_each_sgtable_sg(sgt, sg, i) {
+		phys_addr_t phys = page_to_phys(sg_page(sg)) + sg->offset;
+
+		if (!IS_ALIGNED(phys, VFMIG_IOVA_GRANULE) ||
+		    !IS_ALIGNED((size_t)sg->length, VFMIG_IOVA_GRANULE) ||
+		    sg->length == 0) {
+			dev_err_ratelimited(&dom->vf_pdev->dev,
+					    "vfmig_iova: vf %u bind: sg[%u] not page-aligned (phys 0x%llx len %u offset %u)\n",
+					    dom->vf_id, i,
+					    (unsigned long long)phys,
+					    sg->length, sg->offset);
+			err = -EINVAL;
+			goto out_rollback;
+		}
+		err = dma_iova_link(vfmig_dom_dev(dom), &dom->arena, phys,
+				    vfmig_arena_off(dom, iova_cur),
+				    sg->length, DMA_BIDIRECTIONAL, 0);
+		if (err)
+			goto out_rollback;
+
+		sg_dma_address(sg) = iova_cur;
+		sg_dma_len(sg)	   = sg->length;
+		iova_cur += sg->length;
+	}
+
+	err = dma_iova_sync(vfmig_dom_dev(dom), &dom->arena,
+			    vfmig_arena_off(dom, iova_start),
+			    iova_cur - iova_start);
+	if (err)
+		goto out_rollback;
+
+	/*
+	 * All-or-nothing: every sibling flips together so a partial
+	 * bind is never observable. @awaiting_bind_hits counts binds
+	 * (one per uobject), not pages.
+	 */
+	for (sib = head; sib;
+	     sib = vfmig_iova_user_index_next_sibling_locked(sib))
+		sib->awaiting_bind = false;
+	atomic_long_inc(&dom->awaiting_bind_hits);
+	err = 0;
+
+out_unlock:
+	mutex_unlock(&dom->lock);
+	return err;
+
+out_rollback:
+	/*
+	 * Undo the dma_iova_links issued in this call. The caller treats
+	 * the umem as opaque on error and drops pins via
+	 * ib_umem_release(); every sibling stays awaiting_bind=true for
+	 * retry.
+	 */
+	if (iova_cur > iova_start)
+		dma_iova_unlink(vfmig_dom_dev(dom), &dom->arena,
+				vfmig_arena_off(dom, iova_start),
+				iova_cur - iova_start, DMA_BIDIRECTIONAL, 0);
+	goto out_unlock;
 }
 EXPORT_SYMBOL(vfmig_iova_bind_user_object);
 
