@@ -255,6 +255,41 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 			  dma_addr_t iova, size_t size);
 
 /*
+ * Map a caller-owned physical address into the VFMIG_SLOT_USER_PAGE
+ * window. Backs the ib_core umem-placement hook on tracked VFs: one
+ * arena link per umem-pinned scatter-gather segment (user MR / CQ / QP /
+ * SRQ buffers, doorbell records). Unlike vfmig_iova_alloc_slot() this
+ * does not allocate backing memory -- @phys is supplied by the caller
+ * (from sg_phys()) and stays pinned by the umem for the mapping's life.
+ * The registry entry is flagged external (page/vaddr NULL), so
+ * vfmig_iova_for_each() skips it and domain teardown does not free the
+ * page.
+ *
+ * @phys must be VFMIG_IOVA_GRANULE-aligned; @len is rounded up to the
+ * granule. On success *@iova_out is the allocated IOVA (page-aligned).
+ * Bumps the USER_PAGE bump cursor by ALIGN(@len, GRANULE); no IOVA
+ * reuse on unmap at this stage.
+ *
+ * Errors: -EINVAL bad args / misaligned @phys; -ENOSPC USER_PAGE window
+ * exhausted; -EEXIST cursor IOVA already mapped (kernel bug); <0 from
+ * dma_iova_link / allocation.
+ */
+int  vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
+				   phys_addr_t phys, size_t len, gfp_t gfp,
+				   dma_addr_t *iova_out);
+
+/*
+ * Reverse of vfmig_iova_user_page_map_phys(): dma_iova_unlink the external
+ * entry at @iova and drop it from the registry. @iova must be the value
+ * _map_phys() returned; @len is rounded up to the granule. Returns
+ * -ENOENT if no entry is mapped at @iova, -EINVAL if the entry is not a
+ * USER_PAGE external mapping, 0 on success. Safe with @dom == NULL
+ * (returns -EINVAL).
+ */
+int  vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
+				     dma_addr_t iova, size_t len);
+
+/*
  * Callback for vfmig_iova_for_each(): invoked once per deterministic-slot
  * registry entry, in IOVA-ascending order, with @dom->lock held. @vaddr is
  * the kernel-virtual base of the backing pages (safe to memcpy @len bytes
@@ -331,6 +366,21 @@ vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 		     enum vfmig_iova_slot slot,
 		     dma_addr_t iova, size_t size)
 {
+}
+
+static inline int
+vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
+			      phys_addr_t phys, size_t len, gfp_t gfp,
+			      dma_addr_t *iova_out)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int
+vfmig_iova_user_page_unmap_phys(struct vfmig_iova_domain *dom,
+				dma_addr_t iova, size_t len)
+{
+	return -EOPNOTSUPP;
 }
 
 #endif /* CONFIG_MLX5_VFMIG */
