@@ -19,6 +19,7 @@
 #include <linux/mlx5/driver.h>
 
 #include "mlx5_ib.h"
+#include "qp.h"
 
 #define UVERBS_MODULE_NAME mlx5_ib
 #include <rdma/uverbs_named_ioctl.h>
@@ -812,6 +813,12 @@ DECLARE_UVERBS_NAMED_METHOD(
  *                      ib_uverbs_create_qp recorded at create.
  *   RESP_CREATE_FLAGS  mqp->flags (the IB_QP_CREATE_* mask at create).
  *
+ * One optional out, which costs a firmware QUERY_QP and is read only when
+ * asked for:
+ *   RESP_SQ_PSN        struct mlx5_ib_vfmig_qp_sq_psn, next_send_psn and
+ *                      last_acked_psn from the live QPC, so a dump can wait
+ *                      until everything the QP sent has been acknowledged.
+ *
  * Only RC/UD user QPs are supported, matching mlx5_ib_restore_qp's v0
  * type set. UC's mlx5_ib representation also lives in trans_qp but
  * RESTORE_QP rejects it; raw_packet, XRC, GSI, DCT and DCI have no
@@ -886,9 +893,36 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_QP)(struct uverbs_attr_bund
 			     &user_handle, sizeof(user_handle));
 	if (err)
 		return err;
-	return uverbs_copy_to(attrs,
-			      MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
-			      &create_flags, sizeof(create_flags));
+	err = uverbs_copy_to(attrs,
+			     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
+			     &create_flags, sizeof(create_flags));
+	if (err)
+		return err;
+
+	if (uverbs_attr_is_valid(attrs, MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN)) {
+		int outlen = MLX5_ST_SZ_BYTES(query_qp_out);
+		struct mlx5_ib_vfmig_qp_sq_psn psn;
+		void *qpc;
+		u32 *out;
+
+		out = kzalloc(outlen, GFP_KERNEL);
+		if (!out)
+			return -ENOMEM;
+		err = mlx5_core_qp_query(to_mdev(ibqp->device), &base->mqp, out,
+					 outlen, false);
+		if (!err) {
+			qpc = MLX5_ADDR_OF(query_qp_out, out, qpc);
+			psn.next_send_psn = MLX5_GET(qpc, qpc, next_send_psn);
+			psn.last_acked_psn = MLX5_GET(qpc, qpc, last_acked_psn);
+		}
+		kfree(out);
+		if (err)
+			return err;
+		err = uverbs_copy_to(attrs,
+				     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN,
+				     &psn, sizeof(psn));
+	}
+	return err;
 }
 
 DECLARE_UVERBS_NAMED_METHOD(
@@ -905,7 +939,10 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
 			    UVERBS_ATTR_TYPE(u32),
-			    UA_MANDATORY));
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN,
+			    UVERBS_ATTR_TYPE(struct mlx5_ib_vfmig_qp_sq_psn),
+			    UA_OPTIONAL));
 
 DECLARE_UVERBS_GLOBAL_METHODS(
 	MLX5_IB_OBJECT_VFMIG,
