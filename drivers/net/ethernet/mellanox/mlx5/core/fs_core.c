@@ -1352,6 +1352,11 @@ static struct mlx5_flow_table *__mlx5_create_flow_table(struct mlx5_flow_namespa
 	}
 
 	mutex_lock(&root->chain_lock);
+	if (root->fenced) {
+		/* A VF being migrated: its RX steering is not ours to change. */
+		err = -EBUSY;
+		goto unlock_root;
+	}
 	fs_prio = find_prio(ns, ft_attr->prio);
 	if (!fs_prio) {
 		err = -EINVAL;
@@ -2569,8 +2574,9 @@ static int update_root_ft_destroy(struct mlx5_flow_table *ft)
 		return 0;
 
 	new_root_ft = find_next_ft(ft);
-	if (!new_root_ft) {
-		root->root_ft = NULL;
+	if (!new_root_ft || root->fenced) {
+		/* While fenced the firmware root stays the fence's; lifting it restores ours. */
+		root->root_ft = new_root_ft;
 		return 0;
 	}
 
@@ -3210,6 +3216,11 @@ static int init_rdma_rx_root_ns(struct mlx5_flow_steering *steering)
 		goto out_err;
 
 	set_prio_attrs(steering->rdma_rx_root_ns);
+	/*
+	 * A restored VF may have come up from LOAD with the source's fence as
+	 * its root; hold everything off until vfmig says it has been lifted.
+	 */
+	steering->rdma_rx_root_ns->fenced = mlx5_vf_is_restored(steering->dev);
 
 	return 0;
 
@@ -3852,6 +3863,31 @@ static const struct devlink_param mlx5_fs_params[] = {
 			     mlx5_fs_mode_get, mlx5_fs_mode_set,
 			     mlx5_fs_mode_validate),
 };
+
+/*
+ * For vfmig's RX fence, which takes over @dev's RDMA_RX firmware root
+ * behind this steering's back. While fenced, no table can be created in
+ * RDMA_RX and a destroyed root hands on only in software, so nothing takes
+ * the root from the fence; unfencing points the firmware root back at the
+ * table this steering has there, if any.
+ */
+int mlx5_fs_rdma_rx_fence(struct mlx5_core_dev *dev, bool on)
+{
+	struct mlx5_flow_steering *steering = dev->priv.steering;
+	struct mlx5_flow_root_namespace *root;
+	int err = 0;
+
+	if (!steering || !steering->rdma_rx_root_ns)
+		return on ? -EOPNOTSUPP : 0;
+
+	root = steering->rdma_rx_root_ns;
+	mutex_lock(&root->chain_lock);
+	root->fenced = on;
+	if (!on && root->root_ft)
+		err = root->cmds->update_root_ft(root, root->root_ft, 0, false);
+	mutex_unlock(&root->chain_lock);
+	return err;
+}
 
 void mlx5_fs_core_cleanup(struct mlx5_core_dev *dev)
 {

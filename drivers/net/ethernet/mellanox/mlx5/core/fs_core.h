@@ -295,6 +295,11 @@ struct mlx5_flow_root_namespace {
 	struct mutex			chain_lock;
 	struct list_head		underlay_qpns;
 	const struct mlx5_flow_cmds	*cmds;
+	/*
+	 * RDMA_RX only: a vfmig RX fence owns the firmware root, and no table
+	 * may take it. Under chain_lock. See mlx5_fs_rdma_rx_fence().
+	 */
+	bool				fenced;
 };
 
 enum mlx5_fc_type {
