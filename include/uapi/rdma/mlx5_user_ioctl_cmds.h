@@ -601,6 +601,7 @@ enum mlx5_ib_vfmig_query_qp_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_BLOB,
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN,
 };
 
 /*
@@ -633,6 +634,19 @@ struct mlx5_ib_vfmig_dyn_uar_record {
  * so source and dest uids differ by construction.
  * The layout is fixed wire ABI; reserved fields must be zero.
  */
+/*
+ * Optional RESP_SQ_PSN out of VFMIG_QUERY_QP: the QP's requester PSNs, read
+ * from its live context in firmware. Everything the QP has sent has been
+ * acknowledged -- a READ once its responses have arrived, since they carry
+ * the PSNs the request reserved -- when last_acked_psn == next_send_psn - 1,
+ * modulo 2^24. Unlike the SQ WQEBB counters, which advance as soon as a WQE
+ * is transmitted.
+ */
+struct mlx5_ib_vfmig_qp_sq_psn {
+	__u32	next_send_psn;
+	__u32	last_acked_psn;
+};
+
 struct mlx5_ib_vfmig_ucontext_meta {
 	__u32	num_static_sys_pages;
 	__u32	num_sys_pages;
