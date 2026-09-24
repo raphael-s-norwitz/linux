@@ -252,6 +252,46 @@ struct mlx5_vfmig_resume_vhca {
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x14, struct mlx5_vfmig_resume_vhca)
 
 /*
+ * MLX5_VFMIG_IOC_RX_FENCE:
+ *   Raise or lift a RoCE RX fence on VF @vf_id: a table that drops every
+ *   packet, made the root of the VF's RDMA_RX steering, so no RoCE packet
+ *   reaches its QPs. Raising returns the fence's @table_id and @group_id;
+ *   lifting takes them back.
+ *
+ *   The fence is firmware state, and the kernel keeps no record of it
+ *   beyond holding mlx5_core's own RDMA_RX steering off the root while it
+ *   is up: SAVE_VHCA_STATE carries it, a VF LOADed from that state comes
+ *   up fenced, and the handles from the raise lift it there too.
+ *
+ *   A restored VF comes up with its steering held off either way, since
+ *   the kernel cannot tell a fenced source from an unfenced one. Lift it
+ *   with MLX5_VFMIG_RX_FENCE_F_NO_TABLE when there is no fence table to
+ *   take down, which releases only the steering.
+ *
+ *   The VF must be bound to mlx5_core and RUNNING.
+ *
+ *   Returns 0 on success; -EINVAL if @vf_id is out of range, @op or
+ *   @flags is unknown, or @reserved is non-zero; -ENODEV if the VF is not
+ *   bound; -EBUSY if it is suspended; or a negative firmware error.
+ */
+#define MLX5_VFMIG_RX_FENCE_LIFT	0
+#define MLX5_VFMIG_RX_FENCE_RAISE	1
+
+#define MLX5_VFMIG_RX_FENCE_F_NO_TABLE	(1u << 0)	/* LIFT only */
+
+struct mlx5_vfmig_rx_fence {
+	__u32 vf_id;		/* in  */
+	__u32 op;		/* in: MLX5_VFMIG_RX_FENCE_* */
+	__u32 table_id;		/* out on RAISE, in on LIFT */
+	__u32 group_id;		/* out on RAISE, in on LIFT */
+	__u32 flags;		/* in: MLX5_VFMIG_RX_FENCE_F_* */
+	__u32 reserved;
+};
+
+#define MLX5_VFMIG_IOC_RX_FENCE \
+	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x15, struct mlx5_vfmig_rx_fence)
+
+/*
  * KEEP_SUSPENDED: when SAVE self-suspended the VF (it was not already
  * parked via SUSPEND_VHCA), leave it parked on close instead of resuming
  * it. Ignored when the VF was pre-parked by the caller (that suspend is

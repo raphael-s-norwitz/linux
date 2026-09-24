@@ -925,6 +925,206 @@ static long vfmig_ioc_suspend_vhca(struct mlx5_vfmig_pf *vfmig,
 	return 0;
 }
 
+/*
+ * RoCE RX fence: a one-entry DROP table on the VF's own RDMA_RX steering,
+ * made the root. It is built from raw firmware commands on the VF's command
+ * interface, outside mlx5_core's steering, and is known only by its
+ * handles. Level 1, not 0: the level-0 table is the root by default, so a
+ * fence left at level 0 would take the root back whenever it was reset.
+ */
+static void vfmig_rx_fence_destroy(struct mlx5_core_dev *vf, u32 table_id,
+				   u32 group_id)
+{
+	u32 fg_in[MLX5_ST_SZ_DW(destroy_flow_group_in)] = {};
+	u32 ft_in[MLX5_ST_SZ_DW(destroy_flow_table_in)] = {};
+
+	MLX5_SET(destroy_flow_group_in, fg_in, opcode, MLX5_CMD_OP_DESTROY_FLOW_GROUP);
+	MLX5_SET(destroy_flow_group_in, fg_in, table_type, FS_FT_RDMA_RX);
+	MLX5_SET(destroy_flow_group_in, fg_in, table_id, table_id);
+	MLX5_SET(destroy_flow_group_in, fg_in, group_id, group_id);
+	mlx5_cmd_exec_in(vf, destroy_flow_group, fg_in);
+
+	MLX5_SET(destroy_flow_table_in, ft_in, opcode, MLX5_CMD_OP_DESTROY_FLOW_TABLE);
+	MLX5_SET(destroy_flow_table_in, ft_in, table_type, FS_FT_RDMA_RX);
+	MLX5_SET(destroy_flow_table_in, ft_in, table_id, table_id);
+	mlx5_cmd_exec_in(vf, destroy_flow_table, ft_in);
+}
+
+static int vfmig_rx_fence_delete_fte(struct mlx5_core_dev *vf, u32 table_id)
+{
+	u32 in[MLX5_ST_SZ_DW(delete_fte_in)] = {};
+
+	MLX5_SET(delete_fte_in, in, opcode, MLX5_CMD_OP_DELETE_FLOW_TABLE_ENTRY);
+	MLX5_SET(delete_fte_in, in, table_type, FS_FT_RDMA_RX);
+	MLX5_SET(delete_fte_in, in, table_id, table_id);
+	MLX5_SET(delete_fte_in, in, flow_index, 0);
+	return mlx5_cmd_exec_in(vf, delete_fte, in);
+}
+
+static int vfmig_rx_fence_create(struct mlx5_core_dev *vf, u32 *table_id,
+				 u32 *group_id)
+{
+	u32 root_in[MLX5_ST_SZ_DW(set_flow_table_root_in)] = {};
+	u32 ft_out[MLX5_ST_SZ_DW(create_flow_table_out)] = {};
+	u32 fg_out[MLX5_ST_SZ_DW(create_flow_group_out)] = {};
+	u32 ft_in[MLX5_ST_SZ_DW(create_flow_table_in)] = {};
+	u32 fte_out[MLX5_ST_SZ_DW(set_fte_out)] = {};
+	int fte_len = MLX5_ST_SZ_BYTES(set_fte_in);
+	int fg_len = MLX5_ST_SZ_BYTES(create_flow_group_in);
+	u32 *fg_in, *fte_in;
+	void *ctx;
+	int err;
+
+	fg_in = kvzalloc(fg_len, GFP_KERNEL);
+	fte_in = kvzalloc(fte_len, GFP_KERNEL);
+	if (!fg_in || !fte_in) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	MLX5_SET(create_flow_table_in, ft_in, opcode, MLX5_CMD_OP_CREATE_FLOW_TABLE);
+	MLX5_SET(create_flow_table_in, ft_in, table_type, FS_FT_RDMA_RX);
+	MLX5_SET(create_flow_table_in, ft_in, flow_table_context.level, 1);
+	err = mlx5_cmd_exec_inout(vf, create_flow_table, ft_in, ft_out);
+	if (err)
+		goto out;
+	*table_id = MLX5_GET(create_flow_table_out, ft_out, table_id);
+
+	/* One entry, index 0, with no match criteria: it matches everything. */
+	MLX5_SET(create_flow_group_in, fg_in, opcode, MLX5_CMD_OP_CREATE_FLOW_GROUP);
+	MLX5_SET(create_flow_group_in, fg_in, table_type, FS_FT_RDMA_RX);
+	MLX5_SET(create_flow_group_in, fg_in, table_id, *table_id);
+	err = mlx5_cmd_exec(vf, fg_in, fg_len, fg_out, sizeof(fg_out));
+	if (err)
+		goto destroy_table;
+	*group_id = MLX5_GET(create_flow_group_out, fg_out, group_id);
+
+	MLX5_SET(set_fte_in, fte_in, opcode, MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY);
+	MLX5_SET(set_fte_in, fte_in, table_type, FS_FT_RDMA_RX);
+	MLX5_SET(set_fte_in, fte_in, table_id, *table_id);
+	ctx = MLX5_ADDR_OF(set_fte_in, fte_in, flow_context);
+	MLX5_SET(flow_context, ctx, group_id, *group_id);
+	MLX5_SET(flow_context, ctx, action, MLX5_FLOW_CONTEXT_ACTION_DROP);
+	err = mlx5_cmd_exec(vf, fte_in, fte_len, fte_out, sizeof(fte_out));
+	if (err)
+		goto destroy_group;
+
+	MLX5_SET(set_flow_table_root_in, root_in, opcode, MLX5_CMD_OP_SET_FLOW_TABLE_ROOT);
+	MLX5_SET(set_flow_table_root_in, root_in, table_type, FS_FT_RDMA_RX);
+	MLX5_SET(set_flow_table_root_in, root_in, table_id, *table_id);
+	err = mlx5_cmd_exec_in(vf, set_flow_table_root, root_in);
+	if (!err)
+		goto out;
+
+	vfmig_rx_fence_delete_fte(vf, *table_id);
+destroy_group:
+	vfmig_rx_fence_destroy(vf, *table_id, *group_id);
+	goto out;
+destroy_table:
+	vfmig_rx_fence_destroy(vf, *table_id, 0);
+out:
+	kvfree(fte_in);
+	kvfree(fg_in);
+	return err;
+}
+
+/*
+ * Block mlx5_core's steering from taking the RDMA_RX root first, then put
+ * the fence there.
+ */
+static int vfmig_rx_fence_raise(struct mlx5_core_dev *vf, u32 *table_id,
+				u32 *group_id)
+{
+	int err;
+
+	err = mlx5_fs_rdma_rx_fence(vf, true);
+	if (err)
+		return err;
+	err = vfmig_rx_fence_create(vf, table_id, group_id);
+	if (err)
+		mlx5_fs_rdma_rx_fence(vf, false);
+	return err;
+}
+
+/*
+ * Hand the root back to mlx5_core's own RDMA_RX table, if it has one, then
+ * take the fence apart. With no such table, destroying the root leaves the
+ * default: every packet goes to its QP. @no_table: a VF restored from an
+ * unfenced source has only mlx5_core's steering to release.
+ */
+static int vfmig_rx_fence_lift(struct mlx5_core_dev *vf, u32 table_id,
+			       u32 group_id, bool no_table)
+{
+	int err;
+
+	if (no_table)
+		return mlx5_fs_rdma_rx_fence(vf, false);
+
+	err = vfmig_rx_fence_delete_fte(vf, table_id);
+	if (err)
+		return err;
+	err = mlx5_fs_rdma_rx_fence(vf, false);
+	vfmig_rx_fence_destroy(vf, table_id, group_id);
+	return err;
+}
+
+static long vfmig_ioc_rx_fence(struct mlx5_vfmig_pf *vfmig, void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_core_sriov *sriov = &pf_mdev->priv.sriov;
+	struct mlx5_vfmig_rx_fence arg;
+	struct pci_dev *vf_pdev;
+	int err;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.reserved)
+		return -EINVAL;
+	if (arg.op != MLX5_VFMIG_RX_FENCE_RAISE &&
+	    arg.op != MLX5_VFMIG_RX_FENCE_LIFT)
+		return -EINVAL;
+	if (arg.flags & ~MLX5_VFMIG_RX_FENCE_F_NO_TABLE ||
+	    (arg.flags && arg.op != MLX5_VFMIG_RX_FENCE_LIFT))
+		return -EINVAL;
+	if (arg.vf_id >= sriov->num_vfs)
+		return -EINVAL;
+	if (sriov->vfs_ctx[arg.vf_id].vfmig_dp_state != MLX5_VFMIG_DP_RUNNING)
+		return -EBUSY;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev)
+		return -ENODEV;
+
+	/* The device lock keeps the VF's mlx5_core bound under us. */
+	device_lock(&vf_pdev->dev);
+	if (vf_pdev->dev.driver != pf_mdev->pdev->dev.driver)
+		err = -ENODEV;
+	else if (arg.op == MLX5_VFMIG_RX_FENCE_RAISE)
+		err = vfmig_rx_fence_raise(pci_get_drvdata(vf_pdev),
+					   &arg.table_id, &arg.group_id);
+	else
+		err = vfmig_rx_fence_lift(pci_get_drvdata(vf_pdev),
+					  arg.table_id, arg.group_id,
+					  arg.flags & MLX5_VFMIG_RX_FENCE_F_NO_TABLE);
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+
+	if (err) {
+		mlx5_core_warn(pf_mdev, "vfmig: %s RoCE RX fence on vf %u failed: %d\n",
+			       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? "raising" : "lifting",
+			       arg.vf_id, err);
+		return err;
+	}
+	mlx5_core_info(pf_mdev, "vfmig: RoCE RX fence %s on vf %u (table 0x%x group 0x%x)\n",
+		       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? "up" : "down",
+		       arg.vf_id, arg.table_id, arg.group_id);
+
+	if (arg.op == MLX5_VFMIG_RX_FENCE_RAISE &&
+	    copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+	return 0;
+}
+
 static long vfmig_ioc_resume_vhca(struct mlx5_vfmig_pf *vfmig,
 				  void __user *uarg)
 {
@@ -3235,6 +3435,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_RESUME_VHCA:
 		ret = vfmig_ioc_resume_vhca(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_RX_FENCE:
+		ret = vfmig_ioc_rx_fence(vfmig, uarg);
 		break;
 	case MLX5_VFMIG_IOC_SAVE_VHCA_STATE:
 		ret = vfmig_ioc_save_vhca_state(vfmig, uarg);

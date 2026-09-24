@@ -219,6 +219,7 @@ int mlx5_core_get_caps(struct mlx5_core_dev *dev, enum mlx5_cap_type cap_type);
 int mlx5_core_get_caps_mode(struct mlx5_core_dev *dev, enum mlx5_cap_type cap_type,
 			    enum mlx5_cap_mode cap_mode);
 int mlx5_query_hca_caps(struct mlx5_core_dev *dev);
+int mlx5_fs_rdma_rx_fence(struct mlx5_core_dev *dev, bool on);
 int mlx5_query_board_id(struct mlx5_core_dev *dev);
 int mlx5_query_module_num(struct mlx5_core_dev *dev, int *module_num);
 
