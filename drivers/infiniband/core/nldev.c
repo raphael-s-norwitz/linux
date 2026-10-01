@@ -1621,17 +1621,21 @@ static int res_get_common_dumpit(struct sk_buff *skb,
 	struct nlattr *tb[RDMA_NLDEV_ATTR_MAX];
 	struct rdma_restrack_entry *res;
 	struct rdma_restrack_root *rt;
-	int err, ret = 0, idx = 0;
+	int err, ret = 0;
 	bool show_details = false;
 	struct nlattr *table_attr;
 	struct nlattr *entry_attr;
 	struct ib_device *device;
-	int start = cb->args[0];
+	unsigned long start = cb->args[0];
 	bool has_cap_net_admin;
 	struct nlmsghdr *nlh;
 	unsigned long id;
 	u32 index, port = 0;
 	bool filled = false;
+
+	/* The previous call walked to the end of the table. */
+	if (cb->args[1])
+		return 0;
 
 	err = __nlmsg_parse(cb->nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
 			    nldev_policy, NL_VALIDATE_LIBERAL, NULL);
@@ -1686,16 +1690,17 @@ static int res_get_common_dumpit(struct sk_buff *skb,
 	rt = &device->res[res_type];
 	xa_lock(&rt->xa);
 	/*
-	 * FIXME: if the skip ahead is something common this loop should
-	 * use xas_for_each & xas_pause to optimize, we can have a lot of
-	 * objects.
+	 * Resume from the id we stopped at, not from a count of entries
+	 * already sent: entries added or removed while the dump is in
+	 * progress -- by any user of the device -- shift positions, and a
+	 * count would then skip or repeat unrelated entries.
 	 */
-	xa_for_each(&rt->xa, id, res) {
+	xa_for_each_start(&rt->xa, id, res, start) {
 		if (xa_get_mark(&rt->xa, res->id, RESTRACK_DD) && !show_details)
-			goto next;
+			continue;
 
-		if (idx < start || !rdma_restrack_get(res))
-			goto next;
+		if (!rdma_restrack_get(res))
+			continue;
 
 		xa_unlock(&rt->xa);
 
@@ -1722,14 +1727,16 @@ static int res_get_common_dumpit(struct sk_buff *skb,
 		}
 		nla_nest_end(skb, entry_attr);
 again:		xa_lock(&rt->xa);
-next:		idx++;
 	}
 	xa_unlock(&rt->xa);
+	cb->args[1] = 1;
 
 msg_full:
 	nla_nest_end(skb, table_attr);
 	nlmsg_end(skb, nlh);
-	cb->args[0] = idx;
+	/* The message filled up: resume at the entry that did not fit. */
+	if (!cb->args[1])
+		cb->args[0] = id;
 
 	/*
 	 * No more entries to fill, cancel the message and
