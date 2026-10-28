@@ -123,12 +123,15 @@ enum vfmig_iova_slot {
 /*
  * IOVA window layout (hardware-visible addresses).
  *
- *   VFMIG_IOVA_BASE     -- per-PF base, 4 GiB. The window
- *                          [BASE, BASE + N * PER_VF) must fit entirely
- *                          inside the IOMMU's geometry aperture, whose
- *                          upper bound the iommu driver derives from the
- *                          hardware address width (e.g. 39-bit on some
- *                          Intel VT-d -> [0, 0x7fffffffff]).
+ *   VFMIG_IOVA_BASE     -- base of every VF's window, 4 GiB. Each VF
+ *                          reserves the same [BASE, BASE + PER_VF) in
+ *                          its own managed domain, so an image replays
+ *                          onto any VF of the PF. The window must fit
+ *                          entirely inside the IOMMU's geometry
+ *                          aperture, whose upper bound the iommu driver
+ *                          derives from the hardware address width
+ *                          (e.g. 39-bit on some Intel VT-d ->
+ *                          [0, 0x7fffffffff]).
  *                          dma_iova_alloc_fixed() returns -ERANGE outside
  *                          it, so the window is validated against the
  *                          live aperture at reservation
@@ -138,9 +141,6 @@ enum vfmig_iova_slot {
  *                          failure. Base 4 GiB leaves the bottom 4 GiB
  *                          untouched and makes IOVAs visually distinct
  *                          from anything the default allocator produces.
- *                          VFs of the same PF get distinct sub-windows
- *                          (BASE + vf_id * PER_VF) so an IOVA value alone
- *                          identifies the owning VF in dmesg.
  *   VFMIG_IOVA_PER_VF   -- IOVA space per VF, configurable via
  *                          CONFIG_MLX5_VFMIG_IOVA_PER_VF_GIB (GiB;
  *                          default 4). Ample for the cmd ring +

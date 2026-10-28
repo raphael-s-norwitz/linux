@@ -102,8 +102,8 @@ struct vfmig_iova_page {
  * ordinary DMA-API traffic still works; we only reserve a fixed IOVA
  * carveout in it and populate it with dma_iova_link(). @arena is the
  * reservation returned by dma_iova_alloc_fixed(); @arena.addr == @base.
- * @vf_pdev is pinned for the domain's lifetime; @vf_id derives the IOVA
- * window and labels log lines. The deterministic range
+ * @vf_pdev is pinned for the domain's lifetime; @vf_id labels log lines
+ * and plays no part in the IOVA layout. The deterministic range
  * [base, base + NR_SLOTS * SLOT_BYTES) is partitioned across the slot
  * windows.
  */
@@ -468,12 +468,15 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 
 	if (!vf_pdev || !out)
 		return -EINVAL;
-	if ((u64)vf_id >= U32_MAX / 2)	/* defensive: catch overflow */
-		return -EINVAL;
 
-	base = VFMIG_IOVA_BASE + (u64)vf_id * VFMIG_IOVA_PER_VF;
-	if (base < VFMIG_IOVA_BASE)	/* wrapped */
-		return -ERANGE;
+	/*
+	 * Every VF reserves the same window: each VF is its own IOMMU
+	 * group with its own managed domain, so identical ranges do not
+	 * collide, and a saved image's IOVAs replay onto any VF of the PF
+	 * rather than only the VF index it was saved from. VFs that do
+	 * share a domain fail the reservation below instead of overlapping.
+	 */
+	base = VFMIG_IOVA_BASE;
 
 	/*
 	 * The arena lives inside the VF's managed dma-iommu domain: its IOVA

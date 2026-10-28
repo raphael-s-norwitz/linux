@@ -51,9 +51,10 @@ config MLX5_VFMIG_IOVA_PER_VF_GIB
 	  kcoherent carve, and an expand-to-fill USER_PAGE slot for
 	  user-space-pinned MR/CQ/QP/SRQ buffers -- whose
 	  budget is whatever is left over, so it grows directly with this
-	  value. The whole window [4 GiB + vf_id * this, ...) must fit inside
-	  the platform's IOMMU geometry aperture (e.g. 512 GiB on a 39-bit
-	  Intel VT-d), which vfmig_iova_domain_create() validates at
+	  value. Every VF reserves the same window [4 GiB, 4 GiB + this) in
+	  its own IOMMU domain; it must fit inside the platform's IOMMU
+	  geometry aperture (e.g. 512 GiB on a 39-bit Intel VT-d), which
+	  vfmig_iova_domain_create() validates at
 	  SET_TRACKED time, failing with -EOPNOTSUPP if it does not.
 
 	  The default of 16 GiB leaves a ~11.5 GiB user-MR budget per VF and
