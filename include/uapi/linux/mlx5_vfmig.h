@@ -403,26 +403,42 @@ struct mlx5_vfmig_load_state {
  *     - SET_VF_UUID(vf_id, U) repeat (same U): no-op, returns 0.
  *     - SET_VF_UUID(vf_id, V), V != U, U != 0: -EBUSY, unchanged. Guards
  *         against re-tagging a slot that already carries an identity.
+ *     - SET_VF_UUID(vf_id, U, F_CLEAR), slot == U: all-zeros.
  *     - sriov_numvfs=0 / PF unload:            all-zeros (torn down).
  *
- *   "Set once until teardown": to repurpose a vf_id slot for a different
- *   workload, cycle sriov_numvfs=0 -> N first (the same cycle that already
- *   tears down the slot's other per-VF resources). Idempotent re-stamps
- *   with the same UUID need no teardown.
+ *   To hand a UUID from one VF to another on the same PF, clear it from
+ *   the holder with F_CLEAR and then stamp it on the new VF. Clearing is
+ *   allowed while the VF is bound to a driver; the UUID is only a tag and
+ *   no VF state depends on it. Otherwise the slot is set once until
+ *   sriov_numvfs=0.
+ *
+ *   @flags:
+ *     MLX5_VFMIG_SET_VF_UUID_F_CLEAR -- compare-and-clear: @vf_uuid
+ *       carries the UUID the caller expects @vf_id to hold, and the slot
+ *       is zeroed only if it matches. A mismatch leaves the slot as is.
  *
  *   Errors:
  *     -EFAULT  copy_from_user.
- *     -EINVAL  @vf_id out of range, @reserved non-zero, or @vf_uuid
+ *     -EINVAL  @vf_id out of range, @flags has unknown bits, or @vf_uuid
  *              all-zeros (all-zeros is the "unset" sentinel and is
- *              rejected as a write).
- *     -EBUSY   a different non-zero UUID is already set on @vf_id.
+ *              rejected both as a write and as an expected value).
+ *     -EBUSY   set: a different non-zero UUID is already set on @vf_id.
+ *              F_CLEAR: @vf_id holds a different UUID.
+ *     -ENOENT  F_CLEAR: @vf_id holds no UUID.
  *     -ENODEV  PF is gone.
+ *
+ *   Kernels without F_CLEAR required @flags to be 0 and fail it -EINVAL.
  */
+#define MLX5_VFMIG_SET_VF_UUID_F_CLEAR	(1u << 0)
+#define MLX5_VFMIG_SET_VF_UUID_FLAG_ALL \
+	(MLX5_VFMIG_SET_VF_UUID_F_CLEAR)
+
 struct mlx5_vfmig_set_vf_uuid {
 	__u32 vf_id;		/* in  */
-	__u32 reserved;		/* in: must be 0 */
-	__u8  vf_uuid[16];	/* in: orchestrator-supplied 16-byte
-				 *     UUID; must not be all-zeros.
+	__u32 flags;		/* in: subset of MLX5_VFMIG_SET_VF_UUID_FLAG_* */
+	__u8  vf_uuid[16];	/* in: UUID to stamp, or with F_CLEAR the
+				 *     UUID expected on @vf_id; must not be
+				 *     all-zeros.
 				 */
 };
 

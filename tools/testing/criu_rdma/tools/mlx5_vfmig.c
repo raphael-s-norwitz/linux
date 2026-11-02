@@ -14,6 +14,7 @@
  *   mlx5_vfmig <pf-bdf> set_tracked       <vf_id> <0|1>
  *   mlx5_vfmig <pf-bdf> enable_migratable <vf_id>
  *   mlx5_vfmig <pf-bdf> set_vf_uuid       <vf_id> <uuid-string>
+ *   mlx5_vfmig <pf-bdf> clear_vf_uuid     <vf_id> <expected-uuid-string>
  *   mlx5_vfmig <pf-bdf> suspend_vhca      <vf_id> [initiator|responder|both]
  *   mlx5_vfmig <pf-bdf> resume_vhca       <vf_id> [initiator|responder|both]
  *   mlx5_vfmig <pf-bdf> save_vhca_state   <vf_id> <blob_path> [keep_suspended]
@@ -138,9 +139,12 @@ static int uuid_is_zero(const unsigned char in[16])
 	return memcmp(in, zero, 16) == 0;
 }
 
-static int do_set_vf_uuid(int fd, unsigned int vf_id, const char *uuid_str)
+/* @flags 0 stamps @uuid_str; MLX5_VFMIG_SET_VF_UUID_F_CLEAR clears it. */
+static int do_set_vf_uuid(int fd, unsigned int vf_id, const char *uuid_str,
+			  unsigned int flags)
 {
-	struct mlx5_vfmig_set_vf_uuid arg = { .vf_id = vf_id };
+	struct mlx5_vfmig_set_vf_uuid arg = { .vf_id = vf_id, .flags = flags };
+	int clear = flags & MLX5_VFMIG_SET_VF_UUID_F_CLEAR;
 
 	if (parse_uuid(uuid_str, arg.vf_uuid)) {
 		fprintf(stderr,
@@ -155,16 +159,22 @@ static int do_set_vf_uuid(int fd, unsigned int vf_id, const char *uuid_str)
 	}
 
 	if (ioctl(fd, MLX5_VFMIG_IOC_SET_VF_UUID, &arg) < 0) {
-		if (errno == EBUSY)
+		if (errno == EBUSY && clear)
+			fprintf(stderr,
+				"vf %u: holds a different UUID; nothing cleared\n",
+				vf_id);
+		else if (errno == EBUSY)
 			fprintf(stderr,
 				"vf %u: a different UUID is already stamped on this slot; "
-				"sriov_numvfs=0 + sriov_numvfs=N to clear, or use the same UUID\n",
+				"clear_vf_uuid it first, or use the same UUID\n",
 				vf_id);
+		else if (errno == ENOENT && clear)
+			fprintf(stderr, "vf %u: no UUID stamped\n", vf_id);
 		else
 			perror("SET_VF_UUID");
 		return 1;
 	}
-	printf("vf %u: vf_uuid stamped\n", vf_id);
+	printf("vf %u: vf_uuid %s\n", vf_id, clear ? "cleared" : "stamped");
 	return 0;
 }
 
@@ -501,6 +511,7 @@ static void usage(const char *argv0)
 		"  set_tracked       <vf_id> <0|1>\n"
 		"  enable_migratable <vf_id>\n"
 		"  set_vf_uuid       <vf_id> <uuid-string>\n"
+		"  clear_vf_uuid     <vf_id> <expected-uuid-string>\n"
 		"  suspend_vhca      <vf_id> [initiator|responder|both]\n"
 		"  resume_vhca       <vf_id> [initiator|responder|both]\n"
 		"  save_vhca_state   <vf_id> <blob_path> [keep_suspended]\n"
@@ -562,7 +573,12 @@ int main(int argc, char **argv)
 	} else if (verb_eq(verb, "set_vf_uuid")) {
 		if (argc != 5)
 			goto badargs;
-		ret = do_set_vf_uuid(fd, vf_id, argv[4]);
+		ret = do_set_vf_uuid(fd, vf_id, argv[4], 0);
+	} else if (verb_eq(verb, "clear_vf_uuid")) {
+		if (argc != 5)
+			goto badargs;
+		ret = do_set_vf_uuid(fd, vf_id, argv[4],
+				     MLX5_VFMIG_SET_VF_UUID_F_CLEAR);
 	} else if (verb_eq(verb, "suspend_vhca") || verb_eq(verb, "suspend")) {
 		unsigned int dir = 0;
 
