@@ -224,6 +224,12 @@ int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom);
 
 /*
+ * Number of registry entries (allocated, replayed or external) still in
+ * @dom. 0 for @dom == NULL.
+ */
+unsigned int vfmig_iova_nr_pages(struct vfmig_iova_domain *dom);
+
+/*
  * Allocate @size bytes of DMA-able memory from @slot's sub-window at the
  * slot's next deterministic IOVA. Backing pages are kernel-owned and
  * zeroed; the mapping is linked into the per-VF arena with

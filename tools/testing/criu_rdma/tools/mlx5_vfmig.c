@@ -15,6 +15,7 @@
  *   mlx5_vfmig <pf-bdf> enable_migratable <vf_id>
  *   mlx5_vfmig <pf-bdf> set_vf_uuid       <vf_id> <uuid-string>
  *   mlx5_vfmig <pf-bdf> clear_vf_uuid     <vf_id> <expected-uuid-string>
+ *   mlx5_vfmig <pf-bdf> recycle_vf        <vf_id>
  *   mlx5_vfmig <pf-bdf> suspend_vhca      <vf_id> [initiator|responder|both]
  *   mlx5_vfmig <pf-bdf> resume_vhca       <vf_id> [initiator|responder|both]
  *   mlx5_vfmig <pf-bdf> save_vhca_state   <vf_id> <blob_path> [keep_suspended]
@@ -180,6 +181,27 @@ static int do_set_vf_uuid(int fd, unsigned int vf_id, const char *uuid_str,
 		return 1;
 	}
 	printf("vf %u: vf_uuid %s\n", vf_id, clear ? "cleared" : "stamped");
+	return 0;
+}
+
+static int do_recycle_vf(int fd, unsigned int vf_id)
+{
+	struct mlx5_vfmig_recycle_vf arg = { .vf_id = vf_id };
+
+	if (ioctl(fd, MLX5_VFMIG_IOC_RECYCLE_VF, &arg) < 0) {
+		if (errno == EBUSY)
+			fprintf(stderr,
+				"vf %u: bound to a driver or SAVE/LOAD fd open; "
+				"unbind / close it first\n", vf_id);
+		else if (errno == EEXIST)
+			fprintf(stderr,
+				"vf %u: a UUID is still stamped; clear_vf_uuid it first\n",
+				vf_id);
+		else
+			perror("RECYCLE_VF");
+		return 1;
+	}
+	printf("vf %u: recycled (FLR done, ready for LOAD)\n", vf_id);
 	return 0;
 }
 
@@ -517,6 +539,7 @@ static void usage(const char *argv0)
 		"  enable_migratable <vf_id>\n"
 		"  set_vf_uuid       <vf_id> <uuid-string>\n"
 		"  clear_vf_uuid     <vf_id> <expected-uuid-string>\n"
+		"  recycle_vf        <vf_id>\n"
 		"  suspend_vhca      <vf_id> [initiator|responder|both]\n"
 		"  resume_vhca       <vf_id> [initiator|responder|both]\n"
 		"  save_vhca_state   <vf_id> <blob_path> [keep_suspended]\n"
@@ -584,6 +607,10 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_set_vf_uuid(fd, vf_id, argv[4],
 				     MLX5_VFMIG_SET_VF_UUID_F_CLEAR);
+	} else if (verb_eq(verb, "recycle_vf")) {
+		if (argc != 4)
+			goto badargs;
+		ret = do_recycle_vf(fd, vf_id);
 	} else if (verb_eq(verb, "suspend_vhca") || verb_eq(verb, "suspend")) {
 		unsigned int dir = 0;
 

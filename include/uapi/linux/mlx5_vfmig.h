@@ -452,4 +452,50 @@ struct mlx5_vfmig_set_vf_uuid {
 #define MLX5_VFMIG_IOC_SET_VF_UUID \
 	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x12, struct mlx5_vfmig_set_vf_uuid)
 
+/*
+ * MLX5_VFMIG_IOC_RECYCLE_VF:
+ *   Return a used VF @vf_id to a loadable state without changing
+ *   sriov_numvfs, so it can be the destination of a later LOAD. Works on
+ *   a VF that ran normally and on one that came up from a LOAD.
+ *
+ *   Preconditions:
+ *     - The VF is not bound to any driver.
+ *     - No UUID is stamped on it. Move the UUID off with
+ *       SET_VF_UUID(F_CLEAR) first; recycle never clears it, so a VF
+ *       still carrying a workload identity is refused.
+ *     - No SAVE_VHCA_STATE or LOAD_VHCA_STATE fd is open for it.
+ *
+ *   Effect, in order:
+ *     1. FLR the VF (pci_reset_function_locked()). If this fails nothing
+ *        else is changed.
+ *     2. Drop any staged LOAD and the "restored" latch, along with a
+ *        MARK_RESTORED DEFER_RESUME request, and reset the VF's datapath
+ *        state to RUNNING.
+ *     3. If the VF is tracked, destroy its IOVA arena. Pages left in it
+ *        are freed and counted in dmesg.
+ *
+ *   Postconditions: the VF is in the state right after SR-IOV enable.
+ *   QUERY_VF reports restored=0, tracked=0 and an unset UUID. Run the
+ *   usual bootstrap (SET_TRACKED, ENABLE_MIGRATABLE) before it is bound
+ *   or loaded again. The migratable cap may survive the FLR; that is
+ *   harmless, since ENABLE_MIGRATABLE on a VF that already has it is a
+ *   no-op.
+ *
+ *   Errors:
+ *     -EFAULT  copy_from_user.
+ *     -EINVAL  @vf_id out of range or @flags non-zero.
+ *     -ENODEV  the VF pci_dev is missing, or the PF is gone.
+ *     -EBUSY   the VF is bound, or a SAVE/LOAD fd is open for it.
+ *     -EEXIST  a UUID is stamped on the VF.
+ *     other    from the FLR (e.g. -ENOTTY: no reset method), with no
+ *              state changed.
+ */
+struct mlx5_vfmig_recycle_vf {
+	__u32 vf_id;		/* in  */
+	__u32 flags;		/* in: must be 0 */
+};
+
+#define MLX5_VFMIG_IOC_RECYCLE_VF \
+	_IOW(MLX5_VFMIG_IOC_MAGIC, 0x16, struct mlx5_vfmig_recycle_vf)
+
 #endif /* _UAPI_LINUX_MLX5_VFMIG_H */

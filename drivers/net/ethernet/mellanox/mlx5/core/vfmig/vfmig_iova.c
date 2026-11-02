@@ -578,6 +578,18 @@ err_pci_put:
 	return err;
 }
 
+unsigned int vfmig_iova_nr_pages(struct vfmig_iova_domain *dom)
+{
+	unsigned int n;
+
+	if (!dom)
+		return 0;
+	mutex_lock(&dom->lock);
+	n = dom->n_pages;
+	mutex_unlock(&dom->lock);
+	return n;
+}
+
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 {
 	struct vfmig_iova_page *p, *tmp;
