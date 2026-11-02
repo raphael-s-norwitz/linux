@@ -168,6 +168,11 @@ static int do_set_vf_uuid(int fd, unsigned int vf_id, const char *uuid_str,
 				"vf %u: a different UUID is already stamped on this slot; "
 				"clear_vf_uuid it first, or use the same UUID\n",
 				vf_id);
+		else if (errno == EEXIST)
+			fprintf(stderr,
+				"vf %u: another VF of this PF holds this UUID; "
+				"clear_vf_uuid it there first\n",
+				vf_id);
 		else if (errno == ENOENT && clear)
 			fprintf(stderr, "vf %u: no UUID stamped\n", vf_id);
 		else
