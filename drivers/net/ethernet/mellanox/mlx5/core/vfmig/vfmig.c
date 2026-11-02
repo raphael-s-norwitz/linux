@@ -430,12 +430,29 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 }
 
 /*
+ * Return the VF id whose slot holds @uuid, or -1 if none does. Caller
+ * holds vfmig->ctxs_lock.
+ */
+static int vfmig_uuid_holder_locked(struct mlx5_vfmig_pf *vfmig,
+				    const uuid_t *uuid)
+{
+	u16 i;
+
+	for (i = 0; i < vfmig->max_vfs; i++)
+		if (uuid_equal(&vfmig->vf_uuid[i], uuid))
+			return i;
+	return -1;
+}
+
+/*
  * MLX5_VFMIG_IOC_SET_VF_UUID: stamp the orchestrator's 16-byte identity
  * tag onto VF @vf_id. Set-once until SR-IOV teardown: a first stamp
  * records the UUID, a same-UUID re-stamp is an idempotent no-op, and a
  * different-UUID stamp is rejected -EBUSY (guards against re-tagging a
- * slot that already carries a workload identity). uuid_null is the
- * "unset" sentinel and is rejected as a write.
+ * slot that already carries a workload identity). A UUID held by another
+ * VF of this PF is rejected -EEXIST, so QUERY_VF never reports the same
+ * UUID on two VFs. uuid_null is the "unset" sentinel and is rejected as
+ * a write.
  *
  * With MLX5_VFMIG_SET_VF_UUID_F_CLEAR, @vf_uuid is the UUID the caller
  * expects the slot to hold, and the slot is zeroed only on a match.
@@ -481,9 +498,19 @@ static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
 				       arg.vf_id);
 		}
 	} else if (uuid_is_null(slot)) {
-		uuid_copy(slot, &new_uuid);
-		mlx5_core_info(pf_mdev, "vfmig: SET_VF_UUID vf %u stamped\n",
-			       arg.vf_id);
+		int holder = vfmig_uuid_holder_locked(vfmig, &new_uuid);
+
+		if (holder >= 0) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SET_VF_UUID vf %u rejected: vf %d already holds this UUID\n",
+				       arg.vf_id, holder);
+			err = -EEXIST;
+		} else {
+			uuid_copy(slot, &new_uuid);
+			mlx5_core_info(pf_mdev,
+				       "vfmig: SET_VF_UUID vf %u stamped\n",
+				       arg.vf_id);
+		}
 	} else if (uuid_equal(slot, &new_uuid)) {
 		/* Idempotent same-UUID re-stamp; no log line. */
 	} else {

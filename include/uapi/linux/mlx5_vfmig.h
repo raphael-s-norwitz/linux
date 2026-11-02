@@ -397,12 +397,18 @@ struct mlx5_vfmig_load_state {
  *   any LOAD_VHCA_STATE. CRIU never writes a UUID -- both dump and
  *   restore only READ @vf_uuid via QUERY_VF.
  *
+ *   A UUID identifies at most one VF per PF, so the VF that reports it is
+ *   unambiguous. Uniqueness across PFs or hosts is not enforced: the
+ *   source and destination of a migration carry the same UUID.
+ *
  *   Lifecycle:
  *     - Initial state on sriov_numvfs=N: all-zeros (unset).
  *     - SET_VF_UUID(vf_id, U) first call:      @vf_uuid := U.
  *     - SET_VF_UUID(vf_id, U) repeat (same U): no-op, returns 0.
  *     - SET_VF_UUID(vf_id, V), V != U, U != 0: -EBUSY, unchanged. Guards
  *         against re-tagging a slot that already carries an identity.
+ *     - SET_VF_UUID(vf_id, U), U on another VF of the PF: -EEXIST,
+ *         unchanged.
  *     - SET_VF_UUID(vf_id, U, F_CLEAR), slot == U: all-zeros.
  *     - sriov_numvfs=0 / PF unload:            all-zeros (torn down).
  *
@@ -424,6 +430,7 @@ struct mlx5_vfmig_load_state {
  *              rejected both as a write and as an expected value).
  *     -EBUSY   set: a different non-zero UUID is already set on @vf_id.
  *              F_CLEAR: @vf_id holds a different UUID.
+ *     -EEXIST  set: another VF of this PF already holds @vf_uuid.
  *     -ENOENT  F_CLEAR: @vf_id holds no UUID.
  *     -ENODEV  PF is gone.
  *
