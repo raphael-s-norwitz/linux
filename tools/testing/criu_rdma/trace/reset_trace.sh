@@ -18,15 +18,18 @@
 # report prints as window markers.
 # Events go to a private tracefs instance, so other tracing is untouched.
 #
-# report prints every event and exits 1 if a reset or HCA command hit a
-# watched VF without a matching --allow, or if an --allow count is not
-# met exactly. A PF-issued ENABLE_HCA/DISABLE_HCA is charged to the VF
-# its func_id names. --from/--to limit the check to events between two
-# marks; markers from SAVE/LOAD are printed but never fail the report.
+# report exits 1 if a reset or HCA command hit a watched VF without a
+# matching --allow, or if an --allow count is not met exactly. A
+# PF-issued ENABLE_HCA/DISABLE_HCA is charged to the VF its func_id
+# names. --from/--to limit the check, and the events printed, to those
+# between two marks; markers from SAVE/LOAD are printed but never fail
+# the report.
 #
 # <call> is one of: flr (pcie_flr, the FLR itself), reset (one reset
 # operation; the pci_reset_* and pcie_reset_flr entry points it nests
-# through count once), enable_hca, disable_hca, init_hca, teardown_hca. Example, recycle of VF 0000:08:00.2 with VF .3 watched:
+# through count once), enable_hca, disable_hca, init_hca, teardown_hca.
+#
+# Example, recycle of VF 0000:08:00.2 with VF .3 watched:
 #   reset_trace.sh report --pf 0000:08:00.0 --vf 0000:08:00.2 \
 #       --vf 0000:08:00.3 --allow flr@0000:08:00.2=1 \
 #       --allow reset@0000:08:00.2=1 --allow teardown_hca@0000:08:00.2=1 \
@@ -180,6 +183,9 @@ target_bdf() {
 
 swap16() { echo $(( ($1 >> 8 | $1 << 8) & 0xffff )); }
 
+# Print only inside the report window; uses do_report's in_window.
+show() { (( in_window )) && echo "$@"; return 0; }
+
 do_report() {
 	local pf="" from="" to="" last="" in_window line call bdf dev fid key a n
 	local -a vfs=() allows=()
@@ -210,9 +216,10 @@ do_report() {
 	while IFS= read -r line; do
 		[[ "$line" == \#* || -z "$line" ]] && continue
 		if [[ "$line" =~ criu_rdma\ mark\ (.*)$ ]]; then
-			echo "MARK  ${BASH_REMATCH[1]}"
-			[[ "${BASH_REMATCH[1]}" == "$from" ]] && in_window=1
-			[[ -n "$to" && "${BASH_REMATCH[1]}" == "$to" ]] && in_window=0
+			a="${BASH_REMATCH[1]}"
+			[[ "$a" == "$from" ]] && in_window=1
+			show "MARK  $a"
+			[[ -n "$to" && "$a" == "$to" ]] && in_window=0
 			continue
 		fi
 		[[ "$line" =~ \ ([a-z_]+):\ \( ]] || continue
@@ -231,13 +238,13 @@ do_report() {
 			n=""
 			[[ "$line" =~ vhca=(0x[0-9a-f]+|[0-9]+) ]] &&
 				n=$(printf '0x%04x' "$(swap16 $((BASH_REMATCH[1])))")
-			echo "WIN   $a vhca_id $n via $dev"
+			show "WIN   $a vhca_id $n via $dev"
 			continue
 		fi
 		[[ -z "$bdf" ]] && bdf=$(target_bdf "$dev" "$fid" "$pf")
 		if [[ "$call" == reset_flr && "$line" =~ probe=([0-9]+) &&
 		      "${BASH_REMATCH[1]}" != 0 ]]; then
-			echo "      reset_flr $bdf (capability probe)"
+			show "      reset_flr $bdf (capability probe)"
 			continue
 		fi
 		if [[ ! "$bdf" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$ ]]; then
@@ -255,13 +262,13 @@ do_report() {
 
 		# One reset nests several entry points; count it once.
 		if [[ "$call" == reset && "$last" == "reset@$bdf" ]]; then
-			echo "      $call $bdf (nested)"
+			show "      $call $bdf (nested)"
 			continue
 		fi
 		last="$call@$bdf"
 
 		if (( ! in_window )) || [[ -z "${watched[$bdf]:-}" ]]; then
-			echo "      $call $bdf (not checked)"
+			show "      $call $bdf (not checked)"
 			continue
 		fi
 		key="$call@$bdf"
