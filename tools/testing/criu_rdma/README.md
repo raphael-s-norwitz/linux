@@ -32,6 +32,22 @@ header comment for the verbs).
   and RDMA traffic are out of scope. The harness resets every VF on the
   PF, so keep any traffic peer on another PF or host.
 
+- `save_load/test_vf_recycle.sh` -- reuses VF 0 and VF 1 for SAVE/LOAD
+  for `ITERS` rounds (default 10) without SR-IOV teardown, checking each
+  round that `sriov_numvfs` and the virtfn links are unchanged and, with
+  `trace/reset_trace.sh`, that the vacated VF is reset exactly once and
+  nothing resets either VF between LOAD and the end of the restored
+  probe. Cycles: 1 sysfs FLR then LOAD into a used VF, 2 the same via
+  RECYCLE_VF, 3 recycle and reload a restored VF, 4 save from the VF
+  restored in the previous round, 5 as 4 with a UUID handed off every
+  round. Cycle 3 fails while restored-VF teardown logs a fatal health
+  event (`design/teardown_reclaim_hang.md`).
+
+  ```
+  sudo PF=0000:08:00.0 tools/testing/criu_rdma/save_load/test_vf_recycle.sh
+  sudo CYCLES="2 5" ITERS=20 tools/testing/criu_rdma/save_load/test_vf_recycle.sh
+  ```
+
 ## Tracing
 
 - `trace/reset_trace.sh` -- records PCI resets (`pcie_flr` and the
