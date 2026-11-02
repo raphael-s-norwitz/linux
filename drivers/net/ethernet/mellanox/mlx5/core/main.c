@@ -1192,14 +1192,10 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 	 * firmware reject the subsequent LOAD. So skip them and apply the
 	 * staged blob here instead.
 	 *
-	 * NOTE: on a native (non-VFIO, non-VM) probe without deterministic
-	 * IOVAs the destination's own command ring is left non-functional
-	 * after LOAD -- the blob captured the source's host-ownership view
-	 * of that ring. The bring-up therefore proceeds far enough to apply
-	 * LOAD and record the finding, then fails loudly in
-	 * mlx5_function_open()'s QUERY_HCA_CAP. Making a restored VF fully
-	 * usable requires the deterministic-IOVA work (host-page replay)
-	 * tracked separately.
+	 * The blob refers to the source's command ring and buffers by IOVA.
+	 * The VF must have been tracked (SET_TRACKED) before LOAD, so those
+	 * IOVAs were replayed into its deterministic IOVA domain and its own
+	 * command ring works after LOAD.
 	 */
 	if (mlx5_vfmig_vf_consume_restored(dev, &restored_vhca_id)) {
 		if (restored_out)
