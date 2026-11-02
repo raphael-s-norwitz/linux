@@ -3445,6 +3445,104 @@ err_claim:
 	return err;
 }
 
+/*
+ * Return an unbound VF to its post-SR-IOV-enable state: FLR it, drop the
+ * restored latch, any staged LOAD and the datapath/defer-resume state,
+ * and destroy its IOVA arena, leaving it untracked. The VF device_lock is
+ * held throughout, so nothing can bind it while its state is
+ * inconsistent.
+ */
+static long vfmig_ioc_recycle_vf(struct mlx5_vfmig_pf *vfmig,
+				 void __user *uarg)
+{
+	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
+	struct mlx5_vfmig_vf_load *load = NULL;
+	struct vfmig_iova_domain *old_dom;
+	struct mlx5_vfmig_recycle_vf arg;
+	struct mlx5_core_sriov *sriov;
+	struct pci_dev *vf_pdev;
+	unsigned int left = 0;
+	bool was_restored;
+	int err = 0;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.flags)
+		return -EINVAL;
+
+	sriov = &pf_mdev->priv.sriov;
+	if (arg.vf_id >= sriov->num_vfs || arg.vf_id >= vfmig->max_vfs)
+		return -EINVAL;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	if (!vf_pdev) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RECYCLE_VF vf %u: VF pci_dev lookup failed\n",
+			       arg.vf_id);
+		return -ENODEV;
+	}
+
+	device_lock(&vf_pdev->dev);
+	if (vf_pdev->dev.driver) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RECYCLE_VF vf %u rejected: VF is bound to %s (must be unbound first)\n",
+			       arg.vf_id, vf_pdev->dev.driver->name);
+		err = -EBUSY;
+		goto out_unlock;
+	}
+
+	mutex_lock(&vfmig->ctxs_lock);
+	if (!uuid_is_null(&vfmig->vf_uuid[arg.vf_id])) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RECYCLE_VF vf %u rejected: UUID %pUb still stamped (clear it first)\n",
+			       arg.vf_id, &vfmig->vf_uuid[arg.vf_id]);
+		err = -EEXIST;
+	} else if (vfmig_vf_id_busy_locked(vfmig, arg.vf_id)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RECYCLE_VF vf %u rejected: SAVE/LOAD session open\n",
+			       arg.vf_id);
+		err = -EBUSY;
+	}
+	mutex_unlock(&vfmig->ctxs_lock);
+	if (err)
+		goto out_unlock;
+
+	err = pci_reset_function_locked(vf_pdev);
+	if (err) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: RECYCLE_VF vf %u: FLR failed: %d, state unchanged\n",
+			       arg.vf_id, err);
+		goto out_unlock;
+	}
+
+	mutex_lock(&vfmig->ctxs_lock);
+	load = vfmig->pending_load[arg.vf_id];
+	vfmig->pending_load[arg.vf_id] = NULL;
+	was_restored = test_and_clear_bit(arg.vf_id, vfmig->restored);
+	sriov->vfs_ctx[arg.vf_id].vfmig_dp_state = MLX5_VFMIG_DP_RUNNING;
+	sriov->vfs_ctx[arg.vf_id].vfmig_defer_resume = 0;
+	old_dom = vfmig->iova_dom[arg.vf_id];
+	vfmig->iova_dom[arg.vf_id] = NULL;
+	mutex_unlock(&vfmig->ctxs_lock);
+
+	if (old_dom) {
+		left = vfmig_iova_nr_pages(old_dom);
+		vfmig_iova_domain_destroy(old_dom);
+	}
+
+	mlx5_core_info(pf_mdev,
+		       "vfmig: vf %u recycled (restored=%d staged_load=%d was_tracked=%d, %u arena pages dropped)\n",
+		       arg.vf_id, was_restored, !!load, !!old_dom, left);
+
+out_unlock:
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+
+	if (load)
+		vfmig_vf_load_destroy(pf_mdev, load);
+	return err;
+}
+
 static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct mlx5_vfmig_pf *vfmig = filp->private_data;
@@ -3469,6 +3567,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_SET_VF_UUID:
 		ret = vfmig_ioc_set_vf_uuid(vfmig, uarg);
+		break;
+	case MLX5_VFMIG_IOC_RECYCLE_VF:
+		ret = vfmig_ioc_recycle_vf(vfmig, uarg);
 		break;
 	case MLX5_VFMIG_IOC_SET_TRACKED:
 		ret = vfmig_ioc_set_tracked(vfmig, uarg);
