@@ -188,8 +188,9 @@ struct mlx5_vfmig_vf_load {
  *           A non-NULL entry is applied (and freed) by the VF's next
  *           probe. Mutated under @ctxs_lock. NULL array when @max_vfs 0.
  * @vf_uuid: per-VF orchestrator-stamped identity tag, indexed by VF id.
- *           Stamped via SET_VF_UUID, read back via QUERY_VF, cleared on
- *           SR-IOV teardown. Mutated under @ctxs_lock. NULL when
+ *           Stamped via SET_VF_UUID, read back via QUERY_VF, cleared by
+ *           SET_VF_UUID(F_CLEAR) or on SR-IOV teardown. Mutated under
+ *           @ctxs_lock. NULL when
  *           @max_vfs is 0.
  * @iova_dom: per-VF deterministic IOVA domain, indexed by VF id. A
  *           non-NULL entry means the VF is "tracked": a fixed-IOVA
@@ -435,6 +436,10 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
  * different-UUID stamp is rejected -EBUSY (guards against re-tagging a
  * slot that already carries a workload identity). uuid_null is the
  * "unset" sentinel and is rejected as a write.
+ *
+ * With MLX5_VFMIG_SET_VF_UUID_F_CLEAR, @vf_uuid is the UUID the caller
+ * expects the slot to hold, and the slot is zeroed only on a match.
+ * Nothing but QUERY_VF reads the tag, so this is safe on a bound VF.
  */
 static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
 				  void __user *uarg)
@@ -448,7 +453,7 @@ static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.reserved)
+	if (arg.flags & ~MLX5_VFMIG_SET_VF_UUID_FLAG_ALL)
 		return -EINVAL;
 	import_uuid(&new_uuid, arg.vf_uuid);
 	if (uuid_is_null(&new_uuid))
@@ -461,7 +466,21 @@ static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
 	slot = &vfmig->vf_uuid[arg.vf_id];
 
 	mutex_lock(&vfmig->ctxs_lock);
-	if (uuid_is_null(slot)) {
+	if (arg.flags & MLX5_VFMIG_SET_VF_UUID_F_CLEAR) {
+		if (uuid_is_null(slot)) {
+			err = -ENOENT;
+		} else if (!uuid_equal(slot, &new_uuid)) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SET_VF_UUID vf %u clear rejected: a different UUID is stamped\n",
+				       arg.vf_id);
+			err = -EBUSY;
+		} else {
+			uuid_copy(slot, &uuid_null);
+			mlx5_core_info(pf_mdev,
+				       "vfmig: SET_VF_UUID vf %u cleared\n",
+				       arg.vf_id);
+		}
+	} else if (uuid_is_null(slot)) {
 		uuid_copy(slot, &new_uuid);
 		mlx5_core_info(pf_mdev, "vfmig: SET_VF_UUID vf %u stamped\n",
 			       arg.vf_id);
@@ -3843,10 +3862,10 @@ static void vfmig_drop_vf_uuids_locked(struct mlx5_vfmig_pf *vfmig)
 /*
  * Clear all stamped vf_uuids from mlx5_device_disable_sriov(): the
  * vf_uuid array is indexed by VF id and survives an sriov_numvfs cycle,
- * so a tag stamped for one VF generation must be cleared before the slot
- * can be repurposed -- otherwise a SET_VF_UUID with the next workload's
- * identity would hit the -EBUSY "different UUID already set" guard with
- * no in-kernel clear path. No-op on VFs / before pf_init.
+ * so a tag stamped for one VF generation must not carry over to the next,
+ * where a SET_VF_UUID with the next workload's identity would hit the
+ * -EBUSY "different UUID already set" guard. No-op on VFs / before
+ * pf_init.
  */
 void mlx5_vfmig_pf_drop_vf_uuids(struct mlx5_core_dev *pf_mdev)
 {
