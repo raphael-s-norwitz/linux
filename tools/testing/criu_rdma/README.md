@@ -31,3 +31,24 @@ header comment for the verbs).
   The image holds only the driver's kernel buffers; user verbs objects
   and RDMA traffic are out of scope. The harness resets every VF on the
   PF, so keep any traffic peer on another PF or host.
+
+## Tracing
+
+- `trace/reset_trace.sh` -- records PCI resets (`pcie_flr` and the
+  `pci_reset_*` entry points) and mlx5 HCA lifecycle commands
+  (ENABLE/DISABLE/INIT/TEARDOWN_HCA), with SAVE/LOAD_VHCA_STATE as window
+  markers, and fails if any hit a watched VF other than as allowed.
+
+  ```
+  sudo tools/testing/criu_rdma/trace/reset_trace.sh arm
+  sudo tools/testing/criu_rdma/trace/reset_trace.sh mark flr
+  ...
+  sudo tools/testing/criu_rdma/trace/reset_trace.sh report \
+      --pf 0000:08:00.0 --vf 0000:08:00.2 --vf 0000:08:00.3 \
+      --from flr --to load --allow flr@0000:08:00.2=1 \
+      --allow reset@0000:08:00.2=1
+  sudo tools/testing/criu_rdma/trace/reset_trace.sh disarm
+  ```
+
+  It reads struct offsets from the tree's `vmlinux` and `mlx5_core.ko`
+  with gdb, so run it from the tree the running kernel was built from.
