@@ -89,6 +89,19 @@ struct mlx5_vfmig_get_vhca_id {
  *     vf_uuid:   16-byte orchestrator-stamped per-VF identity tag set
  *                via MLX5_VFMIG_IOC_SET_VF_UUID. All-zeros means unset.
  *                Cleared on SR-IOV teardown (sriov_numvfs=0).
+ *     vf_state:  MLX5_VFMIG_VF_STATE_* flags, read from the VF itself at
+ *                the time of the call:
+ *       BOUND      the VF is bound to a driver.
+ *       FROM_LOAD  the VF is bound to mlx5_core and came up from
+ *                  LOAD_VHCA_STATE. Unlike @restored, which is consumed
+ *                  by the probe, this holds until the VF is unbound, so
+ *                  it tells a restored VF apart from one probed normally
+ *                  (including a restored VF unbound and bound again).
+ *       UNKNOWN    a probe or remove of the VF is in progress; the other
+ *                  bits are 0 and mean nothing. Query again later.
+ *                A kernel without this field reports 0 for a bound VF, so
+ *                check BOUND against sysfs before trusting a clear
+ *                FROM_LOAD.
  *
  *   ABI note: this struct grew to add @vf_uuid + @reserved_out. The
  *   encoded ioctl number changes with the struct size (sizeof in the
@@ -104,8 +117,13 @@ struct mlx5_vfmig_query_vf {
 	__u8  vf_uuid[16];	/* out: orchestrator-stamped UUID,
 				 *      all-zeros if unset
 				 */
-	__u8  reserved_out[8];	/* out: zeroed */
+	__u8  vf_state;		/* out: MLX5_VFMIG_VF_STATE_* */
+	__u8  reserved_out[7];	/* out: zeroed */
 };
+
+#define MLX5_VFMIG_VF_STATE_BOUND	(1u << 0)
+#define MLX5_VFMIG_VF_STATE_FROM_LOAD	(1u << 1)
+#define MLX5_VFMIG_VF_STATE_UNKNOWN	(1u << 2)
 
 #define MLX5_VFMIG_IOC_QUERY_VF \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)
