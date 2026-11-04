@@ -2267,13 +2267,20 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 	 * A restore-mode ucontext is seeded with the source's FW UAR ids,
 	 * which only this VHCA holds if LOAD_VHCA_STATE was applied to it.
 	 * On any other VF those ids are unallocated or belong to someone
-	 * else.
+	 * else. Once a restore-mode ucontext has been destroyed, the ids it
+	 * held were freed, so the LOAD can no longer back a new restore.
 	 */
-	if ((req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE) &&
-	    !mlx5_vf_is_restored(dev->mdev)) {
-		mlx5_ib_warn(dev,
-			     "VFMIG_RESTORE ucontext refused: device did not come up from LOAD_VHCA_STATE\n");
-		return -EINVAL;
+	if (req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE) {
+		if (!mlx5_vf_is_restored(dev->mdev)) {
+			mlx5_ib_warn(dev,
+				     "VFMIG_RESTORE ucontext refused: device did not come up from LOAD_VHCA_STATE\n");
+			return -EINVAL;
+		}
+		if (mlx5_vf_restore_released(dev->mdev)) {
+			mlx5_ib_warn(dev,
+				     "VFMIG_RESTORE ucontext refused: a restore-mode ucontext from this LOAD was already destroyed\n");
+			return -EINVAL;
+		}
 	}
 
 	req.total_num_bfregs = ALIGN(req.total_num_bfregs,
@@ -2438,6 +2445,9 @@ static void mlx5_ib_dealloc_ucontext(struct ib_ucontext *ibcontext)
 	struct mlx5_ib_ucontext *context = to_mucontext(ibcontext);
 	struct mlx5_ib_dev *dev = to_mdev(ibcontext->device);
 	struct mlx5_bfreg_info *bfregi;
+
+	if (context->vfmig_restore_mode)
+		mlx5_vf_set_restore_released(dev->mdev);
 
 	bfregi = &context->bfregi;
 	mlx5_ib_dealloc_transport_domain(dev, context->tdn, context->devx_uid);
