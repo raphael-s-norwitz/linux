@@ -734,6 +734,13 @@ struct mlx5_priv {
 	 * mdev's lifetime without coordinating with the PF.
 	 */
 	bool	vfmig_self_restored;
+	/*
+	 * Set by mlx5_ib when a restore-mode ucontext is destroyed; never
+	 * cleared for the lifetime of this mdev. The UAR ids and other state
+	 * inherited from the LOAD are then no longer intact for a new
+	 * restore.
+	 */
+	bool	vfmig_restore_released;
 };
 
 enum mlx5_device_state {
@@ -1609,6 +1616,16 @@ static inline bool mlx5_core_is_vf(const struct mlx5_core_dev *dev)
 static inline bool mlx5_vf_is_restored(const struct mlx5_core_dev *dev)
 {
 	return dev->priv.vfmig_self_restored;
+}
+
+static inline void mlx5_vf_set_restore_released(struct mlx5_core_dev *dev)
+{
+	WRITE_ONCE(dev->priv.vfmig_restore_released, true);
+}
+
+static inline bool mlx5_vf_restore_released(const struct mlx5_core_dev *dev)
+{
+	return READ_ONCE(dev->priv.vfmig_restore_released);
 }
 
 static inline bool mlx5_core_same_coredev_type(const struct mlx5_core_dev *dev1,

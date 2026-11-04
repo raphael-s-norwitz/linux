@@ -97,7 +97,11 @@ enum mlx5_ib_alloc_uctx_v2_flags {
 	 * uar_mmap()'s existing INVALID-slot check.
 	 *
 	 * Refused with -EINVAL unless the device is a VF that came up from
-	 * LOAD_VHCA_STATE: only that VHCA holds the source's UAR ids.
+	 * LOAD_VHCA_STATE: only that VHCA holds the source's UAR ids. Also
+	 * refused with -EINVAL once any restore-mode ucontext on the device
+	 * has been destroyed, since that freed ids the restore depends on;
+	 * the VF must be recycled and loaded again. Ordinary ucontexts are
+	 * not affected.
 	 */
 	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE	= 1 << 1,
 };
