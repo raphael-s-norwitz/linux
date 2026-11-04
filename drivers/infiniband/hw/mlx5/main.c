@@ -2263,6 +2263,19 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 	if (req.comp_mask || req.reserved0 || req.reserved1 || req.reserved2)
 		return -EOPNOTSUPP;
 
+	/*
+	 * A restore-mode ucontext is seeded with the source's FW UAR ids,
+	 * which only this VHCA holds if LOAD_VHCA_STATE was applied to it.
+	 * On any other VF those ids are unallocated or belong to someone
+	 * else.
+	 */
+	if ((req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE) &&
+	    !mlx5_vf_is_restored(dev->mdev)) {
+		mlx5_ib_warn(dev,
+			     "VFMIG_RESTORE ucontext refused: device did not come up from LOAD_VHCA_STATE\n");
+		return -EINVAL;
+	}
+
 	req.total_num_bfregs = ALIGN(req.total_num_bfregs,
 				    MLX5_NON_FP_BFREGS_PER_UAR);
 	if (req.num_low_latency_bfregs > req.total_num_bfregs - 1)
