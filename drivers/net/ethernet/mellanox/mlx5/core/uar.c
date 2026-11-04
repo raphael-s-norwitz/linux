@@ -91,8 +91,12 @@ static void up_rel_func(struct kref *kref)
 	kfree(up);
 }
 
+/*
+ * @adopt_uar >= 0 takes over that UAR index, which firmware already holds
+ * for this function, instead of issuing ALLOC_UAR.
+ */
 static struct mlx5_uars_page *alloc_uars_page(struct mlx5_core_dev *mdev,
-					      bool map_wc)
+					      bool map_wc, int adopt_uar)
 {
 	struct mlx5_uars_page *up;
 	int err = -ENOMEM;
@@ -126,10 +130,15 @@ static struct mlx5_uars_page *alloc_uars_page(struct mlx5_core_dev *mdev,
 	up->fp_avail = bfregs * MLX5_FP_BFREGS_PER_UAR / MLX5_BFREGS_PER_UAR;
 	up->reg_avail = bfregs * MLX5_NON_FP_BFREGS_PER_UAR / MLX5_BFREGS_PER_UAR;
 
-	err = mlx5_cmd_alloc_uar(mdev, &up->index);
-	if (err) {
-		mlx5_core_warn(mdev, "mlx5_cmd_alloc_uar() failed, %d\n", err);
-		goto error1;
+	if (adopt_uar >= 0) {
+		up->index = adopt_uar;
+	} else {
+		err = mlx5_cmd_alloc_uar(mdev, &up->index);
+		if (err) {
+			mlx5_core_warn(mdev, "mlx5_cmd_alloc_uar() failed, %d\n",
+				       err);
+			goto error1;
+		}
 	}
 
 	pfn = uar2pfn(mdev, up->index);
@@ -172,7 +181,7 @@ struct mlx5_uars_page *mlx5_get_uars_page(struct mlx5_core_dev *mdev)
 		kref_get(&ret->ref_count);
 		goto out;
 	}
-	ret = alloc_uars_page(mdev, false);
+	ret = alloc_uars_page(mdev, false, -1);
 	if (IS_ERR(ret))
 		goto out;
 	list_add(&ret->list, &mdev->priv.bfregs.reg_head.list);
@@ -202,7 +211,7 @@ static unsigned long map_offset(struct mlx5_core_dev *mdev, int dbi)
 }
 
 static int alloc_bfreg(struct mlx5_core_dev *mdev, struct mlx5_sq_bfreg *bfreg,
-		       bool map_wc, bool fast_path)
+		       bool map_wc, bool fast_path, int adopt_uar)
 {
 	struct mlx5_bfreg_data *bfregs;
 	struct mlx5_uars_page *up;
@@ -221,8 +230,12 @@ static int alloc_bfreg(struct mlx5_core_dev *mdev, struct mlx5_sq_bfreg *bfreg,
 		lock = &bfregs->reg_head.lock;
 	}
 	mutex_lock(lock);
+	if (adopt_uar >= 0 && !list_empty(head)) {
+		mutex_unlock(lock);
+		return -EBUSY;
+	}
 	if (list_empty(head)) {
-		up = alloc_uars_page(mdev, map_wc);
+		up = alloc_uars_page(mdev, map_wc, adopt_uar);
 		if (IS_ERR(up)) {
 			mutex_unlock(lock);
 			return PTR_ERR(up);
@@ -259,16 +272,30 @@ int mlx5_alloc_bfreg(struct mlx5_core_dev *mdev, struct mlx5_sq_bfreg *bfreg,
 {
 	int err;
 
-	err = alloc_bfreg(mdev, bfreg, map_wc, fast_path);
+	err = alloc_bfreg(mdev, bfreg, map_wc, fast_path, -1);
 	if (!err)
 		return 0;
 
 	if (err == -EAGAIN && map_wc)
-		return alloc_bfreg(mdev, bfreg, false, fast_path);
+		return alloc_bfreg(mdev, bfreg, false, fast_path, -1);
 
 	return err;
 }
 EXPORT_SYMBOL(mlx5_alloc_bfreg);
+
+/*
+ * Allocate a regular bfreg on a UAR page that takes over @uarn, which
+ * firmware already holds for this function, instead of allocating a new
+ * UAR. Only valid while no regular UAR page exists yet; -EBUSY otherwise.
+ * mlx5_free_bfreg() releases it as usual.
+ */
+int mlx5_alloc_bfreg_adopt(struct mlx5_core_dev *mdev,
+			   struct mlx5_sq_bfreg *bfreg, u32 uarn)
+{
+	if (uarn > INT_MAX)
+		return -EINVAL;
+	return alloc_bfreg(mdev, bfreg, false, false, uarn);
+}
 
 static unsigned int addr_to_dbi_in_syspage(struct mlx5_core_dev *dev,
 					   struct mlx5_uars_page *up,
