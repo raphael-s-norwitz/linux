@@ -705,9 +705,11 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 		 * slot diverged from the source's. Log it but still
 		 * re-claim the page -- strict -EPROTO enforcement (and the
 		 * kcoherent fallback for legitimate post-restore growth)
-		 * arrives with the USER_PAGE work.
+		 * arrives with the USER_PAGE work. An EQ key was set after
+		 * the source's alloc, so it never matches an alloc-time key.
 		 */
-		if (dom->drift_armed && p->instance_key != instance_key)
+		if (dom->drift_armed && p->instance_key != instance_key &&
+		    !VFMIG_EQ_KEY_IS_EQ(p->instance_key))
 			dev_warn_ratelimited(&dom->vf_pdev->dev,
 				"vfmig_iova: vf %u slot %u DRIFT: caller key %s (resolved 0x%llx) but replayed entry at IOVA 0x%llx carries key 0x%llx\n",
 				dom->vf_id, slot,
@@ -777,6 +779,26 @@ void vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 
 out_unlock:
 	mutex_unlock(&dom->lock);
+}
+
+int vfmig_iova_set_key(struct vfmig_iova_domain *dom,
+		       enum vfmig_iova_slot slot, dma_addr_t iova,
+		       u64 instance_key)
+{
+	struct vfmig_iova_page *p;
+	int err = 0;
+
+	if (!dom || slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_USER_PAGE)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	p = vfmig_iova_find_locked(dom, (u64)iova);
+	if (!p || p->slot != slot || p->external)
+		err = -ENOENT;
+	else
+		p->instance_key = instance_key;
+	mutex_unlock(&dom->lock);
+	return err;
 }
 
 int vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,

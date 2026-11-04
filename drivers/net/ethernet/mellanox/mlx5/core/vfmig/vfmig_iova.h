@@ -121,6 +121,33 @@ enum vfmig_iova_slot {
 };
 
 /*
+ * Identity of a kernel EQ in VFMIG_SLOT_EQ_BUF. Once CREATE_EQ returns
+ * the EQ number, eq.c retags the entry holding the EQ's first page with
+ * VFMIG_EQ_KEY(role, vec, eqn). The key travels in that page's HOST_PAGE
+ * record, so a restored probe can find which source EQ owns a replayed
+ * buffer. @vec is the completion vector for VFMIG_EQ_ROLE_COMP and 0
+ * otherwise. The tag byte keeps these keys apart from auto-numbered ones,
+ * which never reach it.
+ */
+enum vfmig_eq_role {
+	VFMIG_EQ_ROLE_NONE	= 0,	/* untracked, e.g. generic EQs */
+	VFMIG_EQ_ROLE_CMD	= 1,
+	VFMIG_EQ_ROLE_ASYNC	= 2,
+	VFMIG_EQ_ROLE_PAGES	= 3,
+	VFMIG_EQ_ROLE_COMP	= 4,
+};
+
+#define VFMIG_EQ_KEY_TAG	0xe0ULL
+#define VFMIG_EQ_KEY_ID(role, vec)				\
+	((VFMIG_EQ_KEY_TAG << 56) | ((u64)(u8)(role) << 48) |	\
+	 ((u64)(u16)(vec) << 32))
+#define VFMIG_EQ_KEY(role, vec, eqn)				\
+	(VFMIG_EQ_KEY_ID(role, vec) | (u32)(eqn))
+#define VFMIG_EQ_KEY_ID_MASK	GENMASK_ULL(63, 32)
+#define VFMIG_EQ_KEY_EQN(key)	((u32)(key))
+#define VFMIG_EQ_KEY_IS_EQ(key)	(((u64)(key) >> 56) == VFMIG_EQ_KEY_TAG)
+
+/*
  * IOVA window layout (hardware-visible addresses).
  *
  *   VFMIG_IOVA_BASE     -- base of every VF's window, 4 GiB. Each VF
@@ -422,6 +449,16 @@ int  vfmig_iova_retag_external_range(struct vfmig_iova_domain *dom,
 				     u64 new_instance_key);
 
 /*
+ * Overwrite the @instance_key of the kernel-slot entry at @iova, e.g. to
+ * record a FW object number known only after the buffer was allocated.
+ * Returns 0, -ENOENT if no entry of @slot is mapped at @iova, or -EINVAL
+ * on a bad argument. USER_PAGE entries use the retag above instead.
+ */
+int  vfmig_iova_set_key(struct vfmig_iova_domain *dom,
+			enum vfmig_iova_slot slot, dma_addr_t iova,
+			u64 instance_key);
+
+/*
  * Destination-side bind: map a freshly-pinned umem @sgt onto the
  * awaiting_bind=true placeholder chain that vfmig_iova_replay_external()
  * installed for the (kind, fw_id) packed via VFMIG_HUOBJ_KEY. Resolves
@@ -480,6 +517,14 @@ vfmig_iova_free_slot(struct vfmig_iova_domain *dom,
 		     enum vfmig_iova_slot slot,
 		     dma_addr_t iova, size_t size)
 {
+}
+
+static inline int
+vfmig_iova_set_key(struct vfmig_iova_domain *dom,
+		   enum vfmig_iova_slot slot, dma_addr_t iova,
+		   u64 instance_key)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline int

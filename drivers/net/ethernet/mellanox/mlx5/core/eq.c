@@ -252,7 +252,7 @@ static void init_eq_buf(struct mlx5_eq *eq)
 
 static int
 create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
-	      struct mlx5_eq_param *param)
+	      struct mlx5_eq_param *param, enum vfmig_eq_role role, u16 vec)
 {
 	u8 log_eq_size = order_base_2(param->nent + MLX5_NUM_SPARE_EQE);
 	struct mlx5_cq_table *cq_table = &eq->cq_table;
@@ -331,6 +331,14 @@ create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
 	eq->irqn = pci_irq_vector(dev->pdev, vecidx);
 	eq->dev = dev;
 	eq->doorbell = priv->bfreg.up->map + MLX5_EQ_DOORBELL_OFFSET;
+
+	if (role != VFMIG_EQ_ROLE_NONE &&
+	    eq->frag_buf.vfmig_slot == VFMIG_SLOT_EQ_BUF &&
+	    vfmig_iova_set_key(dev->cmd.vfmig_iova_dom, VFMIG_SLOT_EQ_BUF,
+			       eq->frag_buf.frags[0].map,
+			       VFMIG_EQ_KEY(role, vec, eq->eqn)))
+		mlx5_core_warn(dev, "vfmig: could not tag EQ 0x%x buffer\n",
+			       eq->eqn);
 
 	err = mlx5_debug_eq_add(dev, eq);
 	if (err)
@@ -475,13 +483,14 @@ void mlx5_eq_table_cleanup(struct mlx5_core_dev *dev)
 /* Async EQs */
 
 static int create_async_eq(struct mlx5_core_dev *dev,
-			   struct mlx5_eq *eq, struct mlx5_eq_param *param)
+			   struct mlx5_eq *eq, struct mlx5_eq_param *param,
+			   enum vfmig_eq_role role)
 {
 	struct mlx5_eq_table *eq_table = dev->priv.eq_table;
 	int err;
 
 	mutex_lock(&eq_table->lock);
-	err = create_map_eq(dev, eq, param);
+	err = create_map_eq(dev, eq, param, role, 0);
 	mutex_unlock(&eq_table->lock);
 	return err;
 }
@@ -604,14 +613,15 @@ static void gather_async_events_mask(struct mlx5_core_dev *dev, u64 mask[4])
 
 static int
 setup_async_eq(struct mlx5_core_dev *dev, struct mlx5_eq_async *eq,
-	       struct mlx5_eq_param *param, const char *name)
+	       struct mlx5_eq_param *param, const char *name,
+	       enum vfmig_eq_role role)
 {
 	int err;
 
 	eq->irq_nb.notifier_call = mlx5_eq_async_int;
 	spin_lock_init(&eq->lock);
 
-	err = create_async_eq(dev, &eq->core, param);
+	err = create_async_eq(dev, &eq->core, param, role);
 	if (err) {
 		mlx5_core_warn(dev, "failed to create %s EQ %d\n", name, err);
 		return err;
@@ -673,7 +683,8 @@ static int create_async_eqs(struct mlx5_core_dev *dev)
 		.mask[0] = 1ull << MLX5_EVENT_TYPE_CMD,
 	};
 	mlx5_cmd_allowed_opcode(dev, MLX5_CMD_OP_CREATE_EQ);
-	err = setup_async_eq(dev, &table->cmd_eq, &param, "cmd");
+	err = setup_async_eq(dev, &table->cmd_eq, &param, "cmd",
+			     VFMIG_EQ_ROLE_CMD);
 	if (err)
 		goto err1;
 
@@ -697,7 +708,8 @@ static int create_async_eqs(struct mlx5_core_dev *dev)
 	};
 
 	gather_async_events_mask(dev, param.mask);
-	err = setup_async_eq(dev, &table->async_eq, &param, "async");
+	err = setup_async_eq(dev, &table->async_eq, &param, "async",
+			     VFMIG_EQ_ROLE_ASYNC);
 	if (err)
 		goto err2;
 
@@ -713,7 +725,8 @@ static int create_async_eqs(struct mlx5_core_dev *dev)
 		.mask[0] = 1ull << MLX5_EVENT_TYPE_PAGE_REQUEST,
 	};
 
-	err = setup_async_eq(dev, &table->pages_eq, &param, "pages");
+	err = setup_async_eq(dev, &table->pages_eq, &param, "pages",
+			     VFMIG_EQ_ROLE_PAGES);
 	if (err)
 		goto err3;
 
@@ -790,7 +803,7 @@ mlx5_eq_create_generic(struct mlx5_core_dev *dev,
 		return ERR_PTR(-ENOMEM);
 
 	param->irq = dev->priv.eq_table->ctrl_irq;
-	err = create_async_eq(dev, eq, param);
+	err = create_async_eq(dev, eq, param, VFMIG_EQ_ROLE_NONE);
 	if (err) {
 		kvfree(eq);
 		eq = ERR_PTR(err);
@@ -1056,7 +1069,7 @@ static int create_comp_eq(struct mlx5_core_dev *dev, u16 vecidx)
 		.nent = nent,
 	};
 
-	err = create_map_eq(dev, &eq->core, &param);
+	err = create_map_eq(dev, &eq->core, &param, VFMIG_EQ_ROLE_COMP, vecidx);
 	if (err)
 		goto clean_eq;
 	err = mlx5_eq_enable(dev, &eq->core, &eq->irq_nb);
