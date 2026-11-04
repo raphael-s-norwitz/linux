@@ -255,6 +255,9 @@ int mlx5_frag_buf_alloc_node_slot(struct mlx5_core_dev *dev, int size,
 int mlx5_pages_import_replayed_fw_page(struct mlx5_core_dev *dev,
 				       u32 function, u64 iova);
 
+int mlx5_alloc_bfreg_adopt(struct mlx5_core_dev *mdev,
+			   struct mlx5_sq_bfreg *bfreg, u32 uarn);
+
 int mlx5_cmd_init(struct mlx5_core_dev *dev);
 void mlx5_cmd_cleanup(struct mlx5_core_dev *dev);
 int mlx5_cmd_enable(struct mlx5_core_dev *dev);

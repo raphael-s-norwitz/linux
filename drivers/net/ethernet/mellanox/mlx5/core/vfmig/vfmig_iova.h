@@ -459,6 +459,15 @@ int  vfmig_iova_set_key(struct vfmig_iova_domain *dom,
 			u64 instance_key);
 
 /*
+ * Find the lowest-IOVA entry of @slot whose key satisfies
+ * (key & @mask) == @match, and return its IOVA and full key. Returns 0 or
+ * -ENOENT.
+ */
+int  vfmig_iova_find_key(struct vfmig_iova_domain *dom,
+			 enum vfmig_iova_slot slot, u64 match, u64 mask,
+			 dma_addr_t *iova_out, u64 *key_out);
+
+/*
  * Destination-side bind: map a freshly-pinned umem @sgt onto the
  * awaiting_bind=true placeholder chain that vfmig_iova_replay_external()
  * installed for the (kind, fw_id) packed via VFMIG_HUOBJ_KEY. Resolves
@@ -525,6 +534,14 @@ vfmig_iova_set_key(struct vfmig_iova_domain *dom,
 		   u64 instance_key)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int
+vfmig_iova_find_key(struct vfmig_iova_domain *dom,
+		    enum vfmig_iova_slot slot, u64 match, u64 mask,
+		    dma_addr_t *iova_out, u64 *key_out)
+{
+	return -ENOENT;
 }
 
 static inline int

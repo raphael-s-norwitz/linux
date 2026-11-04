@@ -1393,9 +1393,26 @@ static int mlx5_function_teardown(struct mlx5_core_dev *dev, bool boot)
 
 static int mlx5_load(struct mlx5_core_dev *dev)
 {
+	u32 uarn;
 	int err;
 
-	err = mlx5_alloc_bfreg(dev, &dev->priv.bfreg, false, false);
+	/*
+	 * vfmig: the source's EQs ring their doorbells through a UAR that
+	 * firmware still holds. Take it over as the device bfreg so those
+	 * EQs can be adopted rather than recreated.
+	 */
+	err = -ENOENT;
+	if (!mlx5_eq_vfmig_source_uar(dev, &uarn)) {
+		err = mlx5_alloc_bfreg_adopt(dev, &dev->priv.bfreg, uarn);
+		if (err)
+			mlx5_core_warn(dev, "vfmig: could not adopt the source's UAR %u, %d\n",
+				       uarn, err);
+		else
+			mlx5_core_info(dev, "vfmig: adopted the source's UAR %u\n",
+				       uarn);
+	}
+	if (err)
+		err = mlx5_alloc_bfreg(dev, &dev->priv.bfreg, false, false);
 	if (err) {
 		mlx5_core_err(dev, "Failed allocating bfreg, %d\n", err);
 		return err;

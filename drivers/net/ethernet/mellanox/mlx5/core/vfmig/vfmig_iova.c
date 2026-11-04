@@ -801,6 +801,30 @@ int vfmig_iova_set_key(struct vfmig_iova_domain *dom,
 	return err;
 }
 
+int vfmig_iova_find_key(struct vfmig_iova_domain *dom,
+			enum vfmig_iova_slot slot, u64 match, u64 mask,
+			dma_addr_t *iova_out, u64 *key_out)
+{
+	struct vfmig_iova_page *p;
+	int err = -ENOENT;
+
+	if (!dom || !iova_out || !key_out)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	list_for_each_entry(p, &dom->pages, node) {
+		if (p->slot != slot || p->external ||
+		    (p->instance_key & mask) != match)
+			continue;
+		*iova_out = p->iova;
+		*key_out = p->instance_key;
+		err = 0;
+		break;
+	}
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
 int vfmig_iova_user_page_map_phys(struct vfmig_iova_domain *dom,
 				  phys_addr_t phys, size_t len, gfp_t gfp,
 				  dma_addr_t *iova_out)

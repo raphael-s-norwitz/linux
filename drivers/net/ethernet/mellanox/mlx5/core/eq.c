@@ -64,6 +64,14 @@ struct mlx5_eq_table {
 	struct mlx5_irq         *ctrl_irq;
 	struct cpu_rmap		*rmap;
 	struct cpumask          used_cpus;
+	/*
+	 * vfmig: the source's command EQ context as QUERY_EQ reported it
+	 * when mlx5_load() looked up the source's UAR, kept for the rest of
+	 * that load. Cleared when mlx5_eq_table_create() returns.
+	 */
+	bool			vfmig_src_cmd_valid;
+	u32			vfmig_src_cmd_eqn;
+	u32			vfmig_src_cmd_eqc[MLX5_ST_SZ_DW(eqc)];
 };
 
 #define MLX5_ASYNC_EVENT_MASK ((1ull << MLX5_EVENT_TYPE_PATH_MIG)	    | \
@@ -248,6 +256,74 @@ static void init_eq_buf(struct mlx5_eq *eq)
 		eqe = get_eqe(eq, i);
 		eqe->owner = MLX5_EQE_OWNER_INIT_VAL;
 	}
+}
+
+/*
+ * vfmig: look up the source's EQ with @role/@vec among the replayed EQ
+ * buffers, and return its first page's IOVA and its EQ number.
+ */
+static int vfmig_find_source_eq(struct mlx5_core_dev *dev,
+				enum vfmig_eq_role role, u16 vec,
+				dma_addr_t *iova, u32 *eqn)
+{
+	u64 key;
+	int err;
+
+	if (!mlx5_vf_is_restored(dev) || !dev->cmd.vfmig_iova_dom)
+		return -ENOENT;
+
+	err = vfmig_iova_find_key(dev->cmd.vfmig_iova_dom, VFMIG_SLOT_EQ_BUF,
+				  VFMIG_EQ_KEY_ID(role, vec),
+				  VFMIG_EQ_KEY_ID_MASK, iova, &key);
+	if (err)
+		return err;
+	*eqn = VFMIG_EQ_KEY_EQN(key);
+	return 0;
+}
+
+static int vfmig_query_eq(struct mlx5_core_dev *dev, u32 eqn, u32 *out,
+			  int outlen)
+{
+	u32 in[MLX5_ST_SZ_DW(query_eq_in)] = {};
+
+	MLX5_SET(query_eq_in, in, opcode, MLX5_CMD_OP_QUERY_EQ);
+	MLX5_SET(query_eq_in, in, eq_number, eqn);
+	return mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
+}
+
+int mlx5_eq_vfmig_source_uar(struct mlx5_core_dev *dev, u32 *uarn)
+{
+	struct mlx5_eq_table *table = dev->priv.eq_table;
+	int outlen = MLX5_ST_SZ_BYTES(query_eq_out);
+	dma_addr_t iova;
+	u32 eqn, *out;
+	void *eqc;
+	int err;
+
+	table->vfmig_src_cmd_valid = false;
+
+	err = vfmig_find_source_eq(dev, VFMIG_EQ_ROLE_CMD, 0, &iova, &eqn);
+	if (err)
+		return err;
+
+	out = kvzalloc(outlen, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
+	err = vfmig_query_eq(dev, eqn, out, outlen);
+	if (err) {
+		mlx5_core_warn(dev, "vfmig: QUERY_EQ on source cmd EQ 0x%x failed, %d\n",
+			       eqn, err);
+		goto out;
+	}
+	eqc = MLX5_ADDR_OF(query_eq_out, out, eq_context_entry);
+	memcpy(table->vfmig_src_cmd_eqc, eqc, sizeof(table->vfmig_src_cmd_eqc));
+	table->vfmig_src_cmd_eqn = eqn;
+	table->vfmig_src_cmd_valid = true;
+	*uarn = MLX5_GET(eqc, eqc, uar_page);
+out:
+	kvfree(out);
+	return err;
 }
 
 static int
@@ -1258,11 +1334,13 @@ int mlx5_eq_table_create(struct mlx5_core_dev *dev)
 		goto err_rmap;
 	}
 
+	eq_table->vfmig_src_cmd_valid = false;
 	return 0;
 
 err_rmap:
 	destroy_async_eqs(dev);
 err_async_eqs:
+	eq_table->vfmig_src_cmd_valid = false;
 	return err;
 }
 

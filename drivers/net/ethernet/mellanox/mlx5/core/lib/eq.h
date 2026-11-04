@@ -105,4 +105,10 @@ struct cpu_rmap *mlx5_eq_table_get_rmap(struct mlx5_core_dev *dev);
 
 int mlx5_comp_irqn_get(struct mlx5_core_dev *dev, int vector, unsigned int *irqn);
 
+/*
+ * On a restored VF, return the UAR page the source's command EQ was
+ * created with. -ENOENT if the image has no tagged command EQ.
+ */
+int mlx5_eq_vfmig_source_uar(struct mlx5_core_dev *dev, u32 *uarn);
+
 #endif
