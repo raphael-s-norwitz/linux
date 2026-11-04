@@ -97,6 +97,12 @@ struct mlx5_vfmig_get_vhca_id {
  *                  by the probe, this holds until the VF is unbound, so
  *                  it tells a restored VF apart from one probed normally
  *                  (including a restored VF unbound and bound again).
+ *       CLAIMED    with FROM_LOAD: a restore-mode ucontext has been
+ *                  created on the VF since it came up, so a restore
+ *                  already used this LOAD. Holds until the VF is
+ *                  unbound, even after that restore's process exits. A
+ *                  restore should skip the LOAD on a bound VF only if
+ *                  it is FROM_LOAD and not CLAIMED.
  *       UNKNOWN    a probe or remove of the VF is in progress; the other
  *                  bits are 0 and mean nothing. Query again later.
  *                A kernel without this field reports 0 for a bound VF, so
@@ -124,6 +130,7 @@ struct mlx5_vfmig_query_vf {
 #define MLX5_VFMIG_VF_STATE_BOUND	(1u << 0)
 #define MLX5_VFMIG_VF_STATE_FROM_LOAD	(1u << 1)
 #define MLX5_VFMIG_VF_STATE_UNKNOWN	(1u << 2)
+#define MLX5_VFMIG_VF_STATE_CLAIMED	(1u << 3)
 
 #define MLX5_VFMIG_IOC_QUERY_VF \
 	_IOWR(MLX5_VFMIG_IOC_MAGIC, 0x03, struct mlx5_vfmig_query_vf)

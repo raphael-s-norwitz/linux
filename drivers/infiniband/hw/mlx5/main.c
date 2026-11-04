@@ -2390,6 +2390,9 @@ uar_done:
 				   1, &dev->port[port].roce.tx_port_affinity));
 	}
 
+	if (context->vfmig_restore_mode)
+		mlx5_vf_set_restore_claimed(dev->mdev);
+
 	return 0;
 
 out_mdev:
