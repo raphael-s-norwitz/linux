@@ -423,8 +423,11 @@ static u8 vfmig_vf_state(struct mlx5_vfmig_pf *vfmig, u32 vf_id)
 		/* The PF cdev only exists while the PF is bound to mlx5_core. */
 		if (vf_pdev->dev.driver == pf_pdev->dev.driver) {
 			vf_mdev = pci_get_drvdata(vf_pdev);
-			if (vf_mdev && mlx5_vf_is_restored(vf_mdev))
+			if (vf_mdev && mlx5_vf_is_restored(vf_mdev)) {
 				state |= MLX5_VFMIG_VF_STATE_FROM_LOAD;
+				if (mlx5_vf_restore_claimed(vf_mdev))
+					state |= MLX5_VFMIG_VF_STATE_CLAIMED;
+			}
 		}
 	}
 	device_unlock(&vf_pdev->dev);

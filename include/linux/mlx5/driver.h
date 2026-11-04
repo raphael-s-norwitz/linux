@@ -735,11 +735,13 @@ struct mlx5_priv {
 	 */
 	bool	vfmig_self_restored;
 	/*
-	 * Set by mlx5_ib when a restore-mode ucontext is destroyed; never
-	 * cleared for the lifetime of this mdev. The UAR ids and other state
-	 * inherited from the LOAD are then no longer intact for a new
-	 * restore.
+	 * Restore-mode ucontext history, set by mlx5_ib and never cleared
+	 * for the lifetime of this mdev. @claimed: one was created, so a
+	 * restore has used this LOAD. @released: one was destroyed, so the
+	 * UAR ids and other state inherited from the LOAD are no longer
+	 * intact for a new restore.
 	 */
+	bool	vfmig_restore_claimed;
 	bool	vfmig_restore_released;
 };
 
@@ -1616,6 +1618,16 @@ static inline bool mlx5_core_is_vf(const struct mlx5_core_dev *dev)
 static inline bool mlx5_vf_is_restored(const struct mlx5_core_dev *dev)
 {
 	return dev->priv.vfmig_self_restored;
+}
+
+static inline void mlx5_vf_set_restore_claimed(struct mlx5_core_dev *dev)
+{
+	WRITE_ONCE(dev->priv.vfmig_restore_claimed, true);
+}
+
+static inline bool mlx5_vf_restore_claimed(const struct mlx5_core_dev *dev)
+{
+	return READ_ONCE(dev->priv.vfmig_restore_claimed);
 }
 
 static inline void mlx5_vf_set_restore_released(struct mlx5_core_dev *dev)
