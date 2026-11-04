@@ -377,6 +377,62 @@ static long vfmig_ioc_mark_restored(struct mlx5_vfmig_pf *vfmig,
 	return 0;
 }
 
+/*
+ * Resolve VF @vf_id (SR-IOV index under @pf_pdev) to its pci_dev,
+ * returning a held reference (drop with pci_dev_put()). We can't derive
+ * the VF's BDF directly (pci_iov_virtfn_bus() is not exported to
+ * modules, only the ..._devfn variant), so walk the PCI device list and
+ * match on (physfn, pci_iov_vf_id). O(num_pci_devs) on a slow ioctl
+ * path, which is fine. Returns NULL if no matching VF is present.
+ */
+static struct pci_dev *vfmig_get_vf_pdev(struct pci_dev *pf_pdev, u32 vf_id)
+{
+	struct pci_dev *iter = NULL;
+
+	for_each_pci_dev(iter) {
+		if (iter->is_virtfn &&
+		    iter->physfn == pf_pdev &&
+		    pci_iov_vf_id(iter) == (int)vf_id)
+			return iter;	/* for_each_pci_dev kept the ref */
+	}
+	return NULL;
+}
+
+/*
+ * MLX5_VFMIG_VF_STATE_* for VF @vf_id, read under its device_lock so the
+ * driver and its mlx5_core_dev stay put. A VF whose lock is held by a
+ * probe or remove in progress reports UNKNOWN instead of waiting, since
+ * a wedged probe holds it indefinitely.
+ */
+static u8 vfmig_vf_state(struct mlx5_vfmig_pf *vfmig, u32 vf_id)
+{
+	struct pci_dev *pf_pdev = vfmig->pf_mdev->pdev;
+	struct mlx5_core_dev *vf_mdev;
+	struct pci_dev *vf_pdev;
+	u8 state = MLX5_VFMIG_VF_STATE_UNKNOWN;
+
+	vf_pdev = vfmig_get_vf_pdev(pf_pdev, vf_id);
+	if (!vf_pdev)
+		return state;
+	if (!device_trylock(&vf_pdev->dev))
+		goto out_put;
+
+	state = 0;
+	if (vf_pdev->dev.driver) {
+		state |= MLX5_VFMIG_VF_STATE_BOUND;
+		/* The PF cdev only exists while the PF is bound to mlx5_core. */
+		if (vf_pdev->dev.driver == pf_pdev->dev.driver) {
+			vf_mdev = pci_get_drvdata(vf_pdev);
+			if (vf_mdev && mlx5_vf_is_restored(vf_mdev))
+				state |= MLX5_VFMIG_VF_STATE_FROM_LOAD;
+		}
+	}
+	device_unlock(&vf_pdev->dev);
+out_put:
+	pci_dev_put(vf_pdev);
+	return state;
+}
+
 static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 			       void __user *uarg)
 {
@@ -391,6 +447,7 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	sriov = &vfmig->pf_mdev->priv.sriov;
 	arg.num_vfs = sriov->num_vfs;
 	arg.tracked = 0;
+	arg.vf_state = 0;
 	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
 
 	if (arg.vf_id >= sriov->num_vfs) {
@@ -409,6 +466,7 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	arg.vhca_id = vhca_id;
 	arg.restored = (arg.vf_id < vfmig->max_vfs &&
 			test_bit(arg.vf_id, vfmig->restored)) ? 1 : 0;
+	arg.vf_state = vfmig_vf_state(vfmig, arg.vf_id);
 
 	/*
 	 * Serialise the 16-byte read against a concurrent SET_VF_UUID and
@@ -521,27 +579,6 @@ static long vfmig_ioc_set_vf_uuid(struct mlx5_vfmig_pf *vfmig,
 	}
 	mutex_unlock(&vfmig->ctxs_lock);
 	return err;
-}
-
-/*
- * Resolve VF @vf_id (SR-IOV index under @pf_pdev) to its pci_dev,
- * returning a held reference (drop with pci_dev_put()). We can't derive
- * the VF's BDF directly (pci_iov_virtfn_bus() is not exported to
- * modules, only the ..._devfn variant), so walk the PCI device list and
- * match on (physfn, pci_iov_vf_id). O(num_pci_devs) on a slow ioctl
- * path, which is fine. Returns NULL if no matching VF is present.
- */
-static struct pci_dev *vfmig_get_vf_pdev(struct pci_dev *pf_pdev, u32 vf_id)
-{
-	struct pci_dev *iter = NULL;
-
-	for_each_pci_dev(iter) {
-		if (iter->is_virtfn &&
-		    iter->physfn == pf_pdev &&
-		    pci_iov_vf_id(iter) == (int)vf_id)
-			return iter;	/* for_each_pci_dev kept the ref */
-	}
-	return NULL;
 }
 
 /*

@@ -341,9 +341,15 @@ static int do_query(int fd, unsigned int vf_id)
 		snprintf(ub, sizeof(ub), "<unset>");
 	else
 		format_uuid(info.vf_uuid, ub);
-	printf("vf %u vhca_id 0x%04x restored=%u tracked=%u (num_vfs=%u) vf_uuid=%s\n",
+	printf("vf %u vhca_id 0x%04x restored=%u tracked=%u (num_vfs=%u) vf_uuid=%s",
 	       vf_id, info.vhca_id, info.restored, info.tracked,
 	       info.num_vfs, ub);
+	if (info.vf_state & MLX5_VFMIG_VF_STATE_UNKNOWN)
+		printf(" bound=? from_load=?\n");
+	else
+		printf(" bound=%u from_load=%u\n",
+		       !!(info.vf_state & MLX5_VFMIG_VF_STATE_BOUND),
+		       !!(info.vf_state & MLX5_VFMIG_VF_STATE_FROM_LOAD));
 	return 0;
 }
 
