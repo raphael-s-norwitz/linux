@@ -14,9 +14,11 @@ firmware, and the VF ran out of EQ numbers. Adopting the source's EQs,
 described below, keeps the EQ numbers fixed, and chains now run at
 least 12 generations. The image growth is unchanged by that fix. It
 comes from mlx5e: every restored probe builds a new set of mlx5e
-objects while the source's stay live. Removing the source's mlx5e
-before SAVE keeps the image flat, and restored QPs keep working;
-having CRIU do that is proposed below.
+objects while the source's stay live. Suspending the source's mlx5e
+before SAVE keeps the image flat, and restored QPs keep working. The
+RoCE RX fence now does that (`MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND`), and
+the source's QPs keep working too if it is left running; see "Fix:
+suspend mlx5e under the RX fence" below.
 
 Saving from a VF that was not restored is not affected.
 
@@ -214,6 +216,9 @@ Running the chain with only some of the VF's auxiliary drivers bound
 | all (the usual setup)             | 4,669,440           | same as mlx5e alone            |
 | all, netdev up                    | 4,812,800           | +1.11 MB, +987 KB, +938 KB, +1.0 MB |
 | all, source's mlx5e unbound before each SAVE | 3,756,032 | +24 KB once, then 0       |
+| all, source's mlx5e suspended before each SAVE | 3,756,032 | +24 KB once, then 0     |
+| all, suspended by the RX fence flag (fence carried) | 3,805,184 | +24 KB once, then 0 |
+| all, source's netdev set down before each SAVE | 4,673,536 | +918 KB, +885 KB, +860 KB, +860 KB |
 
 mlx5e creates its firmware objects at probe, even with the interface
 down: flow tables, TIRs, an RQT, a TIS, a transport domain, a PD and the
@@ -223,11 +228,26 @@ source's copies stay live, so each generation adds about one mlx5e's
 worth. The restored `mlx5_ib` creates almost nothing, because GSI setup
 is refused on restored VFs, which is why it does not grow.
 
-Unbinding the source's `mlx5_core.eth` right before SAVE, and letting
-the destination bind a fresh mlx5e, keeps the image flat for at least
-four generations. The restored VF's RoCE port still reaches ACTIVE with
-its two default GIDs, and `DESTROY_EQ` failures at teardown drop from
-30 to 4 (next section).
+Unbinding or suspending the source's mlx5e right before SAVE, and
+letting the destination bind a fresh mlx5e, keeps the image flat for at
+least four generations. The restored VF's RoCE port still reaches
+ACTIVE with its two default GIDs, and `DESTROY_EQ` failures at teardown
+drop from 30 to 4 (next section). Suspend means the auxiliary driver's
+`suspend` callback, as `mlx5_detach_device()` calls it: mlx5e detaches
+the netdev and destroys its mdev resources (PD, transport domain, mkey,
+TISes, bfregs), but the netdev stays registered.
+
+Setting the netdev down is not enough. It closes the channels, but the
+flow tables, TIRs, RQT, TIS, PD and transport domain stay, and the image
+still grows by about 860 KB per generation. No userspace operation
+reaches mlx5e's `suspend` alone: the auxiliary bus has no PM hooks, and
+mlx5_core calls it only from whole-device detach (PCI sleep, health
+recovery, devlink reload, firmware reset), which also removes mlx5_ib
+and its QPs.
+
+The table's fence-flag row is 49 KB larger than the plain suspend
+because that probe also raises the RX fence before each SAVE, and the
+image carries its table. It is still flat.
 
 ### Adopted EQs that cannot be destroyed
 
@@ -239,7 +259,7 @@ to destroy it:
 - With mlx5e left bound on the source, the source's channel and drop
   CQs pin every completion EQ mlx5e used: 30 failures over four
   generations.
-- With mlx5e unbound before SAVE, its CQs are gone and those EQs are
+- With mlx5e unbound or suspended before SAVE, its CQs are gone and those EQs are
   destroyed cleanly. The 4 that remain are completion EQ 0x6 (vector
   0), once per restored teardown, pinned by generation 0's GSI and MAD
   CQs from `mlx5_ib`.
@@ -249,70 +269,151 @@ firmware keeps a live EQ whose pages are gone. The arena unmaps the
 IOVAs, so a firmware write would fault rather than corrupt host memory.
 The same was true of every source EQ ignored before adoption.
 
-## Proposed: CRIU unbinds mlx5e before SAVE
+## Fix: suspend mlx5e under the RX fence
 
-Before the dump's SAVE, the CRIU plugin unbinds the source VF's
-`mlx5_core.eth` auxiliary device. If the dump fails, or the source is
-left running, it binds the device again. The destination binds a fresh
-mlx5e as usual. Everything else that concerns the netdev belongs to the
-orchestrator, which already assigns the VF's MAC and network setup on
-restore:
+`MLX5_VFMIG_IOC_RX_FENCE` takes a new flag,
+`MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND`:
 
-| Step                                                      | Owner        |
-|-----------------------------------------------------------|--------------|
-| Unbind `mlx5_core.eth` before SAVE; rebind on rollback    | CRIU plugin  |
-| VF admin MAC on the destination, same as the source's     | Orchestrator |
-| IP addresses, namespace, bond or bridge placement, routes | Orchestrator |
-| Telling peers (ARP, neighbours)                           | Orchestrator |
+- **RAISE** puts the fence up, then suspends the VF's mlx5e through
+  `mlx5_adev_eth_suspend()`, which calls the ETH auxiliary driver's
+  `suspend` under the same locks as `mlx5_detach_device()` (VF devlink,
+  devcom, auxiliary device). If mlx5e is not bound, the raise succeeds
+  and clears the flag in the returned `flags`. If the suspend fails, the
+  fence comes back down and the raise fails.
+- **LIFT** resumes mlx5e, then takes the fence down. If the resume
+  fails, the fence stays up so the lift can be retried. Resuming an
+  mlx5e that is not suspended does nothing.
+- The kernel keeps no record of either, as with the fence. The caller
+  keeps the handles and the returned flag.
+- Old kernels reject the flag with `-EINVAL`, so the CRIU plugin can
+  fall back to unbinding mlx5e.
 
-The netdev disappears whoever removes it, so doing it in the kernel
-buys nothing for rollback. Userspace is not slower, and it avoids
-defining a PF-to-VF lock order inside SAVE. If the kernel should
-enforce it, a SAVE flag or a QUERY_VF report of a bound mlx5e is
-enough. Reloading mlx5e on RESUME instead would not help: the image
-would still carry the source's mlx5e objects, and work on SAVE is the
-cost that matters to the source.
+The fence ioctl requires the VF RUNNING, so the kernel enforces the
+order: drain, fence and suspend, SUSPEND_VHCA, SAVE, RESUME_VHCA, then,
+if the source keeps running, resume and lift. Tying the suspend to the
+fence also keeps the plugin to one state per VF: its existing lift on
+an aborted dump becomes the rollback, and `--leave-running` needs the
+same lift after a successful dump. After a dump whose tasks are killed,
+the fence and the suspend stay until the orchestrator unbinds and
+recycles the VF.
 
-Carrying a journal of the source's kernel objects so the destination
-could destroy them was rejected as far more work.
+The suspend keeps the netdev registered, and that is the point.
+ib_core removes RoCE GIDs only on `NETDEV_UNREGISTER` or an address
+going away, not on carrier loss. So the netdev, its ifindex, its
+addresses and all GIDs survive at the same indexes, and the source's QPs
+work again after the resume. Unbinding does not allow that:
+
+- **An unbind is a point of no return for the source's QPs.** Deleting
+  a RoCE GID clears the firmware entry at once, but ib_core keeps the
+  slot reserved (`GID_TABLE_ENTRY_PENDING_DEL`) while a QP references
+  it. After a rebind, the IP's GID lands at a new index (3 became 4),
+  and QPs connected before the unbind fail with `transport retry
+  counter exceeded`, even when idle during it.
+- **No unbind under SUSPEND_VHCA.** With the VF suspended, the unbind
+  blocks in `unregister_netdevice: waiting for ethN to become free` and
+  wedges the VF.
+
+Two more things were measured with the fence, using an RC QP pair to a
+peer VF in another netns:
+
+- **The fence does not depend on mlx5e.** It sits in mlx5_core's own
+  RDMA_RX steering, which mlx5e never touches. It drops inbound RoCE
+  with mlx5e bound, and still does after an mlx5e unbind and rebind.
+  Raised after the suspend, the plugin's fence lands in flow table 0x1,
+  group 0x0, instead of table 0x4, group 0x16, because mlx5e's tables
+  are gone.
+- **Without the fence, mlx5e teardown still stops traffic.** In legacy
+  eswitch mode, it empties the VF's unicast MAC list, so the eswitch no
+  longer delivers to the VF. A peer's in-flight requests are then lost
+  and hit `transport retry counter exceeded`. The suspend therefore
+  comes after the fence, with nothing left unacknowledged.
+
+Also fixed: removing mlx5e after a suspend destroyed its mdev resources
+twice. `_mlx5e_remove()` unregisters the netdev, which calls
+`_mlx5e_suspend()` with the device not present and
+`MLX5E_STATE_DESTROYING` set. The orchestrator's unbind of a suspended
+source then freed PD 0 and transport domain 0 (DEALLOC_PD and
+DEALLOC_TRANSPORT_DOMAIN errors). `mlx5e_destroy_mdev_resources()` now
+returns early once the resources are gone.
+
+### Who does what
+
+| Step                                                                 | Owner        |
+|----------------------------------------------------------------------|--------------|
+| Raise the fence with `F_ETH_SUSPEND` before SAVE                     | CRIU plugin  |
+| Lift it with the flag after `--leave-running` or a failed dump       | CRIU plugin  |
+| Unbind mlx5e instead, on kernels without the flag                    | CRIU plugin  |
+| Unbind and recycle the source after a dump whose tasks were killed   | Orchestrator |
+| VF admin MAC on the destination, same as the source's                | Orchestrator |
+| IP addresses, namespace, bond or bridge placement, routes            | Orchestrator |
+| Telling peers (ARP, neighbours)                                      | Orchestrator |
+
+The destination binds a fresh mlx5e as usual; nothing is suspended
+there.
+
+The MAC matters: a connected QP resolved its destination MAC at RTR,
+and that stays in its firmware context. LOAD does not carry the VF's
+admin MAC, and a destination given another MAC brings up that MAC and
+its default GIDs, so the restored QP fails with `transport retry counter
+exceeded`. RECYCLE_VF keeps the admin MAC; `sriov_numvfs=0` clears it.
+The IP has to be on the destination before `criu restore`, since adding
+it creates its RoCE GIDs.
+
+Reloading mlx5e on RESUME instead would not help: the image would still
+carry the source's mlx5e objects. Carrying a journal of the source's
+kernel objects so the destination could destroy them was rejected as far
+more work.
 
 ### Validation
 
-A self-loop RC QP gate did the CRIU step by hand. The QP is connected
-through the source's RoCEv2 GID for an IPv4 address, and sends itself a
-zero-length message before the dump. The orchestrator's part was done by
-setting the same admin MAC on both VFs through the PF, and adding the
-same IP on the destination before `criu restore`. It ran once with mlx5e
-left bound and once unbound before SAVE, VF 0 -> VF 1 and VF 0 -> VF 0.
-All four passed:
+A self-loop RC QP gate stands in for the CRIU plugin, which does not
+pass the flag yet: it raises its own fence with the flag before
+`criu dump`, and the plugin's plain fence stacks on top. The QP is
+connected through the source's RoCEv2 GID for an IPv4 address and sends
+itself a zero-length message before the dump. The orchestrator's part
+is done by setting the same admin MAC on both VFs through the PF, and
+adding the same IP on the destination before `criu restore`.
 
-- Unbinding mlx5e removes the netdev, takes port 1 DOWN and deletes all
-  four GIDs, and the QP stays in RTS.
-- On the destination, the default GIDs and the IP's GIDs come back at
-  the same indexes, so the restored QP's GID index still names its GID.
-- After restore the QP is still RTS and completes another send to
-  itself. No earlier gate sent traffic on a restored QP.
-- The saved firmware state drops from 4,866,048 to 3,858,432 bytes, and
+- **Unbind before SAVE**, VF 0 -> VF 1 and VF 0 -> VF 0: both pass. The
+  netdev goes, port 1 goes DOWN, all four GIDs are deleted, and the QP
+  stays in RTS. The destination's GIDs come back at the same indexes.
+  The saved firmware state drops from 4,866,048 to 3,858,432 bytes, and
   LOAD replays no mlx5e buffers (`frag_buf` 0 instead of 585).
-
-The MAC matters: the QP resolved its destination MAC at RTR, and that
-stays in its firmware context, so the destination VF must come up with
-the source's MAC.
+- **Suspend under the fence**, VF 0 -> VF 1: passes. While suspended,
+  the netdev stays with its IP, port 1 is DOWN, all four GIDs stay and
+  the QP is RTS. After restore the QP is RTS and completes another send
+  to itself.
+- **Suspend and `--leave-running`**: passes. After the dump, lifting the
+  gate's fence with the flag resumes mlx5e, lifting the plugin's fence
+  reopens RX, the IP's GID is still at index 3, and the source's QP
+  completes a send. The plugin leaves its fence up after a successful
+  `--leave-running` dump today; it must lift it, with the flag.
+- **Suspend with a peer** (fence raised and lifted with the flag, no
+  dump): QPs connected before the raise, whether used or idle before it,
+  pass traffic both ways after the lift. A send from the peer during
+  the suspend is dropped and the peer's QP goes to ERR, as expected.
+- **Unbind with a peer**: once the GIDs are gone, neither side's sends
+  arrive. Both senders' QPs go to ERR, and rebinding does not bring the
+  QPs back.
 
 Not covered: more than one address, IPv6 or VLANs, where the
 destination could add GIDs in a different order (CRIU could record the
 source's GID table and check the destination's before restoring QPs);
-a remote peer; and whether the RoCE RX fence still blocks traffic
-during SAVE. With mlx5e unbound, the fence goes into flow table 0x1,
-group 0x0, instead of table 0x4, group 0x16.
+a peer on another host; and switchdev eswitch mode.
 
 ## Open questions
 
 - **GID order with several addresses.** One IPv4 address keeps its GID
   index (see Validation). Several addresses, IPv6 or VLANs may not.
-- **RoCE RX fence without mlx5e.** The fence lands in a different flow
-  table when mlx5e is unbound; confirm it still drops incoming RoCE
-  traffic during SAVE.
+- **Port events during the suspend.** The suspend takes port 1 DOWN, so
+  ib_core reports `IB_EVENT_PORT_ERR` and then `IB_EVENT_PORT_ACTIVE`
+  after the resume. Applications that react to the port going down could
+  tear down QPs that would have survived.
+- **Stage 1 TX drop.** A restored VF's mlx5e drops every transmitted
+  packet (`vfmig: TX disabled on restored VF`). With mlx5e always fresh
+  on the destination, that may no longer be needed.
+- **Peers on another host.** The peer tests ran between two VFs of one
+  PF. A remote peer, ARP and switchdev mode are untested.
 - **kmod warning during SAVE.** Every dump logs three
   `kmod_dup_request_exists_wait` warnings from `criu`, with or without
   mlx5e bound, which taints the kernel.
@@ -355,8 +456,9 @@ VF also runs that interface in polling mode. Known sources:
 - **Static EQ fields could come from the image** if firmware confirms
   the consumer-index question above.
 - **mlx5e is built twice per hop.** Torn down on the source at SAVE and
-  created from scratch on the destination. Removing it before SAVE
-  keeps the image flat, but does not reduce the commands.
+  created from scratch on the destination. Suspending it before SAVE
+  keeps the image flat, but does not reduce the commands; with
+  `--leave-running` the source also builds it again on resume.
 - **Polling mode.** With the cmd EQ adopted, the restored VF could
   switch the command interface to events, if the stale-EQE question is
   settled.
@@ -367,3 +469,9 @@ issues, compared with a normal probe, to see which of these dominate.
 Reproduce with:
 
     sudo CYCLES=4 tools/testing/criu_rdma/save_load/test_vf_recycle.sh
+
+The driver split, the suspend gate and the peer tests were run with
+scripts outside the tree (`growth_split_probe.sh`,
+`criu_dropeth_gate.sh`, `eth_unbind_questions.sh`, and the `vfmig_fence`,
+`qp_gid_holder` and `rc_pair` helpers); the gate is to be ported into
+the CRIU tree's `test/rdma`.
