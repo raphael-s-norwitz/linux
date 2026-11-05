@@ -12,8 +12,11 @@ These are two problems, not one. The CREATE_EQ failure is fixed: each
 restored probe created new EQs while the source's stayed live in
 firmware, and the VF ran out of EQ numbers. Adopting the source's EQs,
 described below, keeps the EQ numbers fixed, and chains now run at
-least 12 generations. The image growth is unchanged by that fix and its
-cause is still open.
+least 12 generations. The image growth is unchanged by that fix. It
+comes from mlx5e: every restored probe builds a new set of mlx5e
+objects while the source's stay live. Removing the source's mlx5e
+before SAVE keeps the image flat, and restored QPs keep working;
+having CRIU do that is proposed below.
 
 Saving from a VF that was not restored is not affected.
 
@@ -155,7 +158,8 @@ With the three commits, on the VF 1 -> VF 0 -> VF 1 ... chain:
   in round 9 before.
 - The image still grows by 830-920 KB per generation (4,669,440 ->
   14,061,568 bytes over 11 saves), the same as before.
-- One CQ still leaks per generation.
+- One CQ still leaks per generation. It is mlx5e's drop-RQ CQ (see
+  below).
 - Restored-VF teardown still logs Fatal error 3 and leaves 13 arena
   pages, as before (`teardown_reclaim_hang.md`).
 - Every restored probe drops exactly 24 stale command EQEs. They are
@@ -193,20 +197,172 @@ If firmware confirms that it accepts a consumer index that is right
 only modulo twice the EQ size, the async and completion EQs could be
 adopted without a query, using static fields from the arena keys.
 
-## Next steps to debug
+## The image growth is mlx5e
 
-1. **Separate saving from chaining.** SAVE the same restored VF twice
-   in a row, and a normal VF twice in a row. If the size is stable, the
-   growth comes from loading, not from saving or uptime.
-2. **Decode syndrome 0x223532**, with the firmware team or the PRM, to
-   confirm that CREATE_EQ is rejecting an exhausted EQ number.
-3. **Identify the 13 leftover arena entries.** Have RECYCLE_VF log the
-   slot and length of each one, and compare them with the 13 replayed
-   dma_coherent buffers.
-4. **Extend adoption past EQs.** Find the CQ that leaks each generation
-   and adopt or destroy it, then check the remaining kernel objects.
-   This is also the likely fix for the teardown problem, so settle it
-   before changing any teardown code.
+Saving is stable: three SAVEs in a row of the same VF, normal or
+restored, give byte-identical images, including one after 15 s idle. The
+growth happens only across LOAD and the restored probe.
+
+Running the chain with only some of the VF's auxiliary drivers bound
+(auxiliary autoprobe off, drivers bound by hand) splits it by driver:
+
+| Bound on top of `mlx5_core`       | Gen 0 image (bytes) | Growth per restored generation |
+|-----------------------------------|---------------------|--------------------------------|
+| nothing                           | 3,641,344           | +8 KB once, then 0             |
+| `mlx5_ib`                         | 3,747,840           | +24 KB once, then 0            |
+| `mlx5_core.eth` (mlx5e)           | 4,648,960           | +917 KB, +844 KB, +831 KB      |
+| all (the usual setup)             | 4,669,440           | same as mlx5e alone            |
+| all, netdev up                    | 4,812,800           | +1.11 MB, +987 KB, +938 KB, +1.0 MB |
+| all, source's mlx5e unbound before each SAVE | 3,756,032 | +24 KB once, then 0       |
+
+mlx5e creates its firmware objects at probe, even with the interface
+down: flow tables, TIRs, an RQT, a TIS, a transport domain, a PD and the
+drop RQ with its CQ, plus channels and more completion EQs once the
+netdev is up. A restored probe creates all of them again while the
+source's copies stay live, so each generation adds about one mlx5e's
+worth. The restored `mlx5_ib` creates almost nothing, because GSI setup
+is refused on restored VFs, which is why it does not grow.
+
+Unbinding the source's `mlx5_core.eth` right before SAVE, and letting
+the destination bind a fresh mlx5e, keeps the image flat for at least
+four generations. The restored VF's RoCE port still reaches ACTIVE with
+its two default GIDs, and `DESTROY_EQ` failures at teardown drop from
+30 to 4 (next section).
+
+### Adopted EQs that cannot be destroyed
+
+Firmware refuses to destroy an EQ while CQs are still bound to it
+(DESTROY_EQ: bad resource state, syndrome 0x30f433). An adopted EQ can
+still have the source's leaked CQs on it, so restored-VF teardown fails
+to destroy it:
+
+- With mlx5e left bound on the source, the source's channel and drop
+  CQs pin every completion EQ mlx5e used: 30 failures over four
+  generations.
+- With mlx5e unbound before SAVE, its CQs are gone and those EQs are
+  destroyed cleanly. The 4 that remain are completion EQ 0x6 (vector
+  0), once per restored teardown, pinned by generation 0's GSI and MAD
+  CQs from `mlx5_ib`.
+
+`destroy_unmap_eq()` frees the EQ buffer even when DESTROY_EQ fails, so
+firmware keeps a live EQ whose pages are gone. The arena unmaps the
+IOVAs, so a firmware write would fault rather than corrupt host memory.
+The same was true of every source EQ ignored before adoption.
+
+## Proposed: CRIU unbinds mlx5e before SAVE
+
+Before the dump's SAVE, the CRIU plugin unbinds the source VF's
+`mlx5_core.eth` auxiliary device. If the dump fails, or the source is
+left running, it binds the device again. The destination binds a fresh
+mlx5e as usual. Everything else that concerns the netdev belongs to the
+orchestrator, which already assigns the VF's MAC and network setup on
+restore:
+
+| Step                                                      | Owner        |
+|-----------------------------------------------------------|--------------|
+| Unbind `mlx5_core.eth` before SAVE; rebind on rollback    | CRIU plugin  |
+| VF admin MAC on the destination, same as the source's     | Orchestrator |
+| IP addresses, namespace, bond or bridge placement, routes | Orchestrator |
+| Telling peers (ARP, neighbours)                           | Orchestrator |
+
+The netdev disappears whoever removes it, so doing it in the kernel
+buys nothing for rollback. Userspace is not slower, and it avoids
+defining a PF-to-VF lock order inside SAVE. If the kernel should
+enforce it, a SAVE flag or a QUERY_VF report of a bound mlx5e is
+enough. Reloading mlx5e on RESUME instead would not help: the image
+would still carry the source's mlx5e objects, and work on SAVE is the
+cost that matters to the source.
+
+Carrying a journal of the source's kernel objects so the destination
+could destroy them was rejected as far more work.
+
+### Validation
+
+A self-loop RC QP gate did the CRIU step by hand. The QP is connected
+through the source's RoCEv2 GID for an IPv4 address, and sends itself a
+zero-length message before the dump. The orchestrator's part was done by
+setting the same admin MAC on both VFs through the PF, and adding the
+same IP on the destination before `criu restore`. It ran once with mlx5e
+left bound and once unbound before SAVE, VF 0 -> VF 1 and VF 0 -> VF 0.
+All four passed:
+
+- Unbinding mlx5e removes the netdev, takes port 1 DOWN and deletes all
+  four GIDs, and the QP stays in RTS.
+- On the destination, the default GIDs and the IP's GIDs come back at
+  the same indexes, so the restored QP's GID index still names its GID.
+- After restore the QP is still RTS and completes another send to
+  itself. No earlier gate sent traffic on a restored QP.
+- The saved firmware state drops from 4,866,048 to 3,858,432 bytes, and
+  LOAD replays no mlx5e buffers (`frag_buf` 0 instead of 585).
+
+The MAC matters: the QP resolved its destination MAC at RTR, and that
+stays in its firmware context, so the destination VF must come up with
+the source's MAC.
+
+Not covered: more than one address, IPv6 or VLANs, where the
+destination could add GIDs in a different order (CRIU could record the
+source's GID table and check the destination's before restoring QPs);
+a remote peer; and whether the RoCE RX fence still blocks traffic
+during SAVE. With mlx5e unbound, the fence goes into flow table 0x1,
+group 0x0, instead of table 0x4, group 0x16.
+
+## Open questions
+
+- **GID order with several addresses.** One IPv4 address keeps its GID
+  index (see Validation). Several addresses, IPv6 or VLANs may not.
+- **RoCE RX fence without mlx5e.** The fence lands in a different flow
+  table when mlx5e is unbound; confirm it still drops incoming RoCE
+  traffic during SAVE.
+- **kmod warning during SAVE.** Every dump logs three
+  `kmod_dup_request_exists_wait` warnings from `criu`, with or without
+  mlx5e bound, which taints the kernel.
+- **GSI and MAD CQs from generation 0** pin completion EQ 0x6. They
+  cannot be removed on the source without unregistering the IB device.
+  The destination would need to destroy them, which needs their IDs.
+- **EQ buffer freed after a failed DESTROY_EQ.** Keep an adopted EQ's
+  pages mapped until RECYCLE_VF when firmware refuses to destroy it.
+- **RDMA CM on restored VFs.** GSI setup is refused on restored VFs, so
+  port 1 has no MAD agent and RDMA CM, which uses GSI QP1 on RoCE too,
+  cannot work there.
+- **Restored CQ's EQ binding.** `mlx5_ib_restore_cq()` should check the
+  restored CQ's `c_eqn` against the adopted EQ and refuse on mismatch.
+- **24 stale command EQEs** dropped on every restored probe. The count
+  is constant, so it is probably systematic, and it may be what the
+  ghost-EQE workaround (`vfmig_load_skip_cmd_use_events`) covers. With
+  the cmd EQ adopted, that workaround may no longer be needed.
+- **Teardown.** Restored-VF teardown still logs Fatal error 3 and
+  leaves 13 arena pages, with or without mlx5e on the source
+  (`teardown_reclaim_hang.md`).
+- **FW_PAGE cursor.** After the cursor reset at LOAD, the FW_PAGE slot's
+  cursor can hand out imported replayed firmware pages again, since the
+  import does not go through `alloc_slot()`.
+- **Syndrome 0x223532.** Confirm with the firmware team that CREATE_EQ
+  was rejecting an exhausted EQ number.
+
+## Fewer firmware round trips on the restore path
+
+The restore path issues more firmware commands than it needs to. Each
+command is a round trip through the command interface, and a restored
+VF also runs that interface in polling mode. Known sources:
+
+- **Adoption queries.** One QUERY_EQ per adopted EQ. Up-front adoption
+  queries every tagged completion vector, which with the netdev up is
+  many. Restored CQs do not need it: `mlx5_comp_eqn_get()` adopts a
+  vector's EQ on first use anyway. Up-front adoption only ensures
+  unused source EQs are destroyed at teardown; doing it lazily, and
+  destroying the leftovers in one pass at teardown, would trade the
+  queries for destroys of EQs nobody used.
+- **Static EQ fields could come from the image** if firmware confirms
+  the consumer-index question above.
+- **mlx5e is built twice per hop.** Torn down on the source at SAVE and
+  created from scratch on the destination. Removing it before SAVE
+  keeps the image flat, but does not reduce the commands.
+- **Polling mode.** With the cmd EQ adopted, the restored VF could
+  switch the command interface to events, if the stale-EQE question is
+  settled.
+
+The first step is a per-opcode count of the commands a restored probe
+issues, compared with a normal probe, to see which of these dominate.
 
 Reproduce with:
 
