@@ -459,13 +459,25 @@ int  vfmig_iova_set_key(struct vfmig_iova_domain *dom,
 			u64 instance_key);
 
 /*
- * Find the lowest-IOVA entry of @slot whose key satisfies
+ * Find the lowest-IOVA unclaimed entry of @slot whose key satisfies
  * (key & @mask) == @match, and return its IOVA and full key. Returns 0 or
  * -ENOENT.
  */
 int  vfmig_iova_find_key(struct vfmig_iova_domain *dom,
 			 enum vfmig_iova_slot slot, u64 match, u64 mask,
 			 dma_addr_t *iova_out, u64 *key_out);
+
+/*
+ * Take over @n consecutive unclaimed entries of @slot, each @len long,
+ * starting at @iova, and return their kernel addresses in @vaddrs. The
+ * pages keep their contents, and alloc_slot() will not hand them out
+ * again. All or nothing: -ENOENT if any entry is missing or has another
+ * shape, -EBUSY if any is already claimed. vfmig_iova_free_slot()
+ * releases them as usual.
+ */
+int  vfmig_iova_claim_range(struct vfmig_iova_domain *dom,
+			    enum vfmig_iova_slot slot, dma_addr_t iova,
+			    unsigned int n, size_t len, void **vaddrs);
 
 /*
  * Destination-side bind: map a freshly-pinned umem @sgt onto the
@@ -542,6 +554,14 @@ vfmig_iova_find_key(struct vfmig_iova_domain *dom,
 		    dma_addr_t *iova_out, u64 *key_out)
 {
 	return -ENOENT;
+}
+
+static inline int
+vfmig_iova_claim_range(struct vfmig_iova_domain *dom,
+		       enum vfmig_iova_slot slot, dma_addr_t iova,
+		       unsigned int n, size_t len, void **vaddrs)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline int

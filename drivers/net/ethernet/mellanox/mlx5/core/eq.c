@@ -326,6 +326,109 @@ out:
 	return err;
 }
 
+static const char *vfmig_eq_role_name(enum vfmig_eq_role role)
+{
+	switch (role) {
+	case VFMIG_EQ_ROLE_CMD:
+		return "cmd";
+	case VFMIG_EQ_ROLE_ASYNC:
+		return "async";
+	case VFMIG_EQ_ROLE_PAGES:
+		return "pages";
+	case VFMIG_EQ_ROLE_COMP:
+		return "comp";
+	default:
+		return "untagged";
+	}
+}
+
+/*
+ * vfmig: on a restored VF, take over the source's EQ for @role/@vec, which
+ * firmware still holds, instead of creating a new one. Fills @eq's buffer,
+ * fbc, eqn and cons_index. Returns -ENOENT when there is nothing to adopt;
+ * on any other error @eq is untouched and the caller creates a fresh EQ.
+ */
+static int vfmig_adopt_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
+			  enum vfmig_eq_role role, u16 vec, u8 log_eq_size,
+			  u16 vecidx)
+{
+	struct mlx5_eq_table *table = dev->priv.eq_table;
+	int outlen = MLX5_ST_SZ_BYTES(query_eq_out);
+	u8 log_eq_stride = ilog2(MLX5_EQE_SIZE);
+	u32 *out = NULL;
+	dma_addr_t iova;
+	unsigned int n;
+	void *eqc;
+	u32 eqn;
+	int err;
+
+	if (role == VFMIG_EQ_ROLE_NONE)
+		return -ENOENT;
+	err = vfmig_find_source_eq(dev, role, vec, &iova, &eqn);
+	if (err)
+		return err;
+
+	if (role == VFMIG_EQ_ROLE_CMD && table->vfmig_src_cmd_valid &&
+	    table->vfmig_src_cmd_eqn == eqn) {
+		eqc = table->vfmig_src_cmd_eqc;
+	} else {
+		out = kvzalloc(outlen, GFP_KERNEL);
+		if (!out)
+			return -ENOMEM;
+		err = vfmig_query_eq(dev, eqn, out, outlen);
+		if (err)
+			goto out;
+		eqc = MLX5_ADDR_OF(query_eq_out, out, eq_context_entry);
+	}
+
+	if (MLX5_GET(eqc, eqc, status) ||
+	    MLX5_GET(eqc, eqc, log_eq_size) != log_eq_size ||
+	    MLX5_GET(eqc, eqc, log_page_size) !=
+		PAGE_SHIFT - MLX5_ADAPTER_PAGE_SHIFT ||
+	    MLX5_GET(eqc, eqc, intr) != vecidx ||
+	    MLX5_GET(eqc, eqc, uar_page) != dev->priv.bfreg.up->index) {
+		mlx5_core_warn(dev,
+			       "vfmig: source %s EQ 0x%x does not match: status 0x%x, log_eq_size %u (want %u), intr %u (want %u), uar %u (want %u)\n",
+			       vfmig_eq_role_name(role), eqn,
+			       MLX5_GET(eqc, eqc, status),
+			       MLX5_GET(eqc, eqc, log_eq_size), log_eq_size,
+			       MLX5_GET(eqc, eqc, intr), vecidx,
+			       MLX5_GET(eqc, eqc, uar_page),
+			       dev->priv.bfreg.up->index);
+		err = -EINVAL;
+		goto out;
+	}
+
+	err = mlx5_frag_buf_adopt_slot(dev,
+				       wq_get_byte_sz(log_eq_size,
+						      log_eq_stride),
+				       &eq->frag_buf, VFMIG_SLOT_EQ_BUF, iova);
+	if (err)
+		goto out;
+
+	mlx5_init_fbc(eq->frag_buf.frags, log_eq_stride, log_eq_size, &eq->fbc);
+	eq->eqn = eqn;
+	eq->cons_index = MLX5_GET(eqc, eqc, consumer_counter);
+
+	/*
+	 * Command completions the source never consumed name the source's
+	 * command slots, not ours, so drop them instead of dispatching them.
+	 */
+	if (role == VFMIG_EQ_ROLE_CMD) {
+		for (n = 0; next_eqe_sw(eq); n++)
+			eq->cons_index++;
+		if (n)
+			mlx5_core_info(dev, "vfmig: dropped %u stale command EQEs\n",
+				       n);
+	}
+
+	mlx5_core_info(dev, "vfmig: adopted source %s EQ 0x%x (vector %u, consumer index 0x%x)\n",
+		       vfmig_eq_role_name(role), eqn, vec, eq->cons_index);
+out:
+	kvfree(out);
+	return err;
+}
+
 static int
 create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
 	      struct mlx5_eq_param *param, enum vfmig_eq_role role, u16 vec)
@@ -335,11 +438,11 @@ create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
 	u32 out[MLX5_ST_SZ_DW(create_eq_out)] = {0};
 	u8 log_eq_stride = ilog2(MLX5_EQE_SIZE);
 	struct mlx5_priv *priv = &dev->priv;
+	u32 *in = NULL;
 	__be64 *pas;
 	u16 vecidx;
 	void *eqc;
 	int inlen;
-	u32 *in;
 	int err;
 	int i;
 
@@ -349,6 +452,15 @@ create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
 	INIT_RADIX_TREE(&cq_table->tree, GFP_ATOMIC);
 
 	eq->cons_index = 0;
+	eq->irq = param->irq;
+	vecidx = mlx5_irq_get_index(eq->irq);
+
+	err = vfmig_adopt_eq(dev, eq, role, vec, log_eq_size, vecidx);
+	if (!err)
+		goto mapped;
+	if (err != -ENOENT)
+		mlx5_core_warn(dev, "vfmig: creating a new %s EQ instead of adopting the source's, %d\n",
+			       vfmig_eq_role_name(role), err);
 
 	/*
 	 * EQ frag buffers go in their own vfmig IOVA slot so addition or
@@ -367,9 +479,6 @@ create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
 
 	mlx5_init_fbc(eq->frag_buf.frags, log_eq_stride, log_eq_size, &eq->fbc);
 	init_eq_buf(eq);
-
-	eq->irq = param->irq;
-	vecidx = mlx5_irq_get_index(eq->irq);
 
 	inlen = MLX5_ST_SZ_BYTES(create_eq_in) +
 		MLX5_FLD_SZ_BYTES(create_eq_in, pas[0]) * eq->frag_buf.npages;
@@ -401,9 +510,10 @@ create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
 	err = mlx5_cmd_exec(dev, in, inlen, out, sizeof(out));
 	if (err)
 		goto err_in;
-
-	eq->vecidx = vecidx;
 	eq->eqn = MLX5_GET(create_eq_out, out, eq_number);
+
+mapped:
+	eq->vecidx = vecidx;
 	eq->irqn = pci_irq_vector(dev->pdev, vecidx);
 	eq->dev = dev;
 	eq->doorbell = priv->bfreg.up->map + MLX5_EQ_DOORBELL_OFFSET;
@@ -1316,6 +1426,33 @@ static int get_num_eqs(struct mlx5_core_dev *dev)
 	return num_eqs;
 }
 
+/*
+ * vfmig: on a restored VF, adopt the source's completion EQs up front
+ * rather than when a vector is first used, so that a restored CQ looking
+ * up its vector gets the EQ its firmware context already names.
+ */
+static void vfmig_adopt_comp_eqs(struct mlx5_core_dev *dev)
+{
+	struct mlx5_eq_table *table = dev->priv.eq_table;
+	dma_addr_t iova;
+	u32 src_eqn;
+	int vec, eqn;
+	int err;
+
+	for (vec = 0; vec < table->max_comp_eqs; vec++) {
+		if (vfmig_find_source_eq(dev, VFMIG_EQ_ROLE_COMP, vec, &iova,
+					 &src_eqn))
+			continue;
+		err = mlx5_comp_eqn_get(dev, vec, &eqn);
+		if (err)
+			mlx5_core_warn(dev, "vfmig: could not set up comp vector %d, %d\n",
+				       vec, err);
+		else if (eqn != src_eqn)
+			mlx5_core_warn(dev, "vfmig: comp vector %d got EQ 0x%x, source had 0x%x; restored CQs on it will miss events\n",
+				       vec, eqn, src_eqn);
+	}
+}
+
 int mlx5_eq_table_create(struct mlx5_core_dev *dev)
 {
 	struct mlx5_eq_table *eq_table = dev->priv.eq_table;
@@ -1334,6 +1471,7 @@ int mlx5_eq_table_create(struct mlx5_core_dev *dev)
 		goto err_rmap;
 	}
 
+	vfmig_adopt_comp_eqs(dev);
 	eq_table->vfmig_src_cmd_valid = false;
 	return 0;
 

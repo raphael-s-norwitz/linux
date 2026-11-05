@@ -234,6 +234,9 @@ int mlx5_query_module_num(struct mlx5_core_dev *dev, int *module_num);
 int mlx5_frag_buf_alloc_node_slot(struct mlx5_core_dev *dev, int size,
 				  struct mlx5_frag_buf *buf, int node,
 				  enum vfmig_iova_slot slot);
+int mlx5_frag_buf_adopt_slot(struct mlx5_core_dev *dev, int size,
+			     struct mlx5_frag_buf *buf,
+			     enum vfmig_iova_slot slot, dma_addr_t iova);
 
 /*
  * Destination-side mirror of an alloc_system_page() call from the

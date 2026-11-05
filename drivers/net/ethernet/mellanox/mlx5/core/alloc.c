@@ -565,6 +565,58 @@ err_out:
 }
 
 /*
+ * Build @buf around pages that are already in @slot of a tracked VF's
+ * arena, starting at @iova and laid out the way
+ * mlx5_frag_buf_alloc_node_slot() would have allocated them. The pages
+ * keep their contents. mlx5_frag_buf_free() releases them as usual.
+ */
+int mlx5_frag_buf_adopt_slot(struct mlx5_core_dev *dev, int size,
+			     struct mlx5_frag_buf *buf,
+			     enum vfmig_iova_slot slot, dma_addr_t iova)
+{
+	int frag_sz = min_t(int, size, PAGE_SIZE);
+	void **vaddrs;
+	int err, i;
+
+	if (!dev->cmd.vfmig_iova_dom || slot == VFMIG_SLOT_INVALID || size <= 0)
+		return -EINVAL;
+
+	buf->size = size;
+	buf->npages = DIV_ROUND_UP(size, PAGE_SIZE);
+	buf->page_shift = PAGE_SHIFT;
+	buf->frags = kcalloc(buf->npages, sizeof(struct mlx5_buf_list),
+			     GFP_KERNEL);
+	if (!buf->frags)
+		return -ENOMEM;
+
+	vaddrs = kcalloc(buf->npages, sizeof(*vaddrs), GFP_KERNEL);
+	if (!vaddrs) {
+		err = -ENOMEM;
+		goto err_frags;
+	}
+
+	err = vfmig_iova_claim_range(dev->cmd.vfmig_iova_dom, slot, iova,
+				     buf->npages, frag_sz, vaddrs);
+	if (err)
+		goto err_vaddrs;
+
+	for (i = 0; i < buf->npages; i++) {
+		buf->frags[i].buf = vaddrs[i];
+		buf->frags[i].map = iova + (dma_addr_t)i * PAGE_SIZE;
+	}
+	buf->vfmig_slot = (u8)slot;
+	kfree(vaddrs);
+	return 0;
+
+err_vaddrs:
+	kfree(vaddrs);
+err_frags:
+	kfree(buf->frags);
+	buf->frags = NULL;
+	return err;
+}
+
+/*
  * Backward-compat wrapper preserving the exported ABI used by mlx5_ib /
  * vfio_pci_mlx5 / vdpa. These callers are not converted to a per-purpose
  * slot, so they route through the DMA_COHERENT catch-all: on a tracked

@@ -84,6 +84,15 @@ struct vfmig_iova_page {
 	bool		 awaiting_bind;
 
 	/*
+	 * @claimed: a kernel-slot entry the destination's driver owns, either
+	 * handed out by alloc_slot() or taken over by
+	 * vfmig_iova_claim_range(). Replayed entries start unclaimed until
+	 * one of those reaches them. alloc_slot() steps over claimed entries
+	 * at its cursor, and vfmig_iova_find_key() ignores them.
+	 */
+	bool		 claimed;
+
+	/*
 	 * @user_index_node: link in dom->user_index, the (instance_key,
 	 * iova) secondary index. Populated only for external entries whose
 	 * @instance_key has a non-NONE kind byte (source-side retagged or
@@ -668,6 +677,9 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 		instance_key = ++dom->next_auto_key[slot];
 
 	iova = dom->cursor[slot];
+	for (p = vfmig_iova_find_locked(dom, iova); p && p->claimed;
+	     p = vfmig_iova_find_locked(dom, iova))
+		iova = p->iova + p->len;
 	slot_end = vfmig_iova_slot_end(dom, slot);
 	if (iova + aligned > slot_end) {
 		dev_warn_ratelimited(&dom->vf_pdev->dev,
@@ -719,6 +731,7 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 				(unsigned long long)p->instance_key);
 		p->slot		= slot;
 		p->instance_key	= instance_key;
+		p->claimed	= true;
 		dom->cursor[slot] = iova + aligned;
 		*iova_out  = p->iova;
 		*vaddr_out = p->vaddr;
@@ -731,6 +744,7 @@ int vfmig_iova_alloc_slot(struct vfmig_iova_domain *dom,
 	if (err)
 		goto out_unlock;
 
+	p->claimed = true;
 	dom->cursor[slot] = iova + aligned;
 	*iova_out  = p->iova;
 	*vaddr_out = p->vaddr;
@@ -813,7 +827,7 @@ int vfmig_iova_find_key(struct vfmig_iova_domain *dom,
 
 	mutex_lock(&dom->lock);
 	list_for_each_entry(p, &dom->pages, node) {
-		if (p->slot != slot || p->external ||
+		if (p->slot != slot || p->external || p->claimed ||
 		    (p->instance_key & mask) != match)
 			continue;
 		*iova_out = p->iova;
@@ -821,6 +835,52 @@ int vfmig_iova_find_key(struct vfmig_iova_domain *dom,
 		err = 0;
 		break;
 	}
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+int vfmig_iova_claim_range(struct vfmig_iova_domain *dom,
+			   enum vfmig_iova_slot slot, dma_addr_t iova,
+			   unsigned int n, size_t len, void **vaddrs)
+{
+	struct vfmig_iova_page *first, *p;
+	size_t aligned;
+	unsigned int i;
+	u64 want;
+	int err = 0;
+
+	if (!dom || !vaddrs || !n || !len ||
+	    slot <= VFMIG_SLOT_INVALID || slot >= VFMIG_SLOT_USER_PAGE)
+		return -EINVAL;
+	aligned = ALIGN(len, VFMIG_IOVA_GRANULE);
+
+	mutex_lock(&dom->lock);
+	first = vfmig_iova_find_locked(dom, (u64)iova);
+	p = first;
+	want = (u64)iova;
+	for (i = 0; i < n; i++) {
+		if (!p || list_entry_is_head(p, &dom->pages, node) ||
+		    p->iova != want || p->len != aligned ||
+		    p->slot != slot || p->external) {
+			err = -ENOENT;
+			goto out_unlock;
+		}
+		if (p->claimed) {
+			err = -EBUSY;
+			goto out_unlock;
+		}
+		vaddrs[i] = p->vaddr;
+		want += aligned;
+		p = list_next_entry(p, node);
+	}
+
+	p = first;
+	for (i = 0; i < n; i++) {
+		p->claimed = true;
+		p = list_next_entry(p, node);
+	}
+
+out_unlock:
 	mutex_unlock(&dom->lock);
 	return err;
 }
