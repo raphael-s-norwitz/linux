@@ -6,14 +6,16 @@ Every SAVE from a VF that was itself restored produces a firmware image
 about 850 KB (about 210 pages) larger than the one it was loaded from.
 The growth is linear and never shrinks. After eight generations
 (VF 0 -> VF 1 -> VF 0 -> ...), the ninth restored probe fails in
-CREATE_EQ, and the VF does not come up. The cause is confirmed: each
-restored probe creates new kernel objects while the source's stay live
-in firmware, and the VF runs out of EQ numbers. The fix, adopting the
-source's EQs, is described below.
+CREATE_EQ, and the VF does not come up.
 
-Saving from a VF that was not restored is not affected. The immediate
-goal, moving a workload back and forth a couple of times, works today;
-a long chain of migrations does not.
+These are two problems, not one. The CREATE_EQ failure is fixed: each
+restored probe created new EQs while the source's stayed live in
+firmware, and the VF ran out of EQ numbers. Adopting the source's EQs,
+described below, keeps the EQ numbers fixed, and chains now run at
+least 12 generations. The image growth is unchanged by that fix and its
+cause is still open.
+
+Saving from a VF that was not restored is not affected.
 
 ## Observation
 
@@ -60,8 +62,8 @@ boot pages, INIT_HCA), but `mlx5_load()` then creates the driver's
 kernel objects as usual. The source driver's objects came across in the
 image and are still live in firmware. The destination driver never
 learns about them, so it never destroys them. Each generation therefore
-holds its predecessor's objects plus its own, and the next SAVE
-includes both.
+holds its predecessor's objects plus its own. Whether that is also what
+grows the image is not established; for EQs it is not.
 
 This is confirmed for EQs by a probe that chains VF 1 -> VF 0 -> VF 1
 ... and records `/sys/kernel/debug/mlx5/<vf-bdf>/{EQs,CQs,QPs}` plus the
@@ -83,8 +85,11 @@ saved image size at each generation:
   "ghost EQE on cmd_eq slot 0" that `vfmig_load_skip_cmd_use_events`
   works around.
 - **CQs leak one per generation; QPs do not leak.**
-- **Image growth matches.** About 205 pages per generation in the probe
-  (4,669,440 -> 5,603,328 -> 6,443,008 -> 7,274,496 bytes).
+- **Image growth is not explained by the EQs.** It is about 205 pages
+  per generation in the probe as well, but an EQ's buffer is host
+  memory, carried as host-page records, so firmware's image holds only
+  a small EQ context. Adopting the EQs left the growth unchanged (see
+  Results).
 
 ### Restored CQs end up on the wrong EQ
 
@@ -137,11 +142,25 @@ The series:
    to creating a fresh EQ. A new `claimed` flag on arena entries keeps
    the allocation cursor from handing adopted pages out again.
 
-Expected result, not yet verified on hardware: EQ numbers stay at
-0x4-0x6 across generations, the chain gets past generation 9, and image
-growth drops by the EQ share.
-CQ leaks, the other recreated objects, and the ghost-EQE workaround are
-handled afterwards.
+### Results
+
+With the three commits, on the VF 1 -> VF 0 -> VF 1 ... chain:
+
+- EQ numbers stay at 0x4-0x6 for 12 generations. Every restored probe
+  adopts the source's UAR and its cmd, async and completion EQs, with
+  no fallback.
+- The cmd EQ's consumer index carries forward, advancing by about 0xfa
+  per generation.
+- `test_vf_recycle.sh` cycles 4 and 5 pass all 10 rounds. Both failed
+  in round 9 before.
+- The image still grows by 830-920 KB per generation (4,669,440 ->
+  14,061,568 bytes over 11 saves), the same as before.
+- One CQ still leaks per generation.
+- Restored-VF teardown still logs Fatal error 3 and leaves 13 arena
+  pages, as before (`teardown_reclaim_hang.md`).
+- Every restored probe drops exactly 24 stale command EQEs. They are
+  not dispatched, but a constant count looks systematic and may be
+  what the ghost-EQE workaround covers.
 
 ### Why adoption queries firmware for each EQ
 
