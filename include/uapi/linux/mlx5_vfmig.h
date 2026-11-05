@@ -293,23 +293,36 @@ struct mlx5_vfmig_resume_vhca {
  *   with MLX5_VFMIG_RX_FENCE_F_NO_TABLE when there is no fence table to
  *   take down, which releases only the steering.
  *
+ *   MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND on RAISE also suspends the VF's
+ *   mlx5e once the fence is up: mlx5e destroys every firmware object it
+ *   owns, so SAVE_VHCA_STATE does not carry them, but keeps its netdev
+ *   registered, so the netdev's addresses and RoCE GIDs stay as they
+ *   are. If mlx5e is not bound to the VF, there is nothing to suspend and
+ *   the flag is cleared in the returned @flags. On LIFT, the flag resumes
+ *   mlx5e before the fence comes down; resuming an mlx5e that is not
+ *   suspended does nothing. If the resume fails, the fence stays up and
+ *   the LIFT can be retried, with or without the flag.
+ *
  *   The VF must be bound to mlx5_core and RUNNING.
  *
  *   Returns 0 on success; -EINVAL if @vf_id is out of range, @op or
  *   @flags is unknown, or @reserved is non-zero; -ENODEV if the VF is not
- *   bound; -EBUSY if it is suspended; or a negative firmware error.
+ *   bound; -EBUSY if it is suspended; or a negative firmware or mlx5e
+ *   error. A RAISE that fails leaves neither the fence nor the suspend
+ *   behind.
  */
 #define MLX5_VFMIG_RX_FENCE_LIFT	0
 #define MLX5_VFMIG_RX_FENCE_RAISE	1
 
 #define MLX5_VFMIG_RX_FENCE_F_NO_TABLE	(1u << 0)	/* LIFT only */
+#define MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND (1u << 1)
 
 struct mlx5_vfmig_rx_fence {
 	__u32 vf_id;		/* in  */
 	__u32 op;		/* in: MLX5_VFMIG_RX_FENCE_* */
 	__u32 table_id;		/* out on RAISE, in on LIFT */
 	__u32 group_id;		/* out on RAISE, in on LIFT */
-	__u32 flags;		/* in: MLX5_VFMIG_RX_FENCE_F_* */
+	__u32 flags;		/* in: MLX5_VFMIG_RX_FENCE_F_*; out on RAISE */
 	__u32 reserved;
 };
 

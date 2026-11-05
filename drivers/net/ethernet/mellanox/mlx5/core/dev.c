@@ -495,6 +495,43 @@ skip_suspend:
 	mlx5_devcom_comp_unlock(dev->priv.hca_devcom_comp);
 }
 
+/*
+ * Suspend or resume only the ETH auxiliary driver, as mlx5_detach_device()
+ * and mlx5_attach_device() do for all of them. mlx5e releases every firmware
+ * object it owns and keeps its netdev registered, so the netdev's addresses
+ * and RoCE GIDs survive. -ENODEV: mlx5e is not bound, or (on suspend) is
+ * already suspended.
+ */
+int mlx5_adev_eth_suspend(struct mlx5_core_dev *dev, bool suspend)
+{
+	struct mlx5_adev *madev;
+	const struct auxiliary_driver *adrv;
+	struct auxiliary_device *adev;
+	pm_message_t pm = {};
+	int err = -ENODEV;
+
+	devl_lock(priv_to_devlink(dev));
+	mlx5_devcom_comp_lock(dev->priv.hca_devcom_comp);
+	madev = dev->priv.adev[MLX5_INTERFACE_PROTOCOL_ETH];
+	if (!madev)
+		goto unlock;
+
+	adev = &madev->adev;
+	device_lock(&adev->dev);
+	if (adev->dev.driver) {
+		adrv = to_auxiliary_drv(adev->dev.driver);
+		if (suspend)
+			err = adrv->suspend ? adrv->suspend(adev, pm) : -EOPNOTSUPP;
+		else
+			err = adrv->resume ? adrv->resume(adev) : -EOPNOTSUPP;
+	}
+	device_unlock(&adev->dev);
+unlock:
+	mlx5_devcom_comp_unlock(dev->priv.hca_devcom_comp);
+	devl_unlock(priv_to_devlink(dev));
+	return err;
+}
+
 int mlx5_register_device(struct mlx5_core_dev *dev)
 {
 	int ret;

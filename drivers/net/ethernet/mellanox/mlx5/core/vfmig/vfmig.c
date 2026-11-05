@@ -1154,6 +1154,47 @@ static int vfmig_rx_fence_lift(struct mlx5_core_dev *vf, u32 table_id,
 	return err;
 }
 
+/*
+ * Fence first, so nothing reaches the VF's QPs while mlx5e tears down its
+ * steering. -ENODEV from the suspend: mlx5e is not bound, or already
+ * suspended; either way this raise suspended nothing.
+ */
+static int vfmig_rx_fence_raise_eth(struct mlx5_core_dev *vf,
+				    struct mlx5_vfmig_rx_fence *arg)
+{
+	int err;
+
+	err = vfmig_rx_fence_raise(vf, &arg->table_id, &arg->group_id);
+	if (err || !(arg->flags & MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND))
+		return err;
+
+	err = mlx5_adev_eth_suspend(vf, true);
+	if (err == -ENODEV) {
+		arg->flags &= ~MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND;
+		return 0;
+	}
+	if (err)
+		vfmig_rx_fence_lift(vf, arg->table_id, arg->group_id, false);
+	return err;
+}
+
+/* Resume mlx5e before the fence comes down, so a failed resume can be retried. */
+static int vfmig_rx_fence_lift_eth(struct mlx5_core_dev *vf,
+				   struct mlx5_vfmig_rx_fence *arg)
+{
+	int err;
+
+	if (arg->flags & MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND) {
+		err = mlx5_adev_eth_suspend(vf, false);
+		if (err == -ENODEV)
+			arg->flags &= ~MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND;
+		else if (err)
+			return err;
+	}
+	return vfmig_rx_fence_lift(vf, arg->table_id, arg->group_id,
+				   arg->flags & MLX5_VFMIG_RX_FENCE_F_NO_TABLE);
+}
+
 static long vfmig_ioc_rx_fence(struct mlx5_vfmig_pf *vfmig, void __user *uarg)
 {
 	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
@@ -1169,8 +1210,10 @@ static long vfmig_ioc_rx_fence(struct mlx5_vfmig_pf *vfmig, void __user *uarg)
 	if (arg.op != MLX5_VFMIG_RX_FENCE_RAISE &&
 	    arg.op != MLX5_VFMIG_RX_FENCE_LIFT)
 		return -EINVAL;
-	if (arg.flags & ~MLX5_VFMIG_RX_FENCE_F_NO_TABLE ||
-	    (arg.flags && arg.op != MLX5_VFMIG_RX_FENCE_LIFT))
+	if (arg.flags & ~(MLX5_VFMIG_RX_FENCE_F_NO_TABLE |
+			  MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND) ||
+	    (arg.flags & MLX5_VFMIG_RX_FENCE_F_NO_TABLE &&
+	     arg.op != MLX5_VFMIG_RX_FENCE_LIFT))
 		return -EINVAL;
 	if (arg.vf_id >= sriov->num_vfs)
 		return -EINVAL;
@@ -1186,12 +1229,9 @@ static long vfmig_ioc_rx_fence(struct mlx5_vfmig_pf *vfmig, void __user *uarg)
 	if (vf_pdev->dev.driver != pf_mdev->pdev->dev.driver)
 		err = -ENODEV;
 	else if (arg.op == MLX5_VFMIG_RX_FENCE_RAISE)
-		err = vfmig_rx_fence_raise(pci_get_drvdata(vf_pdev),
-					   &arg.table_id, &arg.group_id);
+		err = vfmig_rx_fence_raise_eth(pci_get_drvdata(vf_pdev), &arg);
 	else
-		err = vfmig_rx_fence_lift(pci_get_drvdata(vf_pdev),
-					  arg.table_id, arg.group_id,
-					  arg.flags & MLX5_VFMIG_RX_FENCE_F_NO_TABLE);
+		err = vfmig_rx_fence_lift_eth(pci_get_drvdata(vf_pdev), &arg);
 	device_unlock(&vf_pdev->dev);
 	pci_dev_put(vf_pdev);
 
@@ -1201,9 +1241,12 @@ static long vfmig_ioc_rx_fence(struct mlx5_vfmig_pf *vfmig, void __user *uarg)
 			       arg.vf_id, err);
 		return err;
 	}
-	mlx5_core_info(pf_mdev, "vfmig: RoCE RX fence %s on vf %u (table 0x%x group 0x%x)\n",
+	mlx5_core_info(pf_mdev, "vfmig: RoCE RX fence %s on vf %u (table 0x%x group 0x%x)%s\n",
 		       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? "up" : "down",
-		       arg.vf_id, arg.table_id, arg.group_id);
+		       arg.vf_id, arg.table_id, arg.group_id,
+		       !(arg.flags & MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND) ? "" :
+		       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? ", mlx5e suspended" :
+		       ", mlx5e resumed");
 
 	if (arg.op == MLX5_VFMIG_RX_FENCE_RAISE &&
 	    copy_to_user(uarg, &arg, sizeof(arg)))
