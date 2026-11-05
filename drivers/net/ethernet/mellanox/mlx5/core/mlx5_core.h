@@ -329,6 +329,7 @@ int mlx5_adev_init(struct mlx5_core_dev *dev);
 
 int mlx5_attach_device(struct mlx5_core_dev *dev);
 void mlx5_detach_device(struct mlx5_core_dev *dev, bool suspend);
+int mlx5_adev_eth_suspend(struct mlx5_core_dev *dev, bool suspend);
 int mlx5_register_device(struct mlx5_core_dev *dev);
 void mlx5_unregister_device(struct mlx5_core_dev *dev);
 void mlx5_dev_set_lightweight(struct mlx5_core_dev *dev);
