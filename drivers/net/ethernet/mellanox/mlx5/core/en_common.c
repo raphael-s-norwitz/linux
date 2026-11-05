@@ -221,6 +221,7 @@ err_destroy_bfregs:
 	for (i = 0; i < res->num_bfregs; i++)
 		mlx5_free_bfreg(mdev, res->bfregs + i);
 	kfree(res->bfregs);
+	res->bfregs = NULL;
 err_destroy_mkey:
 	mlx5_core_destroy_mkey(mdev, res->mkey);
 err_dealloc_transport_domain:
@@ -233,6 +234,14 @@ err_dealloc_pd:
 void mlx5e_destroy_mdev_resources(struct mlx5_core_dev *mdev)
 {
 	struct mlx5e_hw_objs *res = &mdev->mlx5e_res.hw_objs;
+
+	/*
+	 * Already destroyed: a suspend followed by a remove gets here twice.
+	 * bfregs is set exactly while the resources exist; the memset below
+	 * clears it.
+	 */
+	if (!res->bfregs)
+		return;
 
 	mlx5_crypto_dek_cleanup(mdev->mlx5e_res.dek_priv);
 	mdev->mlx5e_res.dek_priv = NULL;
