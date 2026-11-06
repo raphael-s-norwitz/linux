@@ -118,6 +118,7 @@ struct vfmig_iova_page {
  */
 struct vfmig_iova_domain {
 	struct dma_iova_state arena;	/* reserved [base, base+PER_VF) */
+	struct iommu_domain *arena_dom;	/* VF domain @arena was reserved in */
 	struct pci_dev	    *vf_pdev;	/* held via pci_dev_get() */
 	u32		     vf_id;
 
@@ -567,6 +568,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 			 vf_id, dom->base, base + VFMIG_IOVA_PER_VF, err);
 		goto err_pci_put;
 	}
+	dom->arena_dom = iommu_get_domain_for_dev(&vf_pdev->dev);
 
 	dev_info(&vf_pdev->dev,
 		 "vfmig_iova: vf %u arena reserved on managed domain: kernel slots [0x%llx, 0x%llx) (%u x 0x%llx) + kcoherent carve 0x%llx + USER_PAGE [0x%llx, 0x%llx)\n",
@@ -619,8 +621,18 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 	 * its page tables and our reservation -- are already gone, so any
 	 * dma_iova_*() call here would dereference a NULL iommu_group. Skip
 	 * the arena side in that case and only free memory we own.
+	 *
+	 * The same holds if the VF's default domain was replaced while it
+	 * was tracked (a write to its iommu_group/type): the old domain took
+	 * the reservation and mappings with it, and dma_iova_*() would act
+	 * on the new one -- an identity domain has no DMA cookie at all.
 	 */
-	arena_live = vf_pdev && iommu_get_domain_for_dev(&vf_pdev->dev);
+	arena_live = vf_pdev && use_dma_iommu(&vf_pdev->dev) &&
+		     iommu_get_domain_for_dev(&vf_pdev->dev) == dom->arena_dom;
+	if (vf_pdev && !arena_live && vf_pdev->dev.iommu_group)
+		dev_warn(&vf_pdev->dev,
+			 "vfmig_iova: vf %u DMA domain changed while tracked; arena went with the old domain\n",
+			 dom->vf_id);
 
 	mutex_lock(&dom->lock);
 	list_for_each_entry_safe(p, tmp, &dom->pages, node) {
