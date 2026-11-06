@@ -104,6 +104,15 @@ enum mlx5_ib_alloc_uctx_v2_flags {
 	 * not affected.
 	 */
 	MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE	= 1 << 1,
+	/*
+	 * With VFMIG_RESTORE only: take over the source ucontext's
+	 * transport domain, @vfmig_tdn owned by @vfmig_td_uid, which
+	 * LOAD_VHCA_STATE brought back, instead of allocating a new one.
+	 * Both come from the source's QUERY_UCONTEXT / QUERY_DYN_UARS meta.
+	 * Without it, the loaded TD is left owned by nobody and every
+	 * later SAVE of this VHCA carries it.
+	 */
+	MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD	= 1 << 2,
 };
 struct mlx5_ib_alloc_ucontext_req_v2 {
 	__u32	total_num_bfregs;
@@ -115,6 +124,9 @@ struct mlx5_ib_alloc_ucontext_req_v2 {
 	__u16	reserved1;
 	__u32	reserved2;
 	__aligned_u64 lib_caps;
+	__u32	vfmig_tdn;
+	__u16	vfmig_td_uid;
+	__u16	reserved3;
 };
 
 enum mlx5_ib_alloc_ucontext_resp_mask {
