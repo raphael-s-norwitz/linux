@@ -1195,10 +1195,14 @@ static int vfmig_rx_fence_lift_eth(struct mlx5_core_dev *vf,
 				   arg->flags & MLX5_VFMIG_RX_FENCE_F_NO_TABLE);
 }
 
+/*
+ * Called without vfmig->lock: the mlx5e suspend takes the VF's devlink lock,
+ * which VF probe and devlink reload hold while taking vfmig->lock. A bound
+ * VF pins its PF instead, as SR-IOV disable must unbind it first.
+ */
 static long vfmig_ioc_rx_fence(struct mlx5_vfmig_pf *vfmig, void __user *uarg)
 {
-	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
-	struct mlx5_core_sriov *sriov = &pf_mdev->priv.sriov;
+	struct mlx5_core_dev *pf_mdev;
 	struct mlx5_vfmig_rx_fence arg;
 	struct pci_dev *vf_pdev;
 	int err;
@@ -1215,38 +1219,55 @@ static long vfmig_ioc_rx_fence(struct mlx5_vfmig_pf *vfmig, void __user *uarg)
 	    (arg.flags & MLX5_VFMIG_RX_FENCE_F_NO_TABLE &&
 	     arg.op != MLX5_VFMIG_RX_FENCE_LIFT))
 		return -EINVAL;
-	if (arg.vf_id >= sriov->num_vfs)
-		return -EINVAL;
-	if (sriov->vfs_ctx[arg.vf_id].vfmig_dp_state != MLX5_VFMIG_DP_RUNNING)
-		return -EBUSY;
 
-	vf_pdev = vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	down_read(&vfmig->lock);
+	if (vfmig->dead) {
+		up_read(&vfmig->lock);
+		return -ENODEV;
+	}
+	pf_mdev = vfmig->pf_mdev;
+	if (arg.vf_id >= pf_mdev->priv.sriov.num_vfs)
+		err = -EINVAL;
+	else if (pf_mdev->priv.sriov.vfs_ctx[arg.vf_id].vfmig_dp_state !=
+		 MLX5_VFMIG_DP_RUNNING)
+		err = -EBUSY;
+	else
+		err = 0;
+	vf_pdev = err ? NULL : vfmig_get_vf_pdev(pf_mdev->pdev, arg.vf_id);
+	up_read(&vfmig->lock);
+	if (err)
+		return err;
 	if (!vf_pdev)
 		return -ENODEV;
 
-	/* The device lock keeps the VF's mlx5_core bound under us. */
+	/* The device lock keeps the VF's mlx5_core, and so the PF, bound. */
 	device_lock(&vf_pdev->dev);
-	if (vf_pdev->dev.driver != pf_mdev->pdev->dev.driver)
-		err = -ENODEV;
-	else if (arg.op == MLX5_VFMIG_RX_FENCE_RAISE)
+	if (vf_pdev->dev.driver != pf_mdev->pdev->dev.driver) {
+		device_unlock(&vf_pdev->dev);
+		pci_dev_put(vf_pdev);
+		return -ENODEV;
+	}
+
+	if (arg.op == MLX5_VFMIG_RX_FENCE_RAISE)
 		err = vfmig_rx_fence_raise_eth(pci_get_drvdata(vf_pdev), &arg);
 	else
 		err = vfmig_rx_fence_lift_eth(pci_get_drvdata(vf_pdev), &arg);
-	device_unlock(&vf_pdev->dev);
-	pci_dev_put(vf_pdev);
 
-	if (err) {
+	if (err)
 		mlx5_core_warn(pf_mdev, "vfmig: %s RoCE RX fence on vf %u failed: %d\n",
 			       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? "raising" : "lifting",
 			       arg.vf_id, err);
+	else
+		mlx5_core_info(pf_mdev, "vfmig: RoCE RX fence %s on vf %u (table 0x%x group 0x%x)%s\n",
+			       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? "up" : "down",
+			       arg.vf_id, arg.table_id, arg.group_id,
+			       !(arg.flags & MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND) ? "" :
+			       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? ", mlx5e suspended" :
+			       ", mlx5e resumed");
+	device_unlock(&vf_pdev->dev);
+	pci_dev_put(vf_pdev);
+	if (err)
 		return err;
-	}
-	mlx5_core_info(pf_mdev, "vfmig: RoCE RX fence %s on vf %u (table 0x%x group 0x%x)%s\n",
-		       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? "up" : "down",
-		       arg.vf_id, arg.table_id, arg.group_id,
-		       !(arg.flags & MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND) ? "" :
-		       arg.op == MLX5_VFMIG_RX_FENCE_RAISE ? ", mlx5e suspended" :
-		       ", mlx5e resumed");
 
 	if (arg.op == MLX5_VFMIG_RX_FENCE_RAISE &&
 	    copy_to_user(uarg, &arg, sizeof(arg)))
@@ -3632,6 +3653,9 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	void __user *uarg = (void __user *)arg;
 	long ret;
 
+	if (cmd == MLX5_VFMIG_IOC_RX_FENCE)
+		return vfmig_ioc_rx_fence(vfmig, uarg);
+
 	down_read(&vfmig->lock);
 	if (vfmig->dead) {
 		ret = -ENODEV;
@@ -3665,9 +3689,6 @@ static long vfmig_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case MLX5_VFMIG_IOC_RESUME_VHCA:
 		ret = vfmig_ioc_resume_vhca(vfmig, uarg);
-		break;
-	case MLX5_VFMIG_IOC_RX_FENCE:
-		ret = vfmig_ioc_rx_fence(vfmig, uarg);
 		break;
 	case MLX5_VFMIG_IOC_SAVE_VHCA_STATE:
 		ret = vfmig_ioc_save_vhca_state(vfmig, uarg);
