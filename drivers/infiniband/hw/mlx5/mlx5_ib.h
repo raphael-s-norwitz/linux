@@ -194,6 +194,8 @@ struct mlx5_ib_ucontext {
 	u8			cqe_version;
 	/* Transport Domain number */
 	u32			tdn;
+	/* Owner of @tdn: devx_uid, or the source's uid for an adopted TD */
+	u16			td_uid;
 
 	u64			lib_caps;
 	u16			devx_uid;

@@ -500,10 +500,14 @@ enum mlx5_ib_vfmig_restore_ucontext_attrs {
  *   COUNT:   __u32. Kernel always writes the number of dynamic UARs held
  *            by this ucontext, so the sizing pass tells userspace how big
  *            RECORDS must be and the snapshot pass confirms it.
+ *   META:    struct mlx5_ib_vfmig_ucontext_meta. OPTIONAL. Same contents
+ *            as QUERY_UCONTEXT's META; the bfreg fields are zero for a
+ *            dynamic-UAR ucontext.
  */
 enum mlx5_ib_vfmig_query_dyn_uars_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_RECORDS = (1U << UVERBS_ID_NS_SHIFT),
 	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT,
+	MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_META,
 };
 
 /*
@@ -647,18 +651,29 @@ struct mlx5_ib_vfmig_qp_sq_psn {
 	__u32	last_acked_psn;
 };
 
+/*
+ * MLX5_IB_VFMIG_UCTX_META_F_TDN: @tdn / @td_uid name the ucontext's
+ * transport domain; pass them back with MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD.
+ * Clear if the device has no transport domains, or from a kernel that
+ * predates the field.
+ */
+enum mlx5_ib_vfmig_ucontext_meta_flags {
+	MLX5_IB_VFMIG_UCTX_META_F_TDN = 1 << 0,
+};
+
 struct mlx5_ib_vfmig_ucontext_meta {
 	__u32	num_static_sys_pages;
 	__u32	num_sys_pages;
 	__u32	num_dyn_bfregs;
 	__u32	num_low_latency_bfregs;
 	__u32	total_num_bfregs;
-	__u32	reserved0;
+	__u32	tdn;
 	__aligned_u64 lib_caps;
 	__u8	lib_uar_4k;
 	__u8	lib_uar_dyn;
 	__u8	cqe_version;
-	__u8	reserved1[3];
+	__u8	flags;
+	__u16	td_uid;
 	__u16	devx_uid;
 };
 

@@ -2102,44 +2102,57 @@ void mlx5_ib_disable_lb(struct mlx5_ib_dev *dev, bool td, bool qp)
 	mutex_unlock(&dev->lb.mutex);
 }
 
+static bool mlx5_ib_td_uses_lb(struct mlx5_ib_dev *dev)
+{
+	return MLX5_CAP_GEN(dev->mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH &&
+	       (MLX5_CAP_GEN(dev->mdev, disable_local_lb_uc) ||
+		MLX5_CAP_GEN(dev->mdev, disable_local_lb_mc));
+}
+
+/*
+ * With @adopt, *@tdn is a TD that LOAD_VHCA_STATE brought back with the
+ * VHCA: take it over rather than allocate one, so that it is freed with
+ * this ucontext instead of outliving it in every later SAVE.
+ */
 static int mlx5_ib_alloc_transport_domain(struct mlx5_ib_dev *dev, u32 *tdn,
-					  u16 uid)
+					  u16 uid, bool adopt)
 {
 	int err;
 
 	if (!MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
-		return 0;
+		return adopt ? -EOPNOTSUPP : 0;
 
-	err = mlx5_cmd_alloc_transport_domain(dev->mdev, tdn, uid);
-	if (err)
-		return err;
+	if (!adopt) {
+		err = mlx5_cmd_alloc_transport_domain(dev->mdev, tdn, uid);
+		if (err)
+			return err;
+	}
 
-	if ((MLX5_CAP_GEN(dev->mdev, port_type) != MLX5_CAP_PORT_TYPE_ETH) ||
-	    (!MLX5_CAP_GEN(dev->mdev, disable_local_lb_uc) &&
-	     !MLX5_CAP_GEN(dev->mdev, disable_local_lb_mc)))
+	if (!mlx5_ib_td_uses_lb(dev))
 		return 0;
 
 	err = mlx5_ib_enable_lb(dev, true, false);
-	if (err)
+	if (err && !adopt)
 		mlx5_cmd_dealloc_transport_domain(dev->mdev, *tdn, uid);
 
 	return err;
 }
 
+/*
+ * @keep leaves the TD itself allocated, for an adopted TD whose ucontext
+ * failed to come up: the next restore attempt adopts it again.
+ */
 static void mlx5_ib_dealloc_transport_domain(struct mlx5_ib_dev *dev, u32 tdn,
-					     u16 uid)
+					     u16 uid, bool keep)
 {
 	if (!MLX5_CAP_GEN(dev->mdev, log_max_transport_domain))
 		return;
 
-	mlx5_cmd_dealloc_transport_domain(dev->mdev, tdn, uid);
+	if (!keep)
+		mlx5_cmd_dealloc_transport_domain(dev->mdev, tdn, uid);
 
-	if ((MLX5_CAP_GEN(dev->mdev, port_type) != MLX5_CAP_PORT_TYPE_ETH) ||
-	    (!MLX5_CAP_GEN(dev->mdev, disable_local_lb_uc) &&
-	     !MLX5_CAP_GEN(dev->mdev, disable_local_lb_mc)))
-		return;
-
-	mlx5_ib_disable_lb(dev, true, false);
+	if (mlx5_ib_td_uses_lb(dev))
+		mlx5_ib_disable_lb(dev, true, false);
 }
 
 static int set_ucontext_resp(struct ib_ucontext *uctx,
@@ -2231,7 +2244,7 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 {
 	struct ib_device *ibdev = uctx->device;
 	struct mlx5_ib_dev *dev = to_mdev(ibdev);
-	struct mlx5_ib_alloc_ucontext_req_v2 req;
+	struct mlx5_ib_alloc_ucontext_req_v2 req = {};
 	struct mlx5_ib_alloc_ucontext_resp resp = {};
 	struct mlx5_ib_ucontext *context = to_mucontext(uctx);
 	struct mlx5_bfreg_info *bfregi;
@@ -2241,6 +2254,7 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 				     max_cqe_version);
 	bool lib_uar_4k;
 	bool lib_uar_dyn;
+	bool adopt_td;
 
 	if (!dev->ib_active)
 		return -EAGAIN;
@@ -2257,11 +2271,19 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 		return err;
 
 	if (req.flags & ~(MLX5_IB_ALLOC_UCTX_DEVX |
-			  MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE))
+			  MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE |
+			  MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD))
 		return -EOPNOTSUPP;
 
-	if (req.comp_mask || req.reserved0 || req.reserved1 || req.reserved2)
+	if (req.comp_mask || req.reserved0 || req.reserved1 || req.reserved2 ||
+	    req.reserved3)
 		return -EOPNOTSUPP;
+
+	adopt_td = req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD;
+	if (adopt_td && !(req.flags & MLX5_IB_ALLOC_UCTX_VFMIG_RESTORE))
+		return -EINVAL;
+	if (!adopt_td && (req.vfmig_tdn || req.vfmig_td_uid))
+		return -EINVAL;
 
 	/*
 	 * A restore-mode ucontext is seeded with the source's FW UAR ids,
@@ -2356,10 +2378,19 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
 		goto out_sys_pages;
 
 uar_done:
+	if (adopt_td) {
+		context->tdn = req.vfmig_tdn;
+		context->td_uid = req.vfmig_td_uid;
+	} else {
+		context->td_uid = context->devx_uid;
+	}
 	err = mlx5_ib_alloc_transport_domain(dev, &context->tdn,
-					     context->devx_uid);
+					     context->td_uid, adopt_td);
 	if (err)
 		goto out_uars;
+	if (adopt_td)
+		mlx5_ib_dbg(dev, "vfmig: adopted transport domain 0x%x uid %u\n",
+			    context->tdn, context->td_uid);
 
 	INIT_LIST_HEAD(&context->db_page_list);
 	mutex_init(&context->db_page_mutex);
@@ -2396,7 +2427,8 @@ uar_done:
 	return 0;
 
 out_mdev:
-	mlx5_ib_dealloc_transport_domain(dev, context->tdn, context->devx_uid);
+	mlx5_ib_dealloc_transport_domain(dev, context->tdn, context->td_uid,
+					 adopt_td);
 
 out_uars:
 	deallocate_uars(dev, context);
@@ -2453,7 +2485,8 @@ static void mlx5_ib_dealloc_ucontext(struct ib_ucontext *ibcontext)
 		mlx5_vf_set_restore_released(dev->mdev);
 
 	bfregi = &context->bfregi;
-	mlx5_ib_dealloc_transport_domain(dev, context->tdn, context->devx_uid);
+	mlx5_ib_dealloc_transport_domain(dev, context->tdn, context->td_uid,
+					 false);
 
 	deallocate_uars(dev, context);
 	kfree(bfregi->sys_pages);

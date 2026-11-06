@@ -24,6 +24,24 @@
 #define UVERBS_MODULE_NAME mlx5_ib
 #include <rdma/uverbs_named_ioctl.h>
 
+/* The meta fields both QUERY_UCONTEXT and QUERY_DYN_UARS report. */
+static void vfmig_fill_uctx_meta_common(struct mlx5_ib_ucontext *c,
+					struct mlx5_ib_vfmig_ucontext_meta *meta)
+{
+	struct mlx5_ib_dev *dev = to_mdev(c->ibucontext.device);
+
+	meta->lib_caps    = c->lib_caps;
+	meta->lib_uar_4k  = c->bfregi.lib_uar_4k ? 1 : 0;
+	meta->lib_uar_dyn = c->bfregi.lib_uar_dyn ? 1 : 0;
+	meta->cqe_version = c->cqe_version;
+	meta->devx_uid    = c->devx_uid;
+	if (MLX5_CAP_GEN(dev->mdev, log_max_transport_domain)) {
+		meta->tdn    = c->tdn;
+		meta->td_uid = c->td_uid;
+		meta->flags |= MLX5_IB_VFMIG_UCTX_META_F_TDN;
+	}
+}
+
 static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT)(struct uverbs_attr_bundle *attrs)
 {
 	struct mlx5_ib_vfmig_ucontext_meta meta = {};
@@ -99,19 +117,14 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_UCONTEXT)(struct uverbs_att
 	meta.num_dyn_bfregs         = bfregi->num_dyn_bfregs;
 	meta.num_low_latency_bfregs = bfregi->num_low_latency_bfregs;
 	meta.total_num_bfregs       = bfregi->total_num_bfregs;
-	meta.lib_caps               = c->lib_caps;
-	meta.lib_uar_4k             = bfregi->lib_uar_4k ? 1 : 0;
-	meta.lib_uar_dyn            = bfregi->lib_uar_dyn ? 1 : 0;
-	meta.cqe_version            = c->cqe_version;
 	/*
-	 * Source ucontext's FW owner-id, exposed across the SAVE/LOAD seam
-	 * as image-only metadata / diagnostics (0 = non-DEVX). The default
-	 * libmlx5 ucontext auto-allocates a DEVX uid, so this is commonly
-	 * non-zero; RESTORE_UCONTEXT logs a mismatch and continues rather
-	 * than rejecting (the restore path opens the dest ucontext without
-	 * DEVX, so dest.devx_uid is 0 by construction).
+	 * devx_uid is the source ucontext's FW owner-id, exposed across the
+	 * SAVE/LOAD seam as image-only metadata / diagnostics (0 = non-DEVX).
+	 * RESTORE_UCONTEXT logs a mismatch and continues rather than
+	 * rejecting (the restore path opens the dest ucontext without DEVX,
+	 * so dest.devx_uid is 0 by construction).
 	 */
-	meta.devx_uid               = c->devx_uid;
+	vfmig_fill_uctx_meta_common(c, &meta);
 
 	err = uverbs_copy_to(attrs,
 			     MLX5_IB_ATTR_VFMIG_QUERY_UCONTEXT_META,
@@ -435,6 +448,17 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_DYN_UARS)(struct uverbs_att
 	if (err)
 		return err;
 
+	if (uverbs_attr_is_valid(attrs, MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_META)) {
+		struct mlx5_ib_vfmig_ucontext_meta meta = {};
+
+		vfmig_fill_uctx_meta_common(c, &meta);
+		err = uverbs_copy_to(attrs,
+				     MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_META,
+				     &meta, sizeof(meta));
+		if (err)
+			return err;
+	}
+
 	mlx5_ib_dbg(dev, "VFMIG_QUERY_DYN_UARS: %s pass, %u dyn UAR(s)\n",
 		    want_records ? "snapshot" : "sizing", count);
 	return 0;
@@ -447,7 +471,10 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UA_OPTIONAL),
 	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_COUNT,
 			    UVERBS_ATTR_TYPE(__u32),
-			    UA_MANDATORY));
+			    UA_MANDATORY),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_DYN_UARS_META,
+			    UVERBS_ATTR_TYPE(struct mlx5_ib_vfmig_ucontext_meta),
+			    UA_OPTIONAL));
 
 /*
  * Single-record dyn-UAR restore worker. Allocates and pins the
