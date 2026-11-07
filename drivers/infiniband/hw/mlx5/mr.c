@@ -1113,14 +1113,11 @@ int mlx5_ib_bind_dmabuf_mr(struct ib_mr *ibmr, int fd)
 		return -EOPNOTSUPP;
 
 	/*
-	 * The UMR QP, its CQ and umrc.sem are allocated lazily by the first
-	 * user, which everywhere else is a registration -- an MR could not
-	 * exist on a device that had never run this. Mkey adoption breaks
-	 * that: RESTORE_MR installs an MR on a freshly probed device without
+	 * The UMR QP and its CQ are allocated lazily by the first user, which
+	 * everywhere else is a registration. Mkey adoption breaks that:
+	 * RESTORE_MR installs an MR on a freshly probed device without
 	 * registering anything, so a bind can be the first UMR the device
-	 * ever sees. Without this, umrc.sem is still a zeroed semaphore and
-	 * mlx5r_umr_post_send_wait()'s down() blocks forever, before the WQE
-	 * is ever posted.
+	 * ever sees.
 	 */
 	err = mlx5r_umr_resource_init(dev);
 	if (err)
