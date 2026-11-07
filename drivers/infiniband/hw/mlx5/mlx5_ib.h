@@ -1152,6 +1152,7 @@ struct mlx5_ib_dev {
 	struct notifier_block		mdev_events;
 	struct notifier_block		sys_error_events;
 	struct notifier_block           lag_events;
+	struct notifier_block		vfmig_nb;
 	int				num_ports;
 	/* serialize update of capability mask
 	 */
