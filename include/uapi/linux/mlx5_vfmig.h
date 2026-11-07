@@ -303,6 +303,13 @@ struct mlx5_vfmig_resume_vhca {
  *   suspended does nothing. If the resume fails, the fence stays up and
  *   the LIFT can be retried, with or without the flag.
  *
+ *   MLX5_VFMIG_RX_FENCE_F_IB_RELEASE, RAISE only, also has the VF's
+ *   mlx5_ib destroy its idle cached mkeys and its UMR QP and CQ, once no
+ *   UMR is in flight, so SAVE_VHCA_STATE does not carry them. mlx5_ib
+ *   creates them again on its next MR operation, so nothing is undone on
+ *   LIFT. If mlx5_ib is not bound, or holds an ODP or dma-buf MR, nothing
+ *   is released and the flag is cleared in the returned @flags.
+ *
  *   The VF must be bound to mlx5_core and RUNNING.
  *
  *   Returns 0 on success; -EINVAL if @vf_id is out of range, @op or
@@ -316,6 +323,7 @@ struct mlx5_vfmig_resume_vhca {
 
 #define MLX5_VFMIG_RX_FENCE_F_NO_TABLE	(1u << 0)	/* LIFT only */
 #define MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND (1u << 1)
+#define MLX5_VFMIG_RX_FENCE_F_IB_RELEASE (1u << 2)	/* RAISE only */
 
 struct mlx5_vfmig_rx_fence {
 	__u32 vf_id;		/* in  */
