@@ -68,3 +68,40 @@ header comment for the verbs).
 
   It reads struct offsets from the tree's `vmlinux` and `mlx5_core.ko`
   with gdb, so run it from the tree the running kernel was built from.
+
+## Probes
+
+One-off experiments behind `design/restored_state_growth.md`, kept so the
+findings there can be reproduced. They are functional only, with no timing.
+They reset SR-IOV on `$PF`, so keep traffic off it. `make ... probes` also
+builds the helpers that need libibverbs.
+
+- `probes/test_ib_release.sh` -- checks `MLX5_VFMIG_RX_FENCE_F_IB_RELEASE`
+  on VF 0 with `umr_release_probe`: the first MR creates mlx5_ib's UMR CQ,
+  the fence raise with the flag removes it, the next MR creates it again,
+  and a LIFT with the flag is refused.
+- `probes/run_criu_gates.sh` -- runs the CRIU tree's hardware vfmig gates
+  (`CRIU_TREE=...`, `GATES="..."`) and summarizes each one's exit code and
+  kernel warnings.
+- `probes/growth_split_probe.sh` -- chains SAVE/LOAD over restored
+  generations with only some of the VF's auxiliary drivers bound, or with
+  mlx5e unbound, suspended or down before SAVE. It prints the image growth
+  per generation.
+- `probes/eq_gen_probe.sh` -- records the EQs, CQs and QPs on a normal VF
+  and on restored generations, to show leaked source EQs.
+- `probes/eth_unbind_questions.sh` -- RC traffic between VF 0 and VF 1,
+  with VF 1 in its own namespace, across an mlx5e unbind or suspend, the
+  RX fence, and RECYCLE_VF.
+- `probes/criu_dropeth_gate.sh` -- a CRIU dump and restore of a
+  self-loop RC QP, with the source's mlx5e unbound or suspended
+  (`CRIU_REPO=...`). It has since been ported to the CRIU tree as
+  `run_vfmig_qp_traffic_cr.sh`.
+
+Helpers: `probes/vfmig_fence` raises and lifts the RX fence, optionally
+with `eth`. `probes/rc_pair` drives RC QP pairs between two ib devices
+from stdin.
+
+```
+make -C tools/testing/criu_rdma probes
+sudo PF=0000:08:00.0 tools/testing/criu_rdma/probes/test_ib_release.sh
+```
