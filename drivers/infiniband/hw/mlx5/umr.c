@@ -145,8 +145,9 @@ int mlx5r_umr_resource_init(struct mlx5_ib_dev *dev)
 
 
 	/*
-	 * UMR qp is set once, never changed until device unload.
-	 * Avoid taking the mutex if initialization is already done.
+	 * UMR qp is set once, and cleared only by device unload or
+	 * mlx5r_umr_resource_release(). Avoid taking the mutex if
+	 * initialization is already done.
 	 */
 	if (smp_load_acquire(&dev->umrc.qp))
 		return 0;
@@ -181,12 +182,11 @@ int mlx5r_umr_resource_init(struct mlx5_ib_dev *dev)
 	if (ret)
 		goto destroy_qp;
 
+	mutex_lock(&dev->umrc.lock);
 	dev->umrc.cq = cq;
-
-	sema_init(&dev->umrc.sem, MAX_UMR_WR);
-	mutex_init(&dev->umrc.lock);
 	dev->umrc.state = MLX5_UMR_STATE_ACTIVE;
 	smp_store_release(&dev->umrc.qp, qp);
+	mutex_unlock(&dev->umrc.lock);
 
 	mutex_unlock(&dev->umrc.init_lock);
 	return 0;
@@ -202,12 +202,46 @@ unlock:
 
 void mlx5r_umr_resource_cleanup(struct mlx5_ib_dev *dev)
 {
-	if (dev->umrc.state == MLX5_UMR_STATE_UNINIT)
+	if (!dev->umrc.qp)
 		return;
-	mutex_destroy(&dev->umrc.lock);
-	/* After device init, UMR cp/qp are not unset during the lifetime. */
 	ib_destroy_qp(dev->umrc.qp);
 	ib_free_cq(dev->umrc.cq);
+}
+
+/*
+ * Destroy the UMR QP and CQ once no UMR is in flight. The next UMR creates
+ * them again, so the caller must make sure no ODP or dma-buf MR exists:
+ * their invalidations post UMRs from contexts that cannot create a QP.
+ */
+void mlx5r_umr_resource_release(struct mlx5_ib_dev *dev)
+{
+	struct umr_common *umrc = &dev->umrc;
+	struct ib_qp *qp;
+	struct ib_cq *cq;
+	int i;
+
+	mutex_lock(&umrc->init_lock);
+	if (!umrc->qp)
+		goto unlock;
+
+	for (i = 0; i < MAX_UMR_WR; i++)
+		down(&umrc->sem);
+
+	mutex_lock(&umrc->lock);
+	qp = umrc->qp;
+	cq = umrc->cq;
+	WRITE_ONCE(umrc->qp, NULL);
+	umrc->cq = NULL;
+	umrc->state = MLX5_UMR_STATE_UNINIT;
+	mutex_unlock(&umrc->lock);
+
+	ib_destroy_qp(qp);
+	ib_free_cq(cq);
+
+	for (i = 0; i < MAX_UMR_WR; i++)
+		up(&umrc->sem);
+unlock:
+	mutex_unlock(&umrc->init_lock);
 }
 
 int mlx5r_umr_init(struct mlx5_ib_dev *dev)
@@ -222,6 +256,8 @@ int mlx5r_umr_init(struct mlx5_ib_dev *dev)
 	dev->umrc.pd = pd;
 
 	mutex_init(&dev->umrc.init_lock);
+	mutex_init(&dev->umrc.lock);
+	sema_init(&dev->umrc.sem, MAX_UMR_WR);
 
 	return 0;
 }
@@ -231,6 +267,7 @@ void mlx5r_umr_cleanup(struct mlx5_ib_dev *dev)
 	if (!dev->umrc.pd)
 		return;
 
+	mutex_destroy(&dev->umrc.lock);
 	mutex_destroy(&dev->umrc.init_lock);
 	ib_dealloc_pd(dev->umrc.pd);
 }
@@ -377,6 +414,17 @@ static int mlx5r_umr_post_send_wait(struct mlx5_ib_dev *dev, u32 mkey,
 		if (umrc->state == MLX5_UMR_STATE_RECOVER) {
 			mutex_unlock(&umrc->lock);
 			usleep_range(3000, 5000);
+			continue;
+		}
+
+		/* Released by mlx5r_umr_resource_release(); create it again. */
+		if (umrc->state == MLX5_UMR_STATE_UNINIT) {
+			mutex_unlock(&umrc->lock);
+			up(&umrc->sem);
+			err = mlx5r_umr_resource_init(dev);
+			if (err)
+				return err;
+			down(&umrc->sem);
 			continue;
 		}
 
