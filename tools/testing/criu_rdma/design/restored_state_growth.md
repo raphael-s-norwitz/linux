@@ -20,6 +20,14 @@ RoCE RX fence now does that (`MLX5_VFMIG_RX_FENCE_F_ETH_SUSPEND`), and
 the source's QPs keep working too if it is left running; see "Fix:
 suspend mlx5e under the RX fence" below.
 
+With mlx5e suspended, two smaller leaks of the same kind remained, and
+both are fixed. A restored ucontext allocated a new transport domain
+and orphaned the source's, about 9 KB per hop; it now adopts the
+source's. And mlx5_ib's UMR QP and CQ, created on the first MR
+operation, came across with no owner, about 24 KB per hop; the RX fence
+now releases them (`MLX5_VFMIG_RX_FENCE_F_IB_RELEASE`). See "The
+remaining growth: transport domain and UMR" below.
+
 Saving from a VF that was not restored is not affected.
 
 ## Observation
@@ -401,6 +409,75 @@ destination could add GIDs in a different order (CRIU could record the
 source's GID table and check the destination's before restoring QPs);
 a peer on another host; and switchdev eswitch mode.
 
+## The remaining growth: transport domain and UMR
+
+With mlx5e suspended before SAVE, the CRIU loop harness
+(`test/rdma/run_vfmig_qp_traffic_loop.sh` in the CRIU tree, 20 hops,
+alternating VF 0 and VF 1) still showed linear growth. Like the EQs and
+mlx5e, both cases are objects that LOAD brings back while the
+destination creates its own.
+
+### Transport domain
+
+A restore-mode `mlx5_ib_alloc_ucontext()` adopts the source's UARs, but
+it allocated a new transport domain (TD). The source's TD stayed
+allocated in firmware with no owner. The image grew by about 8.9 KB per
+hop, even for a bare ucontext.
+
+The ucontext meta now reports the TD and its owner's uid
+(`MLX5_IB_VFMIG_UCTX_META_F_TDN`, from QUERY_UCONTEXT, or from
+QUERY_DYN_UARS through its optional META attribute). The plugin passes
+them back with `MLX5_IB_ALLOC_UCTX_VFMIG_ADOPT_TD`, and the ucontext
+adopts that TD instead of allocating one. Growth drops from +8,875 to
++683 bytes per hop for the bare ucontext, and from +9,110 to +683 for
+the QP holder. The +683 is one or two 4 KB pages of jitter, which go
+down as well as up.
+
+### UMR QP and CQ
+
+With the TD adopted, a PD holder that registers and deregisters an MR
+each hop still grew about 24 KB per hop. With no MR it stayed flat.
+Registering twice per hop grew exactly as much as once. The image also
+kept one more doorbell page (`db_page=1` in the drift line).
+
+The first MR operation on a device calls `mlx5r_umr_resource_init()`.
+That creates a kernel CQ (128 entries, shown as `cqe 255` in
+`rdma res show cq`) and a `REG_UMR` QP, kept until the device is
+removed. Their doorbell records take one DMA-coherent page. The FRMR
+pools, which replace the old mkey cache, were ruled out: they create
+one mkey per pop, with no batches, and aging destroys an idle one
+within 120 s.
+
+| run (6–8 hops) | `[mlx5_ib]` CQ on the restored VF | growth per hop | `db_page` |
+|---|---|---|---|
+| 1 MR per hop | `cqe 255`, every hop | +21,845 B | 1 |
+| no MR | none | 0 | 0 |
+| 1 MR, 130 s before each dump | not recorded | +25,600 B | 1 |
+
+The 130 s wait lets aging destroy the idle pooled mkey before SAVE.
+Growth stays the same, so the UMR pair is the cause. A restored MR's
+bind also creates the pair on the destination, so any workload with MRs
+grows, not only this probe.
+
+The fix releases the pair on the source.
+`MLX5_VFMIG_RX_FENCE_F_IB_RELEASE` on RAISE sends
+`MLX5_DRIVER_EVENT_VFMIG_IB_RELEASE` to the VF, after the fence and the
+mlx5e suspend. mlx5_ib then:
+
+- destroys the idle FRMR-pool mkeys (`ib_frmr_pools_flush_idle()`);
+- takes every slot of `umrc.sem`, so no UMR is in flight;
+- destroys the UMR QP and CQ (`mlx5r_umr_resource_release()`).
+
+The next UMR creates them again from `mlx5r_umr_post_send_wait()`. It
+is refused, and the flag cleared in the returned flags, while the device
+has an ODP or dma-buf MR, because their invalidations post UMRs from
+contexts that cannot create a QP. `probes/test_ib_release.sh` checks
+the release and the re-creation.
+
+Activating it in the plugin, and confirming that a chain with an MR
+per hop is flat with `db_page=0`, was still to do at the time of
+writing.
+
 ## Open questions
 
 - **GID order with several addresses.** One IPv4 address keeps its GID
@@ -470,8 +547,10 @@ Reproduce with:
 
     sudo CYCLES=4 tools/testing/criu_rdma/save_load/test_vf_recycle.sh
 
-The driver split, the suspend gate and the peer tests were run with
-scripts outside the tree (`growth_split_probe.sh`,
-`criu_dropeth_gate.sh`, `eth_unbind_questions.sh`, and the `vfmig_fence`,
-`qp_gid_holder` and `rc_pair` helpers); the gate is to be ported into
-the CRIU tree's `test/rdma`.
+The driver split, the suspend gate and the peer tests were run with the
+scripts in `probes/` (`growth_split_probe.sh`, `criu_dropeth_gate.sh`,
+`eth_unbind_questions.sh`, with the `vfmig_fence` and `rc_pair`
+helpers; the self-loop QP holder is the CRIU tree's
+`test/rdma/qp_gid_holder`). The suspend gate has since been ported to
+the CRIU tree as `run_vfmig_qp_traffic_cr.sh`. The transport-domain
+and UMR results came from that tree's `run_vfmig_qp_traffic_loop.sh`.

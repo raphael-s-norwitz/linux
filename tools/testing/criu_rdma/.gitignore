@@ -1,2 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
 /tools/mlx5_vfmig
+/probes/vfmig_fence
+/probes/rc_pair
+/probes/umr_release_probe
