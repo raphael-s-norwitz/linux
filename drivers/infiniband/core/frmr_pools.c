@@ -346,6 +346,48 @@ static int frmr_pool_cmp_add(struct rb_node *new, const struct rb_node *node)
 	return compare_keys(&pool->key, &new_pool->key);
 }
 
+/*
+ * Destroy every idle FRMR handle in every pool of @device. Handles in use
+ * are left alone, and a pool creates handles again on demand. A pinned
+ * pool is flushed too and stays below its pinned count until the next
+ * ib_frmr_pools_set_pinned().
+ */
+void ib_frmr_pools_flush_idle(struct ib_device *device)
+{
+	struct ib_frmr_pools *pools = device->frmr_pools;
+	struct frmr_queue doomed = {
+		.pages_list = LIST_HEAD_INIT(doomed.pages_list),
+	};
+	struct frmr_handles_page *page;
+	struct ib_frmr_pool *pool;
+	struct rb_node *node;
+	u32 count;
+
+	if (!pools)
+		return;
+
+	read_lock(&pools->rb_lock);
+	for (node = rb_first(&pools->rb_root); node; node = rb_next(node)) {
+		pool = rb_entry(node, struct ib_frmr_pool, node);
+		spin_lock(&pool->lock);
+		splice_frmr_queue_locked(&doomed, &pool->queue);
+		splice_frmr_queue_locked(&doomed, &pool->inactive_queue);
+		spin_unlock(&pool->lock);
+	}
+	read_unlock(&pools->rb_lock);
+
+	while (doomed.ci) {
+		page = list_first_entry(&doomed.pages_list,
+					struct frmr_handles_page, list);
+		list_del(&page->list);
+		count = min_t(unsigned long, doomed.ci, NUM_HANDLES_PER_PAGE);
+		doomed.ci -= count;
+		pools->pool_ops->destroy_frmrs(device, page->handles, count);
+		kfree(page);
+	}
+}
+EXPORT_SYMBOL(ib_frmr_pools_flush_idle);
+
 static struct ib_frmr_pool *ib_frmr_pool_find(struct ib_frmr_pools *pools,
 					      struct ib_frmr_key *key)
 {
