@@ -374,6 +374,11 @@ enum mlx5_driver_event {
 	MLX5_DRIVER_EVENT_AFFILIATION_DONE,
 	MLX5_DRIVER_EVENT_AFFILIATION_REMOVED,
 	MLX5_DRIVER_EVENT_ACTIVE_BACKUP_LAG_CHANGE_LOWERSTATE,
+	/*
+	 * vfmig is about to save the function: release what can be created
+	 * again on first use. @data is an int, set to 0 if released.
+	 */
+	MLX5_DRIVER_EVENT_VFMIG_IB_RELEASE,
 };
 
 enum {

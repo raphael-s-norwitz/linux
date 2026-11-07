@@ -6025,6 +6025,34 @@ static void mlx5_ib_stage_ib_reg_cleanup(struct mlx5_ib_dev *dev)
 	ib_unregister_device(&dev->ib_dev);
 }
 
+/*
+ * Destroy the idle FRMR-pool mkeys and the UMR QP and CQ, which a VF
+ * restored from this one's saved state would carry with no owner. Refused
+ * while an ODP or dma-buf MR could post a UMR from a context that cannot
+ * create the QP again.
+ */
+static int mlx5_ib_vfmig_release(struct mlx5_ib_dev *dev)
+{
+	if (!xa_empty(&dev->odp_mkeys))
+		return -EBUSY;
+
+	ib_frmr_pools_flush_idle(&dev->ib_dev);
+	mlx5r_umr_resource_release(dev);
+	return 0;
+}
+
+static int mlx5_ib_vfmig_event(struct notifier_block *nb, unsigned long event,
+			       void *data)
+{
+	struct mlx5_ib_dev *dev = container_of(nb, struct mlx5_ib_dev, vfmig_nb);
+
+	if (event != MLX5_DRIVER_EVENT_VFMIG_IB_RELEASE)
+		return NOTIFY_DONE;
+
+	*(int *)data = mlx5_ib_vfmig_release(dev);
+	return NOTIFY_OK;
+}
+
 static int mlx5_ib_stage_post_ib_reg_umr_init(struct mlx5_ib_dev *dev)
 {
 	int ret;
@@ -6034,10 +6062,19 @@ static int mlx5_ib_stage_post_ib_reg_umr_init(struct mlx5_ib_dev *dev)
 		return ret;
 
 	ret = mlx5r_frmr_pools_init(&dev->ib_dev);
-	if (ret)
+	if (ret) {
 		mlx5_ib_warn(dev, "frmr pools init failed %d\n", ret);
+		return ret;
+	}
 
-	return ret;
+	dev->vfmig_nb.notifier_call = mlx5_ib_vfmig_event;
+	mlx5_blocking_notifier_register(dev->mdev, &dev->vfmig_nb);
+	return 0;
+}
+
+static void mlx5_ib_stage_post_ib_reg_umr_cleanup(struct mlx5_ib_dev *dev)
+{
+	mlx5_blocking_notifier_unregister(dev->mdev, &dev->vfmig_nb);
 }
 
 static int mlx5_ib_stage_delay_drop_init(struct mlx5_ib_dev *dev)
@@ -6228,7 +6265,7 @@ static const struct mlx5_ib_profile pf_profile = {
 		     mlx5_ib_stage_dev_notifier_cleanup),
 	STAGE_CREATE(MLX5_IB_STAGE_POST_IB_REG_UMR,
 		     mlx5_ib_stage_post_ib_reg_umr_init,
-		     NULL),
+		     mlx5_ib_stage_post_ib_reg_umr_cleanup),
 	STAGE_CREATE(MLX5_IB_STAGE_DELAY_DROP,
 		     mlx5_ib_stage_delay_drop_init,
 		     mlx5_ib_stage_delay_drop_cleanup),
@@ -6288,7 +6325,7 @@ const struct mlx5_ib_profile raw_eth_profile = {
 		     mlx5_ib_stage_dev_notifier_cleanup),
 	STAGE_CREATE(MLX5_IB_STAGE_POST_IB_REG_UMR,
 		     mlx5_ib_stage_post_ib_reg_umr_init,
-		     NULL),
+		     mlx5_ib_stage_post_ib_reg_umr_cleanup),
 	STAGE_CREATE(MLX5_IB_STAGE_DELAY_DROP,
 		     mlx5_ib_stage_delay_drop_init,
 		     mlx5_ib_stage_delay_drop_cleanup),
