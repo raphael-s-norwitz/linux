@@ -99,7 +99,9 @@ builds the helpers that need libibverbs.
 
 Helpers: `probes/vfmig_fence` raises and lifts the RX fence, optionally
 with `eth`. `probes/rc_pair` drives RC QP pairs between two ib devices
-from stdin.
+from stdin. `probes/q_counter_room <ibdev>` prints how many more queue
+counters the device can allocate (as root, through DEVX); run on each
+restored VF of a chain, it drops by one per hop while a counter leaks.
 
 ```
 make -C tools/testing/criu_rdma probes

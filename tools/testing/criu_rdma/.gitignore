@@ -3,3 +3,4 @@
 /probes/vfmig_fence
 /probes/rc_pair
 /probes/umr_release_probe
+/probes/q_counter_room
