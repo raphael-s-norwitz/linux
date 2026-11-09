@@ -933,6 +933,9 @@ static void mlx5_ib_dealloc_counters(struct mlx5_ib_dev *dev)
 
 	for (i = 0; i < num_cnt_ports; i++) {
 		if (dev->port[i].cnts.set_id) {
+			mlx5_vfmig_kobj_forget(dev->mdev,
+					       MLX5_VFMIG_KOBJ_Q_COUNTER, i,
+					       dev->port[i].cnts.set_id);
 			MLX5_SET(dealloc_q_counter_in, in, counter_set_id,
 				 dev->port[i].cnts.set_id);
 			mlx5_cmd_exec_in(dev->mdev, dealloc_q_counter, in);
@@ -956,6 +959,45 @@ skip:
 			dev->port[i].cnts.opfcs[j].fc = NULL;
 		}
 	}
+}
+
+/*
+ * On a VF restored by vfmig, LOAD_VHCA_STATE brought back the source's
+ * queue counter for @port, and the restored QPs still count into it. Take
+ * it over rather than allocate another, which would leave the source's
+ * allocated for good.
+ */
+static bool mlx5_ib_vfmig_adopt_q_counter(struct mlx5_ib_dev *dev, u32 port,
+					  u16 *set_id)
+{
+	u32 out[MLX5_ST_SZ_DW(query_q_counter_out)] = {};
+	u32 in[MLX5_ST_SZ_DW(query_q_counter_in)] = {};
+	u32 id;
+	int err;
+
+	if (mlx5_vfmig_kobj_take(dev->mdev, MLX5_VFMIG_KOBJ_Q_COUNTER, port,
+				 &id))
+		return false;
+
+	err = -ERANGE;
+	if (id <= U8_MAX) {
+		MLX5_SET(query_q_counter_in, in, opcode,
+			 MLX5_CMD_OP_QUERY_Q_COUNTER);
+		MLX5_SET(query_q_counter_in, in, counter_set_id, id);
+		err = mlx5_cmd_exec_inout(dev->mdev, query_q_counter, in, out);
+	}
+	if (err) {
+		mlx5_ib_warn(dev,
+			     "vfmig: cannot adopt the source's queue counter 0x%x for port %u, %d; allocating a new one\n",
+			     id, port + 1, err);
+		return false;
+	}
+
+	*set_id = id;
+	mlx5_ib_log(KERN_INFO, dev,
+		    "vfmig: adopted the source's queue counter 0x%x for port %u\n",
+		    id, port + 1);
+	return true;
 }
 
 static int mlx5_ib_alloc_counters(struct mlx5_ib_dev *dev)
@@ -987,19 +1029,32 @@ static int mlx5_ib_alloc_counters(struct mlx5_ib_dev *dev)
 		mlx5_ib_fill_counters(dev, dev->port[i].cnts.descs,
 				      dev->port[i].cnts.offsets, i);
 
-		MLX5_SET(alloc_q_counter_in, in, uid,
-			 is_shared ? MLX5_SHARED_RESOURCE_UID : 0);
+		if (!mlx5_ib_vfmig_adopt_q_counter(dev, i,
+						   &dev->port[i].cnts.set_id)) {
+			MLX5_SET(alloc_q_counter_in, in, uid,
+				 is_shared ? MLX5_SHARED_RESOURCE_UID : 0);
 
-		err = mlx5_cmd_exec_inout(dev->mdev, alloc_q_counter, in, out);
-		if (err) {
-			mlx5_ib_warn(dev,
-				     "couldn't allocate queue counter for port %d, err %d\n",
-				     i + 1, err);
-			goto err_alloc;
+			err = mlx5_cmd_exec_inout(dev->mdev, alloc_q_counter,
+						  in, out);
+			if (err) {
+				mlx5_ib_warn(dev,
+					     "couldn't allocate queue counter for port %d, err %d\n",
+					     i + 1, err);
+				goto err_alloc;
+			}
+
+			dev->port[i].cnts.set_id =
+				MLX5_GET(alloc_q_counter_out, out,
+					 counter_set_id);
 		}
 
-		dev->port[i].cnts.set_id =
-			MLX5_GET(alloc_q_counter_out, out, counter_set_id);
+		err = mlx5_vfmig_kobj_record(dev->mdev,
+					     MLX5_VFMIG_KOBJ_Q_COUNTER, i,
+					     dev->port[i].cnts.set_id);
+		if (err)
+			mlx5_ib_warn(dev,
+				     "vfmig: could not record queue counter 0x%x for port %d, %d; a restore will allocate another\n",
+				     dev->port[i].cnts.set_id, i + 1, err);
 	}
 	return 0;
 
