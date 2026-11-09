@@ -88,6 +88,11 @@ struct vfmig_wire_header {
  *                        restore. M == 0 until the source-side retag
  *                        callsites land, so this record is absent on a
  *                        blob produced before then.
+ *   [HOST_KOBJ]      Kx  one per kernel object a driver on the VF
+ *                        recorded (kind, key, fw id); see "Kernel
+ *                        objects" in vfmig_iova.h. Not counted in the
+ *                        STREAM_HEADER nor folded into its CRC, so a
+ *                        blob with K == 0 is unchanged.
  *   [FW_DATA]        1x  the SAVE_VHCA_STATE firmware blob
  *
  * The HOST_PAGE records are replayed into the destination's per-VF IOVA
@@ -112,6 +117,7 @@ struct vfmig_wire_header {
 #define VFMIG_WIRE_TAG_STREAM_HEADER	0x4853
 #define VFMIG_WIRE_TAG_HOST_PAGE	0x4842
 #define VFMIG_WIRE_TAG_HOST_USER_PAGE	0x4855
+#define VFMIG_WIRE_TAG_HOST_KOBJ	0x484B
 #define VFMIG_HOST_PAGE_MAX_LEN		(16ULL << 20)
 
 struct vfmig_stream_header {
@@ -143,6 +149,18 @@ struct vfmig_host_user_page_record {
 	__le64 instance_key;
 	__le64 iova;
 	__le64 len;
+};
+
+/*
+ * Identity-only record for one kernel object: @kind is an
+ * enum mlx5_vfmig_kobj_kind, @id its non-zero firmware number. @flags
+ * must be zero.
+ */
+struct vfmig_host_kobj_record {
+	__le32 kind;
+	__le32 key;
+	__le32 id;
+	__le32 flags;
 };
 
 /*
@@ -1794,6 +1812,43 @@ static int vfmig_save_hup_emit_cb(u8 kind, u64 fw_id, dma_addr_t iova,
 	return 0;
 }
 
+static int vfmig_save_kobj_count_cb(u8 kind, u32 key, u32 id, void *ctx)
+{
+	u64 *total = ctx;
+
+	*total += sizeof(struct vfmig_wire_header) +
+		  sizeof(struct vfmig_host_kobj_record);
+	return 0;
+}
+
+struct vfmig_save_kobj_emit_ctx {
+	u8 *buf;
+	u64 capacity;
+	u64 cursor;
+};
+
+static int vfmig_save_kobj_emit_cb(u8 kind, u32 key, u32 id, void *ctx)
+{
+	struct vfmig_save_kobj_emit_ctx *ec = ctx;
+	struct vfmig_host_kobj_record sub = {};
+	struct vfmig_wire_header hdr = {};
+
+	if (ec->cursor + sizeof(hdr) + sizeof(sub) > ec->capacity)
+		return -EOVERFLOW;
+
+	hdr.record_size = cpu_to_le64(sizeof(sub));
+	hdr.tag		= cpu_to_le32(VFMIG_WIRE_TAG_HOST_KOBJ);
+	memcpy(ec->buf + ec->cursor, &hdr, sizeof(hdr));
+	ec->cursor += sizeof(hdr);
+
+	sub.kind = cpu_to_le32(kind);
+	sub.key	 = cpu_to_le32(key);
+	sub.id	 = cpu_to_le32(id);
+	memcpy(ec->buf + ec->cursor, &sub, sizeof(sub));
+	ec->cursor += sizeof(sub);
+	return 0;
+}
+
 /*
  * Snapshot the source VF's vfmig_iova_domain registry into @ctx's wire
  * prefix (STREAM_HEADER + N HOST_PAGE records). Owned by
@@ -1812,16 +1867,18 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 	struct vfmig_save_hup_size_ctx sc_hup = {};
 	struct vfmig_save_hp_emit_ctx ec;
 	struct vfmig_save_hup_emit_ctx ec_hup;
+	struct vfmig_save_kobj_emit_ctx ec_kobj;
 	struct vfmig_wire_header sh_hdr;
 	struct vfmig_stream_header sh_payload;
 	const u64 sh_total = sizeof(sh_hdr) + sizeof(sh_payload);
+	u64 kobj_total = 0;
 	u64 buf_total;
 	int err;
 
 	if (!dom)
 		return 0;
 
-	/* Pass 1 + 2: size the HOST_PAGE then HOST_USER_PAGE regions. */
+	/* Size the HOST_PAGE, HOST_USER_PAGE and HOST_KOBJ regions. */
 	err = vfmig_iova_for_each(dom, vfmig_save_hp_count_cb, &sc);
 	if (err)
 		return err;
@@ -1829,8 +1886,12 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 					   &sc_hup);
 	if (err)
 		return err;
+	err = vfmig_iova_kobj_for_each(dom, vfmig_save_kobj_count_cb,
+				       &kobj_total);
+	if (err)
+		return err;
 
-	buf_total = sh_total + sc.total + sc_hup.total;
+	buf_total = sh_total + sc.total + sc_hup.total + kobj_total;
 	ctx->host_pages_buf = kvmalloc(buf_total, GFP_KERNEL);
 	if (!ctx->host_pages_buf)
 		return -ENOMEM;
@@ -1869,6 +1930,18 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 	if (err)
 		goto err_free;
 	if (WARN_ON(ec_hup.cursor != sc_hup.total)) {
+		err = -EIO;
+		goto err_free;
+	}
+
+	ec_kobj.buf	 = (u8 *)ctx->host_pages_buf + sh_total + sc.total +
+			   sc_hup.total;
+	ec_kobj.capacity = kobj_total;
+	ec_kobj.cursor	 = 0;
+	err = vfmig_iova_kobj_for_each(dom, vfmig_save_kobj_emit_cb, &ec_kobj);
+	if (err)
+		goto err_free;
+	if (WARN_ON(ec_kobj.cursor != kobj_total)) {
 		err = -EIO;
 		goto err_free;
 	}
@@ -2384,6 +2457,7 @@ enum vfmig_load_state {
 	VFMIG_LS_HP_REPLAY,		/* replaying the HOST_PAGE into the domain */
 	VFMIG_LS_HUP_READ_SUBHDR,	/* reading a HOST_USER_PAGE sub-header */
 	VFMIG_LS_HUP_REPLAY,		/* replaying the HOST_USER_PAGE placeholder */
+	VFMIG_LS_KOBJ_READ,		/* reading + replaying a HOST_KOBJ record */
 	VFMIG_LS_PREP_IMAGE,		/* allocate staging for the payload */
 	VFMIG_LS_READ_IMAGE,		/* accumulating the FW_DATA payload */
 	VFMIG_LS_LOAD_IMAGE,		/* payload complete, run LOAD */
@@ -2472,6 +2546,10 @@ struct mlx5_vfmig_load_ctx {
 	u64 hup_instance_key;
 	u64 hup_iova;
 	u64 hup_len;
+
+	/* HOST_KOBJ record being read (VFMIG_LS_KOBJ_READ). */
+	u8  kobj_buf[sizeof(struct vfmig_host_kobj_record)];
+	u32 kobj_filled;
 
 	/* Firmware-tied resources, mutated under vfmig->lock. */
 	bool resources_freed;
@@ -2709,6 +2787,20 @@ static int vfmig_load_dispatch_header(struct mlx5_vfmig_load_ctx *ctx)
 		}
 		ctx->hup_subhdr_filled = 0;
 		ctx->state = VFMIG_LS_HUP_READ_SUBHDR;
+		return 0;
+	case VFMIG_WIRE_TAG_HOST_KOBJ:
+		if (!ctx->iova_dom || !ctx->records_finalized) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: HOST_KOBJ record %s; aborting LOAD\n",
+				       ctx->vf_id, !ctx->iova_dom ?
+				       "but destination not SET_TRACKED'd" :
+				       "before the HOST_PAGE records");
+			return -EPROTO;
+		}
+		if (record_size != sizeof(struct vfmig_host_kobj_record))
+			return -EINVAL;
+		ctx->kobj_filled = 0;
+		ctx->state = VFMIG_LS_KOBJ_READ;
 		return 0;
 	case VFMIG_WIRE_TAG_FW_DATA:
 		if (ctx->image_staged) {
@@ -3198,6 +3290,50 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 		err = vfmig_load_maybe_finalize_records(ctx);
 		if (err)
 			return err;
+
+		ctx->state = VFMIG_LS_READ_HEADER;
+		*progressed = true;
+		return 0;
+	}
+	case VFMIG_LS_KOBJ_READ: {
+		size_t take = min(sizeof(ctx->kobj_buf) - ctx->kobj_filled,
+				  *left);
+		struct vfmig_host_kobj_record rec;
+		u32 kind, key, id;
+
+		if (take) {
+			if (copy_from_user(ctx->kobj_buf + ctx->kobj_filled,
+					   *ubuf, take))
+				return -EFAULT;
+			ctx->kobj_filled += take;
+			*ubuf += take;
+			*left -= take;
+			*progressed = true;
+		}
+		if (ctx->kobj_filled < sizeof(ctx->kobj_buf))
+			return 0;
+
+		memcpy(&rec, ctx->kobj_buf, sizeof(rec));
+		kind = le32_to_cpu(rec.kind);
+		key  = le32_to_cpu(rec.key);
+		id   = le32_to_cpu(rec.id);
+		if (rec.flags || !kind || kind >= MLX5_VFMIG_KOBJ_NR || !id) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: malformed HOST_KOBJ kind %u key %u id 0x%x flags 0x%x\n",
+				       ctx->vf_id, kind, key, id,
+				       le32_to_cpu(rec.flags));
+			return -EPROTO;
+		}
+		err = vfmig_iova_kobj_replay(ctx->iova_dom, kind, key, id);
+		if (err) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: replaying HOST_KOBJ kind %u key %u id 0x%x failed: %d\n",
+				       ctx->vf_id, kind, key, id, err);
+			return err;
+		}
+		mlx5_core_dbg(ctx->vfmig->pf_mdev,
+			      "vfmig: vf %u: replayed HOST_KOBJ kind %u key %u id 0x%x\n",
+			      ctx->vf_id, kind, key, id);
 
 		ctx->state = VFMIG_LS_READ_HEADER;
 		*progressed = true;
@@ -4380,6 +4516,36 @@ int mlx5_vfmig_retag_user_mr(struct mlx5_core_dev *vf_dev, u32 mkey_index,
 	return err;
 }
 EXPORT_SYMBOL(mlx5_vfmig_retag_user_mr);
+
+/* Kernel-object helpers; documented in include/linux/mlx5/driver.h. */
+int mlx5_vfmig_kobj_record(struct mlx5_core_dev *vf_dev,
+			   enum mlx5_vfmig_kobj_kind kind, u32 key, u32 id)
+{
+	struct vfmig_iova_domain *dom = vf_dev->cmd.vfmig_iova_dom;
+
+	if (!dom)
+		return 0;
+	return vfmig_iova_kobj_set(dom, kind, key, id);
+}
+EXPORT_SYMBOL(mlx5_vfmig_kobj_record);
+
+void mlx5_vfmig_kobj_forget(struct mlx5_core_dev *vf_dev,
+			    enum mlx5_vfmig_kobj_kind kind, u32 key, u32 id)
+{
+	vfmig_iova_kobj_clear(vf_dev->cmd.vfmig_iova_dom, kind, key, id);
+}
+EXPORT_SYMBOL(mlx5_vfmig_kobj_forget);
+
+int mlx5_vfmig_kobj_take(struct mlx5_core_dev *vf_dev,
+			 enum mlx5_vfmig_kobj_kind kind, u32 key, u32 *id)
+{
+	struct vfmig_iova_domain *dom = vf_dev->cmd.vfmig_iova_dom;
+
+	if (!dom || !mlx5_vf_is_restored(vf_dev))
+		return -ENOENT;
+	return vfmig_iova_kobj_take(dom, kind, key, id);
+}
+EXPORT_SYMBOL(mlx5_vfmig_kobj_take);
 
 /*
  * Public destination-side bind entry point for the mlx5_ib RESTORE_MR

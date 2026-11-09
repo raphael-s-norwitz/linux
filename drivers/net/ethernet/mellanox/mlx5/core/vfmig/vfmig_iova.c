@@ -105,6 +105,15 @@ struct vfmig_iova_page {
 	struct rb_node	 user_index_node;
 };
 
+/* One kernel-object entry; see "Kernel objects" in vfmig_iova.h. */
+struct vfmig_iova_kobj {
+	struct list_head node;	/* dom->kobjs */
+	u8		 kind;
+	bool		 replayed;
+	u32		 key;
+	u32		 id;
+};
+
 /*
  * A per-VF fixed-IOVA arena reserved inside the VF's managed DMA-IOMMU
  * domain. The VF keeps its default (dma-iommu-managed) domain, so its
@@ -173,6 +182,9 @@ struct vfmig_iova_domain {
 	 */
 	u32		     expected_count[VFMIG_IOVA_NR_SLOTS];
 	bool		     drift_armed;
+
+	struct list_head     kobjs;	/* of vfmig_iova_kobj */
+	unsigned int	     n_kobjs;
 };
 
 static inline u64
@@ -527,6 +539,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 
 	mutex_init(&dom->lock);
 	INIT_LIST_HEAD(&dom->pages);
+	INIT_LIST_HEAD(&dom->kobjs);
 	dom->user_index = RB_ROOT;
 	atomic_long_set(&dom->awaiting_bind_hits, 0);
 	dom->vf_id = vf_id;
@@ -603,6 +616,7 @@ unsigned int vfmig_iova_nr_pages(struct vfmig_iova_domain *dom)
 
 void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 {
+	struct vfmig_iova_kobj *k, *ktmp;
 	struct vfmig_iova_page *p, *tmp;
 	struct pci_dev *vf_pdev;
 	bool arena_live;
@@ -640,6 +654,11 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 		vfmig_iova_destroy_page_locked(dom, p, arena_live);
 	}
 	dom->n_pages = 0;
+	list_for_each_entry_safe(k, ktmp, &dom->kobjs, node) {
+		list_del(&k->node);
+		kfree(k);
+	}
+	dom->n_kobjs = 0;
 	if (arena_live)
 		dma_iova_free_fixed(&vf_pdev->dev, &dom->arena);
 	mutex_unlock(&dom->lock);
@@ -1655,6 +1674,137 @@ int vfmig_iova_for_each_external(struct vfmig_iova_domain *dom,
 		ret = cb(VFMIG_HUOBJ_KIND(p->instance_key),
 			 VFMIG_HUOBJ_FWID(p->instance_key),
 			 p->iova, p->len, ctx);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&dom->lock);
+	return ret;
+}
+
+/* Caller holds @dom->lock. */
+static struct vfmig_iova_kobj *
+vfmig_iova_kobj_find_locked(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			    bool replayed)
+{
+	struct vfmig_iova_kobj *k;
+
+	list_for_each_entry(k, &dom->kobjs, node)
+		if (k->kind == kind && k->key == key && k->replayed == replayed)
+			return k;
+	return NULL;
+}
+
+/* Caller holds @dom->lock. */
+static int vfmig_iova_kobj_add_locked(struct vfmig_iova_domain *dom, u8 kind,
+				      u32 key, u32 id, bool replayed)
+{
+	struct vfmig_iova_kobj *k;
+
+	if (dom->n_kobjs >= VFMIG_IOVA_MAX_KOBJS)
+		return -ENOSPC;
+	k = kzalloc(sizeof(*k), GFP_KERNEL);
+	if (!k)
+		return -ENOMEM;
+	k->kind = kind;
+	k->key = key;
+	k->id = id;
+	k->replayed = replayed;
+	list_add_tail(&k->node, &dom->kobjs);
+	dom->n_kobjs++;
+	return 0;
+}
+
+int vfmig_iova_kobj_set(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			u32 id)
+{
+	struct vfmig_iova_kobj *k;
+	int err = 0;
+
+	if (!dom || !kind || !id)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	k = vfmig_iova_kobj_find_locked(dom, kind, key, false);
+	if (k)
+		k->id = id;
+	else
+		err = vfmig_iova_kobj_add_locked(dom, kind, key, id, false);
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+void vfmig_iova_kobj_clear(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			   u32 id)
+{
+	struct vfmig_iova_kobj *k;
+
+	if (!dom)
+		return;
+
+	mutex_lock(&dom->lock);
+	k = vfmig_iova_kobj_find_locked(dom, kind, key, false);
+	if (k && k->id == id) {
+		list_del(&k->node);
+		dom->n_kobjs--;
+		kfree(k);
+	}
+	mutex_unlock(&dom->lock);
+}
+
+int vfmig_iova_kobj_replay(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			   u32 id)
+{
+	int err;
+
+	if (!dom || !kind || !id)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	if (vfmig_iova_kobj_find_locked(dom, kind, key, true) ||
+	    vfmig_iova_kobj_find_locked(dom, kind, key, false))
+		err = -EEXIST;
+	else
+		err = vfmig_iova_kobj_add_locked(dom, kind, key, id, true);
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+int vfmig_iova_kobj_take(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			 u32 *id)
+{
+	struct vfmig_iova_kobj *k;
+	int err = -ENOENT;
+
+	if (!dom || !id)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	k = vfmig_iova_kobj_find_locked(dom, kind, key, true);
+	if (k) {
+		*id = k->id;
+		list_del(&k->node);
+		dom->n_kobjs--;
+		kfree(k);
+		err = 0;
+	}
+	mutex_unlock(&dom->lock);
+	return err;
+}
+
+int vfmig_iova_kobj_for_each(struct vfmig_iova_domain *dom,
+			     vfmig_iova_kobj_fn cb, void *ctx)
+{
+	struct vfmig_iova_kobj *k;
+	int ret = 0;
+
+	if (!dom || !cb)
+		return -EINVAL;
+
+	mutex_lock(&dom->lock);
+	list_for_each_entry(k, &dom->kobjs, node) {
+		if (k->replayed)
+			continue;
+		ret = cb(k->kind, k->key, k->id, ctx);
 		if (ret)
 			break;
 	}

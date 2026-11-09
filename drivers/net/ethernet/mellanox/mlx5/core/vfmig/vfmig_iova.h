@@ -515,6 +515,57 @@ void vfmig_iova_reset_cursor(struct vfmig_iova_domain *dom);
  */
 void vfmig_iova_arm_drift_detection(struct vfmig_iova_domain *dom);
 
+/*
+ * Kernel objects. A driver on the VF may own firmware objects that have
+ * no host memory, so no registry page can carry their number (a queue
+ * counter, for example). SAVE carries them in the VHCA state all the
+ * same, and a destination that allocates its own instead leaks the
+ * loaded copy. @dom therefore also keeps a (kind, key) -> firmware id
+ * table, which SAVE emits as identity-only HOST_KOBJ records and LOAD
+ * replays, so the destination's driver can take the source's object over.
+ *
+ * Entries the driver records are live; replayed entries wait for the
+ * destination's driver to take them. Only live entries are saved, and a
+ * (kind, key) has at most one of each. @kind is an
+ * enum mlx5_vfmig_kobj_kind; @id is never 0.
+ */
+#define VFMIG_IOVA_MAX_KOBJS	64
+
+/*
+ * Record the live (@kind, @key) -> @id mapping, replacing an existing
+ * one. Returns 0, -ENOSPC when the table is full, -ENOMEM, or -EINVAL.
+ */
+int  vfmig_iova_kobj_set(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			 u32 id);
+
+/* Drop the live (@kind, @key) entry if it maps to @id. */
+void vfmig_iova_kobj_clear(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			   u32 id);
+
+/*
+ * Replay one HOST_KOBJ record. Returns 0, -EEXIST if (@kind, @key) is
+ * already present, -ENOSPC when the table is full, -ENOMEM, or -EINVAL.
+ */
+int  vfmig_iova_kobj_replay(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			    u32 id);
+
+/*
+ * Remove the replayed (@kind, @key) entry and return its @id. The caller
+ * records the id it ends up using with vfmig_iova_kobj_set(). Returns 0
+ * or -ENOENT.
+ */
+int  vfmig_iova_kobj_take(struct vfmig_iova_domain *dom, u8 kind, u32 key,
+			  u32 *id);
+
+typedef int (*vfmig_iova_kobj_fn)(u8 kind, u32 key, u32 id, void *ctx);
+
+/*
+ * Call @cb for each live entry, in insertion order, with @dom->lock held.
+ * Returns 0 or the first non-zero @cb return.
+ */
+int  vfmig_iova_kobj_for_each(struct vfmig_iova_domain *dom,
+			      vfmig_iova_kobj_fn cb, void *ctx);
+
 #else /* !CONFIG_MLX5_VFMIG */
 
 /*
