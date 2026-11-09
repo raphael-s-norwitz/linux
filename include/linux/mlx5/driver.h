@@ -1579,6 +1579,59 @@ mlx5_vfmig_bind_user_dbr(struct mlx5_core_dev *vf_dev,
 }
 #endif
 
+/*
+ * Firmware objects a driver on a tracked VF owns that have no host memory.
+ * SAVE_VHCA_STATE carries them, so a destination that allocates its own
+ * leaks the source's. The values go on the SAVE stream: append only.
+ */
+enum mlx5_vfmig_kobj_kind {
+	MLX5_VFMIG_KOBJ_Q_COUNTER = 1,	/* key: port index; id: counter_set_id */
+	MLX5_VFMIG_KOBJ_NR,
+};
+
+/*
+ * mlx5_vfmig_kobj_record - note that the driver owns firmware object @id
+ * as (@kind, @key), so that SAVE carries the mapping to the destination.
+ * Replaces an earlier @id for the same (@kind, @key). A no-op returning 0
+ * on a VF that is not tracked. Otherwise returns 0 or a negative errno;
+ * on failure the object still works but a restore will allocate another.
+ *
+ * mlx5_vfmig_kobj_forget - drop the mapping when the driver frees @id.
+ *
+ * mlx5_vfmig_kobj_take - on a restored VF, return the id the source
+ * recorded for (@kind, @key) and consume it. The caller checks the object
+ * is usable and records whichever id it ends up with. Returns 0, or
+ * -ENOENT when there is nothing to take over.
+ */
+#if IS_ENABLED(CONFIG_MLX5_VFMIG)
+int mlx5_vfmig_kobj_record(struct mlx5_core_dev *vf_dev,
+			   enum mlx5_vfmig_kobj_kind kind, u32 key, u32 id);
+void mlx5_vfmig_kobj_forget(struct mlx5_core_dev *vf_dev,
+			    enum mlx5_vfmig_kobj_kind kind, u32 key, u32 id);
+int mlx5_vfmig_kobj_take(struct mlx5_core_dev *vf_dev,
+			 enum mlx5_vfmig_kobj_kind kind, u32 key, u32 *id);
+#else
+static inline int
+mlx5_vfmig_kobj_record(struct mlx5_core_dev *vf_dev,
+		       enum mlx5_vfmig_kobj_kind kind, u32 key, u32 id)
+{
+	return 0;
+}
+
+static inline void
+mlx5_vfmig_kobj_forget(struct mlx5_core_dev *vf_dev,
+		       enum mlx5_vfmig_kobj_kind kind, u32 key, u32 id)
+{
+}
+
+static inline int
+mlx5_vfmig_kobj_take(struct mlx5_core_dev *vf_dev,
+		     enum mlx5_vfmig_kobj_kind kind, u32 key, u32 *id)
+{
+	return -ENOENT;
+}
+#endif
+
 int mlx5_sriov_blocking_notifier_register(struct mlx5_core_dev *mdev,
 					  int vf_id,
 					  struct notifier_block *nb);
