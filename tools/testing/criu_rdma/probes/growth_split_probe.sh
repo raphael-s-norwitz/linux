@@ -16,6 +16,8 @@
 #   linkdown as full, but "ip link set down" the source's netdev before each
 #            SAVE (userspace only; mlx5e closes its channels but keeps
 #            TIRs, RQT, flow tables, TIS, PD and TD)
+# With mlx5_ib bound and probes/q_counter_room built ("make probes"), each
+# generation also prints qc_room, the queue counters the VF has left.
 # Run: sudo tools/testing/criu_rdma/probes/growth_split_probe.sh
 #      sudo MODES="full dropeth" GENS=4 tools/testing/criu_rdma/probes/growth_split_probe.sh
 PF=${PF:-0000:08:00.0}
@@ -111,6 +113,12 @@ objs() {	# vf_id
 	     "net=$(ls /sys/bus/pci/devices/$(bdf_of $1)/net 2>/dev/null | tr '\n' ' ')"
 }
 
+q_room() {	# vf_id: queue counters the VF can still allocate
+	local ib=$(ls /sys/bus/pci/devices/$(bdf_of $1)/infiniband 2>/dev/null | head -1)
+	[ -n "$ib" ] && [ -x $HERE/q_counter_room ] || return
+	echo "qc_room=$($HERE/q_counter_room $ib 2>/dev/null | sed -n 's/.*room for \([0-9]*\) .*/\1/p')"
+}
+
 save() {	# vf_id mode -> prints size
 	[ "$2" = dropeth ] && unbind_eth $1
 	if [ "$2" = suspendeth ]; then
@@ -141,6 +149,7 @@ for mode in $MODES; do
 	for g in $(seq 0 $GENS); do
 		o="$(objs $cur)"
 		case $mode in full|dropeth|suspendeth|linkdown) o="$o $(port_state $cur)" ;; esac
+		o="$o $(q_room $cur)"
 		sz=$(save $cur $mode) || { echo "   SAVE vf $cur FAILED (gen $g)"; break; }
 		d=
 		[ -n "$prev" ] && { d=$((sz - prev)); deltas="$deltas $d"; d=" (+$d)"; }
