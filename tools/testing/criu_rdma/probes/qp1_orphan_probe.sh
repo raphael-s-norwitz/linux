@@ -18,7 +18,9 @@
 #            it, lift the carried fence, give it $IP_A. Rebind VF 1 as the
 #            peer in $NS_B with $IP_B.
 #   hazard   Send $COUNT RDMA CM connects (rping -c) from the peer to the
-#            restored VF. They go to QPN 1, the orphan. Report rping's
+#            restored VF, through a permanent neighbor entry since the
+#            restored VF has TX disabled and does not answer ARP. They go
+#            to QPN 1, the orphan. Nothing answers. Report rping's
 #            result, the restored port's receive counters, and dmesg
 #            IOMMU faults, "bogus CQ" completion events (enabled through
 #            dynamic debug for the run) and mlx5 errors.
@@ -149,8 +151,7 @@ report_dmesg() {	# phase
 	note "IOMMU faults:        $(grep -cE "$IOMMU_RE" <<<"$d")"
 	note "bogus CQ events:     $(grep -cE "$BOGUS_RE" <<<"$d") (dynamic debug $DYNDBG)"
 	note "mlx5 errors/WARNs:   $(grep -cE "$ERR_RE" <<<"$d")"
-	grep -E "$IOMMU_RE|$BOGUS_RE|$ERR_RE|vfmig" <<<"$d" | grep -v 'arena reserved' | tail -25 \
-		| sed 's/^/    dmesg: /'
+	grep -E "$IOMMU_RE|$BOGUS_RE|$ERR_RE" <<<"$d" | head -40 | sed 's/^/    dmesg: /'
 }
 
 # One rping connect from the peer netns to IP_A. Against the restored VF
@@ -218,7 +219,12 @@ note "restored: vf 0 $BDF_0 $IB_R $NET_R $IP_A port=$(port_state "$IB_R")" \
      "driver QPs=$(ls /sys/kernel/debug/mlx5/$BDF_0/QPs 2>/dev/null | wc -l)" \
      "CQs=$(ls /sys/kernel/debug/mlx5/$BDF_0/CQs 2>/dev/null | wc -l)"
 peer_up 1 || exit 1
-ip netns exec "$NS_B" ping -c 2 -W 2 "$IP_A" >/dev/null && note "ping peer -> restored ok" || note "ping peer -> restored FAILED"
+# The restored VF has TX disabled, so it never answers ARP (nor a ping):
+# give the peer its MAC, and the CM REQs go out without an ARP reply.
+MAC_R="$(cat "/sys/class/net/$NET_R/address")"
+NET_P="$(ip -n "$NS_B" -br link show | awk '$1 != "lo" {print $1; exit}')"
+ip -n "$NS_B" neigh replace "$IP_A" lladdr "$MAC_R" dev "$NET_P" nud permanent \
+	&& note "peer neighbor $IP_A -> $MAC_R on $NET_P" || note "peer neighbor entry FAILED"
 report_dmesg restore
 
 # ---------------------------------------------------------------- hazard
@@ -227,7 +233,6 @@ note "restored before: $(counters "$IB_R")"
 for i in $(seq 1 "$COUNT"); do cm_connect "hazard connect $i"; done
 sleep 2
 note "restored after:  $(counters "$IB_R")"
-ip netns exec "$NS_B" ping -c 2 -W 2 "$IP_A" >/dev/null && note "ping peer -> restored still ok" || note "ping peer -> restored FAILED after the connects"
 report_dmesg hazard
 
 # ---------------------------------------------------------------- teardown
