@@ -593,6 +593,18 @@ static int destroy_unmap_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq)
 		mlx5_core_warn(dev, "failed to destroy a previously created eq: eqn %d\n",
 			       eq->eqn);
 
+	/*
+	 * Firmware keeps an EQ it refused to destroy and may still write to
+	 * it until the function is disabled. On a tracked VF leave the pages
+	 * in the VF's vfmig domain, which frees them only once the VF is
+	 * recycled, untracked or removed.
+	 */
+	if (err && eq->frag_buf.vfmig_slot != VFMIG_SLOT_INVALID) {
+		kfree(eq->frag_buf.frags);
+		eq->frag_buf.frags = NULL;
+		return err;
+	}
+
 	mlx5_frag_buf_free(dev, &eq->frag_buf);
 	return err;
 }
