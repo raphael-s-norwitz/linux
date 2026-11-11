@@ -95,7 +95,8 @@ builds the helpers that need libibverbs.
 - `probes/qp1_orphan_probe.sh` -- sends RDMA CM connects to a restored
   VF, which land on the source's QP1, and reports IOMMU faults, "bogus
   CQ" completion events and mlx5 errors in dmesg, with a control run
-  against the source first. Needs `rping`.
+  against the source first. Needs `rping`. Findings and fix options are in
+  `design/orphan_qp1.md`.
 - `probes/criu_dropeth_gate.sh` -- a CRIU dump and restore of a
   self-loop RC QP, with the source's mlx5e unbound or suspended
   (`CRIU_REPO=...`). It has since been ported to the CRIU tree as
