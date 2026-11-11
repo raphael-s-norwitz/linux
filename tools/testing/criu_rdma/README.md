@@ -92,6 +92,10 @@ builds the helpers that need libibverbs.
 - `probes/eth_unbind_questions.sh` -- RC traffic between VF 0 and VF 1,
   with VF 1 in its own namespace, across an mlx5e unbind or suspend, the
   RX fence, and RECYCLE_VF.
+- `probes/qp1_orphan_probe.sh` -- sends RDMA CM connects to a restored
+  VF, which land on the source's QP1, and reports IOMMU faults, "bogus
+  CQ" completion events and mlx5 errors in dmesg, with a control run
+  against the source first. Needs `rping`.
 - `probes/criu_dropeth_gate.sh` -- a CRIU dump and restore of a
   self-loop RC QP, with the source's mlx5e unbound or suspended
   (`CRIU_REPO=...`). It has since been ported to the CRIU tree as
