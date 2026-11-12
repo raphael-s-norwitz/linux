@@ -549,6 +549,7 @@ finish:
 }
 EXPORT_SYMBOL_GPL(reserve_iova);
 
+#ifdef CONFIG_IOMMU_DMA_FIXED_IOVA
 /**
  * alloc_iova_fixed - reserve an exact, caller-specified iova range
  * @iovad: - iova domain in question
@@ -596,6 +597,7 @@ out:
 	return ret;
 }
 EXPORT_SYMBOL_GPL(alloc_iova_fixed);
+#endif /* CONFIG_IOMMU_DMA_FIXED_IOVA */
 
 /*
  * Magazine caches for IOVA ranges.  For an introduction to magazines,

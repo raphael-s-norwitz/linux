@@ -1853,6 +1853,7 @@ void dma_iova_free(struct device *dev, struct dma_iova_state *state)
 }
 EXPORT_SYMBOL_GPL(dma_iova_free);
 
+#ifdef CONFIG_IOMMU_DMA_FIXED_IOVA
 /**
  * dma_iova_alloc_fixed - Reserve a caller-chosen IOVA range
  * @dev: Device to reserve the IOVA space for
@@ -1934,6 +1935,7 @@ void dma_iova_free_fixed(struct device *dev, struct dma_iova_state *state)
 	memset(state, 0, sizeof(*state));
 }
 EXPORT_SYMBOL_GPL(dma_iova_free_fixed);
+#endif /* CONFIG_IOMMU_DMA_FIXED_IOVA */
 
 static int __dma_iova_link(struct device *dev, dma_addr_t addr,
 		phys_addr_t phys, size_t size, enum dma_data_direction dir,

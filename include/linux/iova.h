@@ -97,7 +97,6 @@ unsigned long alloc_iova_fast(struct iova_domain *iovad, unsigned long size,
 			      unsigned long limit_pfn, bool flush_rcache);
 struct iova *reserve_iova(struct iova_domain *iovad, unsigned long pfn_lo,
 	unsigned long pfn_hi);
-int alloc_iova_fixed(struct iova_domain *iovad, unsigned long pfn_lo, unsigned long pfn_hi);
 void init_iova_domain(struct iova_domain *iovad, unsigned long granule,
 	unsigned long start_pfn);
 int iova_domain_init_rcaches(struct iova_domain *iovad);
@@ -150,13 +149,6 @@ static inline struct iova *reserve_iova(struct iova_domain *iovad,
 	return NULL;
 }
 
-static inline int alloc_iova_fixed(struct iova_domain *iovad,
-				   unsigned long pfn_lo,
-				   unsigned long pfn_hi)
-{
-	return -EOPNOTSUPP;
-}
-
 static inline void init_iova_domain(struct iova_domain *iovad,
 				    unsigned long granule,
 				    unsigned long start_pfn)
@@ -173,6 +165,17 @@ static inline void put_iova_domain(struct iova_domain *iovad)
 {
 }
 
+#endif
+
+#if IS_REACHABLE(CONFIG_IOMMU_IOVA) && IS_ENABLED(CONFIG_IOMMU_DMA_FIXED_IOVA)
+int alloc_iova_fixed(struct iova_domain *iovad, unsigned long pfn_lo, unsigned long pfn_hi);
+#else
+static inline int alloc_iova_fixed(struct iova_domain *iovad,
+				   unsigned long pfn_lo,
+				   unsigned long pfn_hi)
+{
+	return -EOPNOTSUPP;
+}
 #endif
 
 #endif

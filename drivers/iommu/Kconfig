@@ -158,6 +158,19 @@ config IOMMU_DMA
 	select NEED_SG_DMA_LENGTH
 	select NEED_SG_DMA_FLAGS if SWIOTLB
 
+config IOMMU_DMA_FIXED_IOVA
+	bool "Caller-chosen IOVA reservations in DMA-IOMMU domains"
+	depends on IOMMU_DMA
+	help
+	  Adds dma_iova_alloc_fixed() and dma_iova_free_fixed(), which
+	  reserve an exact IOVA range in a device's DMA-IOMMU domain for
+	  later dma_iova_link() calls, and the alloc_iova_fixed() iova-layer
+	  primitive under them. A driver uses them to keep device-visible
+	  addresses stable across a migration, for example the mlx5 vfmig
+	  carveout. Without this option the calls return -EOPNOTSUPP.
+
+	  If unsure, say N.
+
 # Shared Virtual Addressing
 config IOMMU_SVA
 	select IOMMU_MM_DATA
