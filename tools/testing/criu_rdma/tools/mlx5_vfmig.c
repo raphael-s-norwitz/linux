@@ -11,7 +11,7 @@
  *   mlx5_vfmig <pf-bdf> list
  *   mlx5_vfmig <pf-bdf> query_vf          <vf_id>
  *   mlx5_vfmig <pf-bdf> get_vhca_id       <vf_id>
- *   mlx5_vfmig <pf-bdf> set_tracked       <vf_id> <0|1>
+ *   mlx5_vfmig <pf-bdf> set_tracked       <vf_id> <0|1> [pasid=<n>]
  *   mlx5_vfmig <pf-bdf> enable_migratable <vf_id>
  *   mlx5_vfmig <pf-bdf> set_vf_uuid       <vf_id> <uuid-string>
  *   mlx5_vfmig <pf-bdf> clear_vf_uuid     <vf_id> <expected-uuid-string>
@@ -55,19 +55,53 @@ static int do_enable_migratable(int fd, unsigned int vf_id)
 	return 0;
 }
 
-static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
+/*
+ * Enabling without @pasid asks for the carveout window, so scripts that
+ * predate the PASID window keep their behaviour; the kernel's default
+ * (flags 0) is the PASID window and needs a PASID.
+ */
+static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable,
+			  unsigned int pasid)
 {
 	struct mlx5_vfmig_set_tracked arg = {
 		.vf_id  = vf_id,
-		.enable = enable ? 1 : 0,
+		.enable = enable,
+		.flags  = (enable && !pasid) ? MLX5_VFMIG_TRACK_F_CARVEOUT : 0,
+		.pasid  = pasid,
 	};
 
 	if (ioctl(fd, MLX5_VFMIG_IOC_SET_TRACKED, &arg) < 0) {
-		perror("SET_TRACKED");
+		if (errno == EOPNOTSUPP)
+			fprintf(stderr,
+				"vf %u: the %s window is not built into this kernel (see dmesg)\n",
+				vf_id, pasid ? "PASID" : "carveout");
+		else
+			perror("SET_TRACKED");
 		return 1;
 	}
-	printf("vf %u: vfmig tracked=%u (call before driver bind)\n",
-	       vf_id, arg.enable);
+	if (!enable)
+		printf("vf %u: vfmig tracked=0\n", vf_id);
+	else if (pasid)
+		printf("vf %u: vfmig tracked=1 window=pasid pasid=0x%x (call before driver bind)\n",
+		       vf_id, pasid);
+	else
+		printf("vf %u: vfmig tracked=1 window=carveout (call before driver bind)\n",
+		       vf_id);
+	return 0;
+}
+
+/* "pasid=<n>", n non-zero, in any base strtoul() accepts. */
+static int parse_pasid(const char *s, unsigned int *out)
+{
+	unsigned long v;
+	char *end;
+
+	if (strncmp(s, "pasid=", 6) || !s[6])
+		return -1;
+	v = strtoul(s + 6, &end, 0);
+	if (*end || !v || v > 0xffffffffUL)
+		return -1;
+	*out = (unsigned int)v;
 	return 0;
 }
 
@@ -542,7 +576,7 @@ static void usage(const char *argv0)
 		"  list\n"
 		"  query_vf          <vf_id>\n"
 		"  get_vhca_id       <vf_id>\n"
-		"  set_tracked       <vf_id> <0|1>\n"
+		"  set_tracked       <vf_id> <0|1> [pasid=<n>]\n"
 		"  enable_migratable <vf_id>\n"
 		"  set_vf_uuid       <vf_id> <uuid-string>\n"
 		"  clear_vf_uuid     <vf_id> <expected-uuid-string>\n"
@@ -598,9 +632,17 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_get(fd, vf_id);
 	} else if (verb_eq(verb, "set_tracked")) {
-		if (argc != 5)
+		unsigned int enable, pasid = 0;
+		char *end;
+
+		if (argc != 5 && argc != 6)
 			goto badargs;
-		ret = do_set_tracked(fd, vf_id, strtoul(argv[4], NULL, 0));
+		enable = strtoul(argv[4], &end, 0);
+		if (*end || enable > 1)
+			goto badargs;
+		if (argc == 6 && (!enable || parse_pasid(argv[5], &pasid)))
+			goto badargs;
+		ret = do_set_tracked(fd, vf_id, enable, pasid);
 	} else if (verb_eq(verb, "enable_migratable")) {
 		if (argc != 4)
 			goto badargs;

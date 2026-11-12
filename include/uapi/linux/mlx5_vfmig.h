@@ -159,43 +159,51 @@ struct mlx5_vfmig_enable_migratable {
 
 /*
  * MLX5_VFMIG_IOC_SET_TRACKED:
- *   Toggle "vfmig owns this VF's address space" for VF @vf_id. With
- *   @enable=1 the driver allocates an unmanaged paging iommu_domain and
- *   attaches it to the VF in place of its default DMA domain, staking out
- *   a deterministic per-VF IOVA window; @enable=0 detaches and frees it,
- *   restoring the default DMA domain. QUERY_VF reports the resulting
- *   state in @tracked.
+ *   Toggle "vfmig owns this VF's fixed IOVAs" for VF @vf_id. With
+ *   @enable=1 the driver sets up the per-VF IOVA window that the VF's
+ *   migratable buffers are mapped into at deterministic addresses, so a
+ *   restore host can reproduce the IOVAs a SAVE captured inside the
+ *   firmware blob; @enable=0 tears it down. QUERY_VF reports the
+ *   resulting state in @tracked.
  *
- *   This is the foundation for reproducing, on a restore host, the exact
- *   IOVAs a SAVE captured inside the firmware blob. The deterministic
- *   allocator and the SAVE/LOAD page replay that populate the domain land
- *   in later kernels; on its own this command only creates/destroys the
- *   domain.
+ *   The window lives in one of two places, chosen by @flags:
+ *     0                        (default) a paging domain of its own,
+ *                              attached to the VF at PASID @pasid, which
+ *                              the orchestrator chooses and keeps the
+ *                              same across hosts. The VF's default DMA
+ *                              domain is not touched. Needs a kernel
+ *                              built with CONFIG_MLX5_VFMIG_IOVA_PASID.
+ *     MLX5_VFMIG_TRACK_F_CARVEOUT  a reserved carveout of the VF's
+ *                              default DMA-IOMMU domain; @pasid must be
+ *                              0. Needs CONFIG_MLX5_VFMIG_IOVA_CARVEOUT.
  *
- *   The VF MUST be unbound (no driver attached) -- both because a bound
- *   driver's DMA mappings live in the domain being replaced, and because
- *   while our unmanaged domain is attached the VF has no working
- *   dma_alloc_coherent() until the allocator routing lands. Enable it
- *   before binding the workload; the state is cleared on SR-IOV teardown
- *   (sriov_numvfs=0) and PF unload.
+ *   The VF MUST be unbound (no driver attached): the window has to exist
+ *   before the VF's first DMA. Enable it before binding the workload; the
+ *   state is cleared on SR-IOV teardown (sriov_numvfs=0) and PF unload.
  *
  *   Idempotent: a toggle to the state the VF is already in is a no-op
  *   (returns 0, no iommu traffic).
  *
  *   Errors:
  *     -EFAULT     copy_from_user.
- *     -EINVAL     @vf_id out of range, @enable > 1, or @flags/@reserved
- *                 non-zero.
+ *     -EINVAL     @vf_id out of range, @enable > 1, unknown @flags, no
+ *                 @pasid for the PASID window, or @flags/@pasid set with
+ *                 @enable=0 or @pasid set with F_CARVEOUT.
  *     -ENODEV     the VF pci_dev could not be found.
  *     -EBUSY      the VF is bound to a driver (must be unbound first).
- *     -EOPNOTSUPP the per-VF IOVA window does not fit the IOMMU aperture.
+ *     -EOPNOTSUPP the chosen window is not built into this kernel, the
+ *                 carveout does not fit the VF's DMA domain, or PASID is
+ *                 not enabled on the PF or @pasid is beyond what the VF
+ *                 supports.
  *     other <0    iommu core error from domain alloc/attach.
  */
+#define MLX5_VFMIG_TRACK_F_CARVEOUT	(1U << 0)
+
 struct mlx5_vfmig_set_tracked {
 	__u32 vf_id;		/* in  */
 	__u32 enable;		/* in: 0 = untrack, 1 = track */
-	__u32 flags;		/* in: reserved, must be 0 */
-	__u32 reserved;		/* in: reserved, must be 0 */
+	__u32 flags;		/* in: MLX5_VFMIG_TRACK_F_* */
+	__u32 pasid;		/* in: PASID window's PASID, else 0 */
 };
 
 #define MLX5_VFMIG_IOC_SET_TRACKED \

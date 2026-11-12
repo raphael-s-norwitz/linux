@@ -629,6 +629,7 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
 	struct vfmig_iova_domain *new_dom = NULL;
 	struct vfmig_iova_domain *old_dom = NULL;
+	enum vfmig_iova_backend backend;
 	struct mlx5_vfmig_set_tracked arg;
 	struct mlx5_core_sriov *sriov;
 	struct pci_dev *vf_pdev;
@@ -637,10 +638,32 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.flags || arg.reserved)
+	if (arg.flags & ~MLX5_VFMIG_TRACK_F_CARVEOUT)
 		return -EINVAL;
 	if (arg.enable > 1)
 		return -EINVAL;
+	if (!arg.enable && (arg.flags || arg.pasid))
+		return -EINVAL;
+
+	backend = (arg.flags & MLX5_VFMIG_TRACK_F_CARVEOUT) ?
+		  VFMIG_IOVA_BACKEND_CARVEOUT : VFMIG_IOVA_BACKEND_PASID;
+	if (arg.enable) {
+		if (!IS_ENABLED(CONFIG_MLX5_VFMIG_IOVA_PASID) &&
+		    !IS_ENABLED(CONFIG_MLX5_VFMIG_IOVA_CARVEOUT)) {
+			mlx5_core_err(pf_mdev,
+				      "vfmig: SET_TRACKED vf %u: this kernel has no IOVA window for tracked VFs (neither CONFIG_MLX5_VFMIG_IOVA_PASID nor CONFIG_MLX5_VFMIG_IOVA_CARVEOUT)\n",
+				      arg.vf_id);
+			return -EOPNOTSUPP;
+		}
+		if (backend == VFMIG_IOVA_BACKEND_CARVEOUT && arg.pasid)
+			return -EINVAL;
+		if (backend == VFMIG_IOVA_BACKEND_PASID && !arg.pasid) {
+			mlx5_core_warn(pf_mdev,
+				       "vfmig: SET_TRACKED vf %u: no PASID given; pass the orchestrator's PASID, or MLX5_VFMIG_TRACK_F_CARVEOUT for the DMA-domain carveout\n",
+				       arg.vf_id);
+			return -EINVAL;
+		}
+	}
 
 	sriov = &pf_mdev->priv.sriov;
 	if (arg.vf_id >= sriov->num_vfs || arg.vf_id >= vfmig->max_vfs)
@@ -677,7 +700,8 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 	}
 
 	if (desired) {
-		err = vfmig_iova_domain_create(vf_pdev, arg.vf_id, &new_dom);
+		err = vfmig_iova_domain_create(vf_pdev, arg.vf_id, backend,
+					       arg.pasid, &new_dom);
 		if (err) {
 			mlx5_core_warn(pf_mdev,
 				       "vfmig: SET_TRACKED vf %u: iova_domain_create failed: %d\n",

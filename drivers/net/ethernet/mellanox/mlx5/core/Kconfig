@@ -67,6 +67,29 @@ config MLX5_VFMIG_IOVA_PER_VF_GIB
 	  the kernel slots + kcoherent carve + at least one user-MR IOVA, or
 	  vfmig_iova.h's static_assert fires at build time.
 
+config MLX5_VFMIG_IOVA_PASID
+	bool "MLX5 vfmig: fixed IOVAs in a PASID address space"
+	depends on MLX5_VFMIG && PCI_PASID
+	default y
+	help
+	  Lets SET_TRACKED give a VF a paging domain of its own, attached at
+	  a PASID the orchestrator chooses, and map the VF's migratable
+	  buffers at their fixed IOVAs there. The VF's default DMA domain is
+	  left alone for its ordinary DMA. This is SET_TRACKED's default
+	  window. It only works if the device tags the DMA for those buffers
+	  with that PASID.
+
+config MLX5_VFMIG_IOVA_CARVEOUT
+	bool "MLX5 vfmig: fixed IOVAs in a carveout of the VF's DMA domain"
+	depends on MLX5_VFMIG && IOMMU_DMA_FIXED_IOVA
+	default y
+	help
+	  Lets SET_TRACKED with MLX5_VFMIG_TRACK_F_CARVEOUT reserve the VF's
+	  fixed IOVA window in its default DMA-IOMMU domain with
+	  dma_iova_alloc_fixed() and link the migratable buffers there.
+
+	  With neither this nor MLX5_VFMIG_IOVA_PASID, SET_TRACKED fails.
+
 config MLX5_FPGA
 	bool "Mellanox Technologies Innova support"
 	depends on MLX5_CORE

@@ -44,11 +44,23 @@
  * --------------------------
  * The VF keeps its dma-iommu-managed default domain, so ordinary
  * dma_alloc_coherent() / dma_map_*() on the VF continue to work
- * (streaming netdev traffic, cmd mailboxes) outside the carveout. The
- * reserved arena is populated with dma_iova_link(); those IOVAs are the
- * only PF-managed, migration-recorded addresses. Because the reservation
- * must grab its exact fixed range before any other DMA races it, the
- * carveout is reserved at SET_TRACKED.
+ * (streaming netdev traffic, cmd mailboxes) outside the arena; the
+ * arena's IOVAs are the only PF-managed, migration-recorded addresses.
+ * SET_TRACKED picks one of two mapping backends for them:
+ *
+ *   carveout  The arena is a fixed range reserved in the default domain
+ *             with dma_iova_alloc_fixed() and populated with
+ *             dma_iova_link(). The reservation must grab its exact range
+ *             before any other DMA races it, so it is made at SET_TRACKED.
+ *             Needs CONFIG_MLX5_VFMIG_IOVA_CARVEOUT.
+ *   PASID     The arena is a paging domain of its own, attached to the VF
+ *             at an orchestrator-chosen PASID and populated with
+ *             iommu_map(). The default domain is not touched. The device
+ *             reaches the arena only through DMA it tags with that PASID.
+ *             Needs CONFIG_MLX5_VFMIG_IOVA_PASID.
+ *
+ * The registry, the slot allocator and replay do not depend on the
+ * backend; the IOVAs are the same in both.
  */
 
 #ifndef __MLX5_CORE_VFMIG_IOVA_H__
@@ -60,6 +72,12 @@
 struct pci_dev;
 struct sg_table;
 struct vfmig_iova_domain;
+
+/* Where a domain's arena is mapped; see "Coexistence with dma-iommu". */
+enum vfmig_iova_backend {
+	VFMIG_IOVA_BACKEND_PASID	= 1,
+	VFMIG_IOVA_BACKEND_CARVEOUT	= 2,
+};
 
 /*
  * Slot identity. Each value names one category of converted allocation;
@@ -235,13 +253,22 @@ static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
 	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
 
 /*
- * Reserve the fixed per-VF IOVA carveout in @vf_pdev's managed DMA-IOMMU
- * domain and return the handle in *@out. Returns 0 on success (with a
- * pinned reference on @vf_pdev held for the domain's lifetime),
- * -EOPNOTSUPP if the VF is not a DMA-coherent, dma-iommu-managed device,
- * or a negative errno if the exact IOVA range could not be reserved.
+ * Set up @vf_pdev's fixed per-VF IOVA arena and return the handle in
+ * *@out. @backend picks where the arena's pages are mapped:
+ * VFMIG_IOVA_BACKEND_CARVEOUT reserves the window in the VF's managed
+ * DMA-IOMMU domain; VFMIG_IOVA_BACKEND_PASID attaches a paging domain of
+ * its own to the VF at @pasid and maps there, leaving the default domain
+ * alone. @pasid is non-zero exactly for the PASID backend.
+ *
+ * Returns 0 on success (with a pinned reference on @vf_pdev held for the
+ * domain's lifetime). -EOPNOTSUPP if the VF is not DMA-coherent, if
+ * @backend is not built in, if the carveout's VF is not dma-iommu
+ * managed, or if PASID is not enabled on the PF or the VF cannot use
+ * @pasid. Otherwise a negative errno from reserving the carveout or
+ * from allocating/attaching the PASID domain.
  */
 int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
+			      enum vfmig_iova_backend backend, u32 pasid,
 			      struct vfmig_iova_domain **out);
 
 /*
