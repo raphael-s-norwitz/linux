@@ -383,6 +383,9 @@ static int vfmig_iova_pasid_attach(struct vfmig_iova_domain *dom)
 		return err;
 	}
 	dom->iommu_dom = pd;
+	dev_info(dev,
+		 "vfmig_iova: vf %u PASID 0x%x attached (PF %s, VF supports %u PASIDs)\n",
+		 dom->vf_id, dom->pasid, pci_name(pf), max_pasids);
 	return 0;
 }
 #endif /* CONFIG_MLX5_VFMIG_IOVA_PASID */
