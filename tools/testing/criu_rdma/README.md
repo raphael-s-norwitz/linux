@@ -100,6 +100,11 @@ builds the helpers that need libibverbs.
   self-loop RC QP, with the source's mlx5e unbound or suspended
   (`CRIU_REPO=...`). It has since been ported to the CRIU tree as
   `run_vfmig_qp_traffic_cr.sh`.
+- `probes/iova_track_cycle.sh` -- cycles SET_TRACKED on and off across
+  VFs and `iova_bits` values (`BITS="..."`, `ITERS=`, `NUMVFS=`) and
+  checks every reservation lands at [2^(bits-1), 2^bits), plus the
+  out-of-range and re-track refusals. It prints the IOMMU aperture end
+  and bus DMA limit the kernel logged for each window size.
 
 Helpers: `probes/vfmig_fence` raises and lifts the RX fence, optionally
 with `eth`. `probes/rc_pair` drives RC QP pairs between two ib devices
