@@ -11,7 +11,7 @@
  *   mlx5_vfmig <pf-bdf> list
  *   mlx5_vfmig <pf-bdf> query_vf          <vf_id>
  *   mlx5_vfmig <pf-bdf> get_vhca_id       <vf_id>
- *   mlx5_vfmig <pf-bdf> set_tracked       <vf_id> <0|1>
+ *   mlx5_vfmig <pf-bdf> set_tracked       <vf_id> <0|1> [iova_bits]
  *   mlx5_vfmig <pf-bdf> enable_migratable <vf_id>
  *   mlx5_vfmig <pf-bdf> set_vf_uuid       <vf_id> <uuid-string>
  *   mlx5_vfmig <pf-bdf> clear_vf_uuid     <vf_id> <expected-uuid-string>
@@ -55,11 +55,13 @@ static int do_enable_migratable(int fd, unsigned int vf_id)
 	return 0;
 }
 
-static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable)
+static int do_set_tracked(int fd, unsigned int vf_id, unsigned int enable,
+			  unsigned int iova_bits)
 {
 	struct mlx5_vfmig_set_tracked arg = {
-		.vf_id  = vf_id,
-		.enable = enable ? 1 : 0,
+		.vf_id     = vf_id,
+		.enable    = enable ? 1 : 0,
+		.iova_bits = iova_bits,
 	};
 
 	if (ioctl(fd, MLX5_VFMIG_IOC_SET_TRACKED, &arg) < 0) {
@@ -542,7 +544,7 @@ static void usage(const char *argv0)
 		"  list\n"
 		"  query_vf          <vf_id>\n"
 		"  get_vhca_id       <vf_id>\n"
-		"  set_tracked       <vf_id> <0|1>\n"
+		"  set_tracked       <vf_id> <0|1> [iova_bits, default 39]\n"
 		"  enable_migratable <vf_id>\n"
 		"  set_vf_uuid       <vf_id> <uuid-string>\n"
 		"  clear_vf_uuid     <vf_id> <expected-uuid-string>\n"
@@ -598,9 +600,10 @@ int main(int argc, char **argv)
 			goto badargs;
 		ret = do_get(fd, vf_id);
 	} else if (verb_eq(verb, "set_tracked")) {
-		if (argc != 5)
+		if (argc != 5 && argc != 6)
 			goto badargs;
-		ret = do_set_tracked(fd, vf_id, strtoul(argv[4], NULL, 0));
+		ret = do_set_tracked(fd, vf_id, strtoul(argv[4], NULL, 0),
+				     argc == 6 ? strtoul(argv[5], NULL, 0) : 0);
 	} else if (verb_eq(verb, "enable_migratable")) {
 		if (argc != 4)
 			goto badargs;

@@ -40,7 +40,9 @@
 #   TOOL          mlx5_vfmig CLI (default ../tools/mlx5_vfmig)
 #   TRACE         1 (default): check resets with ../trace/reset_trace.sh;
 #                 0: skip
-#   EXPECT_BASE   arena base every VF should reserve (default 0x4000000000)
+#   IOVA_BITS     SET_TRACKED iova_bits (default 0: the kernel's 39)
+#   EXPECT_BASE   arena base every VF should reserve (default
+#                 2^(IOVA_BITS-1), 0x4000000000 for 39 bits)
 #   SET_DMA       1 (default): switch an identity-domain VF's IOMMU group
 #                 to DMA before tracking it; 0: fail instead
 #   BIND_TIMEOUT  seconds to wait for a VF probe or unbind (default 90)
@@ -59,7 +61,8 @@ ITERS="${ITERS:-10}"
 TOOL="${TOOL:-$HERE/../tools/mlx5_vfmig}"
 RTRACE="$HERE/../trace/reset_trace.sh"
 TRACE="${TRACE:-1}"
-EXPECT_BASE="${EXPECT_BASE:-0x4000000000}"
+IOVA_BITS="${IOVA_BITS:-0}"
+EXPECT_BASE="${EXPECT_BASE:-$(printf '0x%x' $((1 << ((IOVA_BITS ? IOVA_BITS : 39) - 1))))}"
 SET_DMA="${SET_DMA:-1}"
 BIND_TIMEOUT="${BIND_TIMEOUT:-90}"
 SETTLE="${SETTLE:-10}"
@@ -163,7 +166,8 @@ bootstrap_vf() {
 	local vf="$1" tag="r$ROUND.$((++SEQ))-track$1" line
 	ensure_dma_domain "$(bdf_of "$vf")"
 	mark "$tag"
-	"$TOOL" "$PF" set_tracked "$vf" 1 >/dev/null || hard "SET_TRACKED vf $vf failed"
+	"$TOOL" "$PF" set_tracked "$vf" 1 "$IOVA_BITS" >/dev/null ||
+		hard "SET_TRACKED vf $vf failed"
 	line="$(klog_since "$tag" | grep -m1 "vfmig_iova: vf $vf arena reserved" || true)"
 	[[ "$line" == *"kernel slots [$EXPECT_BASE,"* ]] ||
 		hard "vf $vf arena not reserved at $EXPECT_BASE: ${line:-nothing logged}"

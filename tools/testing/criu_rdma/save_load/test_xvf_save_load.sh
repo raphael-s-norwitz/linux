@@ -33,7 +33,9 @@
 #   DST_VF       VF index the state is loaded onto (default 1)
 #   TOOL         mlx5_vfmig CLI (default ../tools/mlx5_vfmig)
 #   BLOB         image path (default: inside the work dir)
-#   EXPECT_BASE  arena base every VF should reserve (default 0x4000000000)
+#   IOVA_BITS    SET_TRACKED iova_bits (default 0: the kernel's 39)
+#   EXPECT_BASE  arena base every VF should reserve (default
+#                2^(IOVA_BITS-1), 0x4000000000 for 39 bits)
 #   SET_DMA      1 (default): switch an identity-domain VF's IOMMU group
 #                to DMA before tracking it; 0: fail instead
 #   BIND_TIMEOUT seconds to wait for a VF probe (default 90)
@@ -51,7 +53,8 @@ PF="${PF:-0000:08:00.0}"
 SRC_VF="${SRC_VF:-0}"
 DST_VF="${DST_VF:-1}"
 TOOL="${TOOL:-$HERE/../tools/mlx5_vfmig}"
-EXPECT_BASE="${EXPECT_BASE:-0x4000000000}"
+IOVA_BITS="${IOVA_BITS:-0}"
+EXPECT_BASE="${EXPECT_BASE:-$(printf '0x%x' $((1 << ((IOVA_BITS ? IOVA_BITS : 39) - 1))))}"
 SET_DMA="${SET_DMA:-1}"
 BIND_TIMEOUT="${BIND_TIMEOUT:-90}"
 SETTLE="${SETTLE:-10}"
@@ -216,7 +219,7 @@ track_vf() {
 	local vf="$1" tag="track-$1-$2" line
 	ensure_dma_domain "$(vf_bdf "$vf")"
 	mark "$tag"
-	"$TOOL" "$PF" set_tracked "$vf" 1 >/dev/null \
+	"$TOOL" "$PF" set_tracked "$vf" 1 "$IOVA_BITS" >/dev/null \
 		|| fail_stage arena "SET_TRACKED vf $vf failed (see dmesg)"
 	line="$(klog_since "$tag" | grep -m1 "vfmig_iova: vf $vf arena reserved" || true)"
 	[[ -n "$line" ]] || fail_stage arena "no arena reservation logged for vf $vf"
