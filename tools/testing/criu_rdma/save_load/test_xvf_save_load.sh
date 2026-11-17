@@ -11,6 +11,9 @@
 #
 # Each stage is reported separately:
 #   arena     both VFs reserve the same IOVA window ($EXPECT_BASE)
+#   mismatch  with MISMATCH_BITS: a LOAD onto $DST_VF re-tracked with
+#             that many bits is refused at the stream header, before
+#             any replay, and $DST_VF is then re-tracked as before
 #   replay    the LOAD stream's HOST_PAGE records replay into $DST_VF
 #   fw_load   the probe-time LOAD_VHCA_STATE lands on $DST_VF's vHCA
 #   probe     $DST_VF binds to mlx5_core with no allocator drift and
@@ -36,6 +39,8 @@
 #   IOVA_BITS    SET_TRACKED iova_bits (default 0: the kernel's 39)
 #   EXPECT_BASE  arena base every VF should reserve (default
 #                2^(IOVA_BITS-1), 0x4000000000 for 39 bits)
+#   MISMATCH_BITS iova_bits for the mismatch stage, 34..39 and not the
+#                IOVA_BITS window (default: skip the stage)
 #   SET_DMA      1 (default): switch an identity-domain VF's IOMMU group
 #                to DMA before tracking it; 0: fail instead
 #   BIND_TIMEOUT seconds to wait for a VF probe (default 90)
@@ -54,7 +59,9 @@ SRC_VF="${SRC_VF:-0}"
 DST_VF="${DST_VF:-1}"
 TOOL="${TOOL:-$HERE/../tools/mlx5_vfmig}"
 IOVA_BITS="${IOVA_BITS:-0}"
-EXPECT_BASE="${EXPECT_BASE:-$(printf '0x%x' $((1 << ((IOVA_BITS ? IOVA_BITS : 39) - 1))))}"
+SRC_BITS=$((IOVA_BITS ? IOVA_BITS : 39))
+EXPECT_BASE="${EXPECT_BASE:-$(printf '0x%x' $((1 << (SRC_BITS - 1))))}"
+MISMATCH_BITS="${MISMATCH_BITS:-}"
 SET_DMA="${SET_DMA:-1}"
 BIND_TIMEOUT="${BIND_TIMEOUT:-90}"
 SETTLE="${SETTLE:-10}"
@@ -69,7 +76,7 @@ RUN_ID="$$-$(date +%s)"
 SRIOV_TOUCHED=0
 
 declare -A RESULT=()
-STAGES=(arena replay fw_load probe health)
+STAGES=(arena ${MISMATCH_BITS:+mismatch} replay fw_load probe health)
 TEARDOWN_NOTE=""
 
 # mlx5 health poller reporting a dead or disabled function.
@@ -238,6 +245,12 @@ sect "Preconditions"
 [[ -e "$CDEV" ]] || die "missing $CDEV (mlx5_core without vfmig?)"
 total="$(cat "$PF_DEV/sriov_totalvfs")"
 (( total >= NUM_VFS )) || die "PF $PF supports $total VFs, need $NUM_VFS"
+if [[ -n "$MISMATCH_BITS" ]]; then
+	(( MISMATCH_BITS >= 34 && MISMATCH_BITS <= 39 && MISMATCH_BITS != SRC_BITS )) \
+		|| die "MISMATCH_BITS=$MISMATCH_BITS must be in 34..39 and differ from $SRC_BITS"
+	grep -aq ' iova_bits=%u' "$TOOL" \
+		|| die "$TOOL query_vf prints no iova_bits -- make -C $HERE/.."
+fi
 note "PF=$PF SRC_VF=$SRC_VF DST_VF=$DST_VF NUM_VFS=$NUM_VFS kernel=$(uname -r)"
 
 # ---------------------------------------------------------------------------
@@ -280,7 +293,32 @@ if [[ "$SRC_VF" != "$DST_VF" ]]; then
 else
 	pass_stage arena "vf $DST_VF at $EXPECT_BASE"
 fi
-"$TOOL" "$PF" enable_migratable "$DST_VF" >/dev/null
+	"$TOOL" "$PF" enable_migratable "$DST_VF" >/dev/null
+
+if [[ -n "$MISMATCH_BITS" ]]; then
+	sect "LOAD onto VF $DST_VF tracked with iova_bits $MISMATCH_BITS (must be refused)"
+	"$TOOL" "$PF" set_tracked "$DST_VF" 0 >/dev/null \
+		|| fail_stage mismatch "untrack vf $DST_VF failed"
+	"$TOOL" "$PF" set_tracked "$DST_VF" 1 "$MISMATCH_BITS" >/dev/null \
+		|| fail_stage mismatch "SET_TRACKED vf $DST_VF iova_bits $MISMATCH_BITS failed"
+	mark mismatch
+	if "$TOOL" "$PF" load_vhca_state "$DST_VF" "$BLOB" >/dev/null 2>&1; then
+		fail_stage mismatch "LOAD accepted a $SRC_BITS-bit image on a $MISMATCH_BITS-bit window"
+	fi
+	MM_LOG="$(klog_since mismatch)"
+	grep -q "vf $DST_VF: stream saved with iova_bits $SRC_BITS but destination tracked with iova_bits $MISMATCH_BITS" <<<"$MM_LOG" \
+		|| fail_stage mismatch "no window mismatch logged for vf $DST_VF"
+	if grep -E 'replay_page\(|replay: wire claims|staged [0-9]* bytes' <<<"$MM_LOG" >&2; then
+		fail_stage mismatch "LOAD replayed or staged before refusing (above)"
+	fi
+	"$TOOL" "$PF" query_vf "$DST_VF" | grep -q 'restored=0 ' \
+		|| fail_stage mismatch "vf $DST_VF latched restored after the refused LOAD"
+	"$TOOL" "$PF" set_tracked "$DST_VF" 0 >/dev/null \
+		|| fail_stage mismatch "untrack vf $DST_VF failed"
+	track_vf "$DST_VF" dst-retrack
+	pass_stage mismatch "$SRC_BITS-bit image refused on a $MISMATCH_BITS-bit window"
+fi
+
 [[ ! -e "/sys/bus/pci/devices/$DST_BDF/driver" ]] \
 	|| die "destination VF $DST_BDF is bound before LOAD"
 DST_VHCA="$(vhca_of "$DST_VF")"

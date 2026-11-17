@@ -347,12 +347,13 @@ static int do_query(int fd, unsigned int vf_id)
 	       vf_id, info.vhca_id, info.restored, info.tracked,
 	       info.num_vfs, ub);
 	if (info.vf_state & MLX5_VFMIG_VF_STATE_UNKNOWN)
-		printf(" bound=? from_load=? claimed=?\n");
+		printf(" bound=? from_load=? claimed=?");
 	else
-		printf(" bound=%u from_load=%u claimed=%u\n",
+		printf(" bound=%u from_load=%u claimed=%u",
 		       !!(info.vf_state & MLX5_VFMIG_VF_STATE_BOUND),
 		       !!(info.vf_state & MLX5_VFMIG_VF_STATE_FROM_LOAD),
 		       !!(info.vf_state & MLX5_VFMIG_VF_STATE_CLAIMED));
+	printf(" iova_bits=%u\n", info.iova_bits);
 	return 0;
 }
 

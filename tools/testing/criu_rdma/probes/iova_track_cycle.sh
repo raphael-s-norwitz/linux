@@ -8,14 +8,16 @@
 #
 # Flow, on PF $PF with $NUMVFS unbound VFs in DMA domains:
 #   edges    iova_bits out of range is refused (EINVAL); re-tracking with
-#            the same window is a no-op, 0 and 39 being the same window;
-#            re-tracking with a different window is refused (EBUSY).
+#            the same window or with 0 is a no-op that keeps the window
+#            (checked on 39 and 36); re-tracking with a different window
+#            is refused (EBUSY).
 #   rounds   $ITERS rounds. Each round tracks every VF, VF j with the
 #            ((round + j) mod n)th entry of $BITS, so VFs hold different
 #            windows at once and each VF sees every size over the run.
 #            For each VF: the logged window, the kernel slot and USER_PAGE
-#            bounds, and QUERY_VF's tracked bit. Then untracks every VF
-#            and checks the release and tracked=0.
+#            bounds, and QUERY_VF's tracked bit and iova_bits. Then
+#            untracks every VF and checks the release, tracked=0 and
+#            iova_bits=0.
 #   report   Per iova_bits: reservations checked, the window, and the
 #            IOMMU aperture end and bus DMA limit the kernel logged.
 #
@@ -91,6 +93,10 @@ tracked_of() {
 	"$TOOL" "$PF" query_vf "$1" | sed -n 's/.* tracked=\([01]\) .*/\1/p'
 }
 
+bits_of() {
+	"$TOOL" "$PF" query_vf "$1" | sed -n 's/.* iova_bits=\([0-9]*\)$/\1/p'
+}
+
 # Run set_tracked; print "rc<TAB>output".
 st() {
 	local out rc=0
@@ -131,6 +137,7 @@ track_check() {
 	[[ "$slots" == *"kernel slots [$(hex $base),"* && "$slots" == *"USER_PAGE ["*", $(hex $end))"* ]] ||
 		fail "vf $vf bits $bits: slot bounds not in [$(hex $base), $(hex $end)): ${slots#*vfmig_iova: }"
 	[[ "$(tracked_of "$vf")" == 1 ]] || fail "vf $vf bits $bits: QUERY_VF tracked != 1"
+	[[ "$(bits_of "$vf")" == "$b" ]] || fail "vf $vf bits $bits: QUERY_VF iova_bits $(bits_of "$vf") != $b"
 	check_clean "$tag" "vf $vf bits $bits"
 	sed -n 's/.*(IOMMU aperture ends at \(0x[0-9a-f]*\), bus DMA limit \(0x[0-9a-f]*\)).*/\1 \2/p' \
 		<<<"$win" | sed "s/^/$b $(hex $base) $(hex $end) /" >>"$STATS"
@@ -147,6 +154,7 @@ untrack_check() {
 	[[ "$log" == *"vfmig_iova: vf $vf arena released"* ]] ||
 		fail "vf $vf: no 'arena released' logged on untrack"
 	[[ "$(tracked_of "$vf")" == 0 ]] || fail "vf $vf: QUERY_VF tracked != 0 after untrack"
+	[[ "$(bits_of "$vf")" == 0 ]] || fail "vf $vf: QUERY_VF iova_bits $(bits_of "$vf") != 0 after untrack"
 	check_clean "$tag" "vf $vf untrack"
 }
 
@@ -172,6 +180,20 @@ expect_ok() {
 	[[ "${res%%$'\t'*}" == 0 ]] || fail "set_tracked $*: exited ${res%%$'\t'*}: ${res#*$'\t'}"
 }
 
+# set_tracked @vf 1 0 on a VF tracked with @bits keeps that window.
+keep_check() {
+	local vf="$1" bits="$2" tag log
+	tag="s$((++SEQ))-keep-vf$vf-b$bits"
+	mark "$tag"
+	expect_ok "$vf" 1 0
+	log="$(klog_since "$tag")"
+	[[ "$log" == *"SET_TRACKED vf $vf: already 1, no-op"* && "$log" != *"vfmig_iova: vf $vf "* ]] ||
+		fail "vf $vf: set_tracked 1 0 on a $bits-bit window was not a no-op"
+	[[ "$(bits_of "$vf")" == "$bits" ]] ||
+		fail "vf $vf: set_tracked 1 0 changed iova_bits $bits -> $(bits_of "$vf")"
+	note "set_tracked $vf 1 0 on a $bits-bit window: kept (ok)"
+}
+
 edges() {
 	sect "Edges ($1)"
 	expect_err "Invalid argument" 0 1 33
@@ -185,6 +207,12 @@ edges() {
 	[[ "$(tracked_of 0)" == 1 ]] || fail "vf 0 lost tracking after refused re-tracks"
 	untrack_check 0
 	expect_ok 0 0 38
+	track_check 0 36 || return
+	keep_check 0 36
+	expect_ok 0 1 36
+	expect_err "Device or resource busy" 0 1 39
+	[[ "$(bits_of 0)" == 36 ]] || fail "vf 0 window changed after refused re-tracks"
+	untrack_check 0
 	track_check 0 34 && untrack_check 0
 }
 
@@ -224,6 +252,7 @@ for ((j = 0; j < NUMVFS; j++)); do
 	note "vf $j $bdf group $(basename "$(readlink "/sys/bus/pci/devices/$bdf/iommu_group")") $(cat "/sys/bus/pci/devices/$bdf/iommu_group/type")"
 	[[ "$(tracked_of "$j")" == 0 ]] || die "vf $j already tracked after provisioning"
 done
+[[ "$(bits_of 0)" == 0 ]] || die "$TOOL query_vf prints no iova_bits -- make -C $HERE/.."
 
 edges start
 
