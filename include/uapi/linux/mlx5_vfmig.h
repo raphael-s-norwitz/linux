@@ -181,16 +181,18 @@ struct mlx5_vfmig_enable_migratable {
  *
  *   @iova_bits selects the VF's IOVA window on enable: the VF's DMA mask
  *   is set to @iova_bits bits and the window is the top half of what
- *   that mask reaches, [2^(iova_bits-1), 2^iova_bits). 0 selects
- *   MLX5_VFMIG_IOVA_BITS_DEFAULT (39: [256 GiB, 512 GiB)); otherwise it
- *   must be in [MLX5_VFMIG_IOVA_BITS_MIN, MLX5_VFMIG_IOVA_BITS_DEFAULT]
- *   (34: [8 GiB, 16 GiB) is the smallest window the kernel's fixed slots
- *   fit in). Ignored on disable. A SAVE replays only onto a VF tracked
- *   with the same @iova_bits.
+ *   that mask reaches, [2^(iova_bits-1), 2^iova_bits). A non-zero
+ *   value must be in [MLX5_VFMIG_IOVA_BITS_MIN,
+ *   MLX5_VFMIG_IOVA_BITS_DEFAULT] (34: [8 GiB, 16 GiB) is the smallest
+ *   window the kernel's fixed slots fit in). 0 asks for no particular
+ *   window: MLX5_VFMIG_IOVA_BITS_DEFAULT (39: [256 GiB, 512 GiB)) on an
+ *   untracked VF, the window it already has on a tracked one. Ignored
+ *   on disable. A SAVE replays only onto a VF tracked with the same
+ *   @iova_bits.
  *
  *   Idempotent: a toggle to the state the VF is already in is a no-op
- *   (returns 0, no iommu traffic), as long as an enable asks for the
- *   window the VF already has.
+ *   (returns 0, no iommu traffic), as long as an enable with a non-zero
+ *   @iova_bits asks for the window the VF already has.
  *
  *   Errors:
  *     -EFAULT     copy_from_user.
@@ -198,7 +200,8 @@ struct mlx5_vfmig_enable_migratable {
  *                 @iova_bits out of range.
  *     -ENODEV     the VF pci_dev could not be found.
  *     -EBUSY      the VF is bound to a driver (must be unbound first), or
- *                 is already tracked with a different @iova_bits.
+ *                 is already tracked with a different non-zero
+ *                 @iova_bits (untrack it first).
  *     -EOPNOTSUPP the VF is not in a managed DMA-IOMMU domain or is not
  *                 DMA-coherent, or its IOMMU aperture or bus DMA limit
  *                 does not reach the top of the window.
@@ -216,7 +219,7 @@ struct mlx5_vfmig_set_tracked {
 	__u32 vf_id;		/* in  */
 	__u32 enable;		/* in: 0 = untrack, 1 = track */
 	__u32 flags;		/* in: reserved, must be 0 */
-	__u32 iova_bits;	/* in: window DMA mask bits, 0 = default */
+	__u32 iova_bits;	/* in: window DMA mask bits, 0 = any */
 };
 
 #define MLX5_VFMIG_IOC_SET_TRACKED \

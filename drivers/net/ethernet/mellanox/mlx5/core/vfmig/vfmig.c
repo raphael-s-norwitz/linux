@@ -649,12 +649,12 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 		return -EINVAL;
 
 	desired = (arg.enable == 1);
-	dma_bits = arg.iova_bits ?: MLX5_VFMIG_IOVA_BITS_DEFAULT;
-	if (desired && (dma_bits < MLX5_VFMIG_IOVA_BITS_MIN ||
-			dma_bits > MLX5_VFMIG_IOVA_BITS_DEFAULT)) {
+	if (desired && arg.iova_bits &&
+	    (arg.iova_bits < MLX5_VFMIG_IOVA_BITS_MIN ||
+	     arg.iova_bits > MLX5_VFMIG_IOVA_BITS_DEFAULT)) {
 		mlx5_core_warn(pf_mdev,
 			       "vfmig: SET_TRACKED vf %u: iova_bits %u outside [%u, %u]\n",
-			       arg.vf_id, dma_bits, MLX5_VFMIG_IOVA_BITS_MIN,
+			       arg.vf_id, arg.iova_bits, MLX5_VFMIG_IOVA_BITS_MIN,
 			       MLX5_VFMIG_IOVA_BITS_DEFAULT);
 		return -EINVAL;
 	}
@@ -665,6 +665,13 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 	cur_bits = cur_dom ? vfmig_iova_domain_dma_bits(cur_dom) : 0;
 	mutex_unlock(&vfmig->ctxs_lock);
 
+	/*
+	 * 0 asks for no particular window: the default on an untracked VF,
+	 * the current one on a tracked VF, so re-sending SET_TRACKED with
+	 * 0 leaves whatever window the VF was tracked with alone.
+	 */
+	dma_bits = arg.iova_bits ?: (tracked ? cur_bits :
+				     MLX5_VFMIG_IOVA_BITS_DEFAULT);
 	if (tracked && desired && cur_bits != dma_bits) {
 		mlx5_core_warn(pf_mdev,
 			       "vfmig: SET_TRACKED vf %u rejected: already tracked with iova_bits %u, asked for %u (untrack first)\n",
