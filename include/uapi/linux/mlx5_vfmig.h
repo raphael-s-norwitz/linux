@@ -77,7 +77,7 @@ struct mlx5_vfmig_get_vhca_id {
  *   Userspace iterates @vf_id 0..num_vfs-1 to enumerate. Returns 0 on
  *   success, or -ERANGE if @vf_id >= num_vfs (with @num_vfs still filled
  *   in so callers can size their iteration; @vhca_id / @restored /
- *   @tracked / @vf_uuid are zeroed).
+ *   @tracked / @vf_uuid / @iova_bits are zeroed).
  *
  *   Output fields:
  *     vhca_id:   live VHCA identifier.
@@ -108,6 +108,11 @@ struct mlx5_vfmig_get_vhca_id {
  *                A kernel without this field reports 0 for a bound VF, so
  *                check BOUND against sysfs before trusting a clear
  *                FROM_LOAD.
+ *     iova_bits: with @tracked, the DMA mask bits the VF's IOVA window
+ *                was reserved under (SET_TRACKED's @iova_bits after
+ *                defaulting); 0 if untracked. A kernel without this
+ *                field reports 0 for a tracked VF; its window is then
+ *                MLX5_VFMIG_IOVA_BITS_DEFAULT.
  *
  *   ABI note: this struct grew to add @vf_uuid + @reserved_out. The
  *   encoded ioctl number changes with the struct size (sizeof in the
@@ -124,7 +129,8 @@ struct mlx5_vfmig_query_vf {
 				 *      all-zeros if unset
 				 */
 	__u8  vf_state;		/* out: MLX5_VFMIG_VF_STATE_* */
-	__u8  reserved_out[7];	/* out: zeroed */
+	__u8  iova_bits;	/* out: tracked window bits, 0 if untracked */
+	__u8  reserved_out[6];	/* out: zeroed */
 };
 
 #define MLX5_VFMIG_VF_STATE_BOUND	(1u << 0)
@@ -187,8 +193,8 @@ struct mlx5_vfmig_enable_migratable {
  *   window the kernel's fixed slots fit in). 0 asks for no particular
  *   window: MLX5_VFMIG_IOVA_BITS_DEFAULT (39: [256 GiB, 512 GiB)) on an
  *   untracked VF, the window it already has on a tracked one. Ignored
- *   on disable. A SAVE replays only onto a VF tracked with the same
- *   @iova_bits.
+ *   on disable. QUERY_VF reports the window in @iova_bits. A SAVE
+ *   replays only onto a VF tracked with the same @iova_bits.
  *
  *   Idempotent: a toggle to the state the VF is already in is a no-op
  *   (returns 0, no iommu traffic), as long as an enable with a non-zero

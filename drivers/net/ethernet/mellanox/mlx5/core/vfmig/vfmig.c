@@ -469,6 +469,7 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 	arg.num_vfs = sriov->num_vfs;
 	arg.tracked = 0;
 	arg.vf_state = 0;
+	arg.iova_bits = 0;
 	memset(arg.reserved_out, 0, sizeof(arg.reserved_out));
 
 	if (arg.vf_id >= sriov->num_vfs) {
@@ -491,12 +492,16 @@ static long vfmig_ioc_query_vf(struct mlx5_vfmig_pf *vfmig,
 
 	/*
 	 * Serialise the 16-byte read against a concurrent SET_VF_UUID and
-	 * the @tracked read against a concurrent SET_TRACKED publish/take.
+	 * the @tracked/@iova_bits read against a concurrent SET_TRACKED
+	 * publish/take.
 	 */
 	mutex_lock(&vfmig->ctxs_lock);
 	if (arg.vf_id < vfmig->max_vfs) {
+		struct vfmig_iova_domain *dom = vfmig->iova_dom[arg.vf_id];
+
 		export_uuid(arg.vf_uuid, &vfmig->vf_uuid[arg.vf_id]);
-		arg.tracked = vfmig->iova_dom[arg.vf_id] ? 1 : 0;
+		arg.tracked = dom ? 1 : 0;
+		arg.iova_bits = dom ? vfmig_iova_domain_dma_bits(dom) : 0;
 	} else {
 		export_uuid(arg.vf_uuid, &uuid_null);
 	}
