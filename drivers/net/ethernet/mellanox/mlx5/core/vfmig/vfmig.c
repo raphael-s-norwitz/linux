@@ -629,7 +629,9 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 	struct mlx5_core_dev *pf_mdev = vfmig->pf_mdev;
 	struct vfmig_iova_domain *new_dom = NULL;
 	struct vfmig_iova_domain *old_dom = NULL;
+	struct vfmig_iova_domain *cur_dom;
 	struct mlx5_vfmig_set_tracked arg;
+	unsigned int dma_bits, cur_bits;
 	struct mlx5_core_sriov *sriov;
 	struct pci_dev *vf_pdev;
 	bool desired, tracked;
@@ -637,7 +639,7 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 
 	if (copy_from_user(&arg, uarg, sizeof(arg)))
 		return -EFAULT;
-	if (arg.flags || arg.reserved)
+	if (arg.flags)
 		return -EINVAL;
 	if (arg.enable > 1)
 		return -EINVAL;
@@ -647,11 +649,28 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 		return -EINVAL;
 
 	desired = (arg.enable == 1);
+	dma_bits = arg.iova_bits ?: MLX5_VFMIG_IOVA_BITS_DEFAULT;
+	if (desired && (dma_bits < MLX5_VFMIG_IOVA_BITS_MIN ||
+			dma_bits > MLX5_VFMIG_IOVA_BITS_DEFAULT)) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SET_TRACKED vf %u: iova_bits %u outside [%u, %u]\n",
+			       arg.vf_id, dma_bits, MLX5_VFMIG_IOVA_BITS_MIN,
+			       MLX5_VFMIG_IOVA_BITS_DEFAULT);
+		return -EINVAL;
+	}
 
 	mutex_lock(&vfmig->ctxs_lock);
-	tracked = vfmig->iova_dom[arg.vf_id];
+	cur_dom = vfmig->iova_dom[arg.vf_id];
+	tracked = cur_dom;
+	cur_bits = cur_dom ? vfmig_iova_domain_dma_bits(cur_dom) : 0;
 	mutex_unlock(&vfmig->ctxs_lock);
 
+	if (tracked && desired && cur_bits != dma_bits) {
+		mlx5_core_warn(pf_mdev,
+			       "vfmig: SET_TRACKED vf %u rejected: already tracked with iova_bits %u, asked for %u (untrack first)\n",
+			       arg.vf_id, cur_bits, dma_bits);
+		return -EBUSY;
+	}
 	if (tracked == desired) {
 		mlx5_core_info(pf_mdev,
 			       "vfmig: SET_TRACKED vf %u: already %d, no-op\n",
@@ -677,7 +696,8 @@ static long vfmig_ioc_set_tracked(struct mlx5_vfmig_pf *vfmig,
 	}
 
 	if (desired) {
-		err = vfmig_iova_domain_create(vf_pdev, arg.vf_id, &new_dom);
+		err = vfmig_iova_domain_create(vf_pdev, arg.vf_id, dma_bits,
+					       &new_dom);
 		if (err) {
 			mlx5_core_warn(pf_mdev,
 				       "vfmig: SET_TRACKED vf %u: iova_domain_create failed: %d\n",

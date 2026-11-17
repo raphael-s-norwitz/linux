@@ -484,7 +484,7 @@ static int alloc_system_page(struct mlx5_core_dev *dev, u32 function,
 		 * fault on first dereference.
 		 *
 		 * vfmig_iova_alloc_slot() returns IOVAs strictly above
-		 * VFMIG_IOVA_BASE (256 GiB), so the "FW doesn't support
+		 * the window base (8 GiB or more), so the "FW doesn't support
 		 * physical-address-0" workaround the default path does is
 		 * unnecessary. fwp->page is left NULL because the IOVA
 		 * module owns the backing page; free_fwp() reads vfmig_dom

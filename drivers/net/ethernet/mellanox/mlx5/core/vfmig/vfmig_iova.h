@@ -56,6 +56,7 @@
 
 #include <linux/bits.h>
 #include <linux/types.h>
+#include <uapi/linux/mlx5_vfmig.h>
 
 struct pci_dev;
 struct sg_table;
@@ -150,27 +151,31 @@ enum vfmig_eq_role {
 /*
  * IOVA window layout (hardware-visible addresses).
  *
- *   VFMIG_IOVA_DMA_MASK_BITS -- the DMA mask, 39 bits, the VF carries
- *                          when its window is reserved.
- *   VFMIG_IOVA_PER_VF   -- IOVA space per VF, 256 GiB: half of what that
- *                          mask reaches.
- *   VFMIG_IOVA_BASE     -- base of every VF's window, 256 GiB.
+ *   bits                -- the DMA mask, in bits, the VF carries when
+ *                          its window is reserved: SET_TRACKED's
+ *                          @iova_bits, VFMIG_IOVA_DEFAULT_DMA_MASK_BITS
+ *                          (39) unless asked otherwise.
+ *   VFMIG_IOVA_WINDOW_BYTES(bits)
+ *                       -- both the size and the base of the VF's
+ *                          window: the top half of what the mask
+ *                          reaches, [2^(bits-1), 2^bits). 256 GiB at
+ *                          256 GiB for the default.
  *
  * The window is reserved with the public dma_iova_try_alloc(), which
  * takes no address. Its allocator aligns a request to the request's
  * size rounded up to a power of two and searches down from the DMA
- * mask, so 256 GiB under a 39-bit mask can only land at
- * [256 GiB, 512 GiB): the next aligned candidate down starts at IOVA 0,
- * which the allocator never hands out. The result therefore does not
- * depend on the IOMMU's address width, as long as its aperture reaches
- * 512 GiB. It fails instead if that range is not free -- a platform
- * reservation such as a PCI host-bridge window inside it, or a smaller
- * aperture. The placement is the allocator's behavior, not an API
- * guarantee, so vfmig_iova_domain_create() checks the returned range
- * and fails SET_TRACKED rather than use a window anywhere else.
+ * mask, so 2^(bits-1) bytes under a @bits-bit mask can only land at
+ * [2^(bits-1), 2^bits): the next aligned candidate down starts at IOVA
+ * 0, which the allocator never hands out. The result therefore does
+ * not depend on the IOMMU's address width, as long as its aperture
+ * reaches 2^bits. It fails instead if that range is not free -- a
+ * platform reservation such as a PCI host-bridge window inside it, or
+ * a smaller aperture. The placement is the allocator's behavior, not an
+ * API guarantee, so vfmig_iova_domain_create() checks the returned
+ * range and fails SET_TRACKED rather than use a window anywhere else.
  *
- * Each VF reserves the same [BASE, BASE + PER_VF) in its own managed
- * domain, so an image replays onto any VF of the PF.
+ * Each VF reserves its window in its own managed domain, so an image
+ * replays onto any VF of the PF tracked with the same bits.
  *
  *   VFMIG_IOVA_GRANULE  -- minimum allocation alignment; matches
  *                          PAGE_SIZE (also the mlx5 hardware page size).
@@ -178,9 +183,9 @@ enum vfmig_eq_role {
 
 #if IS_ENABLED(CONFIG_MLX5_VFMIG)
 
-#define VFMIG_IOVA_DMA_MASK_BITS	39
-#define VFMIG_IOVA_PER_VF	BIT_ULL(VFMIG_IOVA_DMA_MASK_BITS - 1)
-#define VFMIG_IOVA_BASE		VFMIG_IOVA_PER_VF
+#define VFMIG_IOVA_DEFAULT_DMA_MASK_BITS	MLX5_VFMIG_IOVA_BITS_DEFAULT
+#define VFMIG_IOVA_MIN_DMA_MASK_BITS		MLX5_VFMIG_IOVA_BITS_MIN
+#define VFMIG_IOVA_WINDOW_BYTES(bits)		BIT_ULL((bits) - 1)
 #define VFMIG_IOVA_GRANULE	PAGE_SIZE
 
 /*
@@ -197,10 +202,11 @@ enum vfmig_eq_role {
  *     (future) non-migrated kcoherent sub-arena, so the user-MR IOVA
  *     range proper starts at slot_base(USER_PAGE) + KCOHERENT_BYTES.
  *
- * The 510 MiB kernel slot size is pinned (not scaled with PER_VF): the
- * kernel call-site footprint is bounded by hardware capabilities, not by
- * the window size, and pinning it keeps a SAVE blob's kernel-slot IOVAs
- * PER_VF-independent -- only USER_PAGE's upper bound depends on PER_VF.
+ * The 510 MiB kernel slot size is pinned (not scaled with the window):
+ * the kernel call-site footprint is bounded by hardware capabilities,
+ * not by the window size, and pinning it keeps a SAVE blob's
+ * kernel-slot offsets window-independent -- only USER_PAGE's upper
+ * bound depends on the window size.
  */
 #define VFMIG_IOVA_NR_SLOTS		((unsigned int)VFMIG_SLOT_NR)
 #define VFMIG_IOVA_KERNEL_NR_SLOTS	(VFMIG_IOVA_NR_SLOTS - 1U)
@@ -225,29 +231,40 @@ enum vfmig_eq_role {
  */
 #define VFMIG_IOVA_KCOHERENT_BYTES	BIT_ULL(30)	/* 1 GiB */
 
-static_assert(VFMIG_IOVA_PER_VF >
-	      (u64)VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES +
-	      VFMIG_IOVA_KCOHERENT_BYTES,
-	      "VFMIG_IOVA_PER_VF too small: must fit the fixed 510-MiB kernel slots + the kcoherent carve + at least one user-MR IOVA");
-static_assert(VFMIG_IOVA_BASE + VFMIG_IOVA_PER_VF ==
-	      BIT_ULL(VFMIG_IOVA_DMA_MASK_BITS),
-	      "the window must be the size-aligned top of the reservation mask");
+#define VFMIG_IOVA_FIXED_BYTES \
+	((u64)VFMIG_IOVA_KERNEL_NR_SLOTS * VFMIG_IOVA_SLOT_BYTES + \
+	 VFMIG_IOVA_KCOHERENT_BYTES)
+
+static_assert(VFMIG_IOVA_WINDOW_BYTES(VFMIG_IOVA_MIN_DMA_MASK_BITS) >
+	      VFMIG_IOVA_FIXED_BYTES,
+	      "VFMIG_IOVA_MIN_DMA_MASK_BITS too small: its window must fit the fixed 510-MiB kernel slots + the kcoherent carve + at least one user-MR IOVA");
+static_assert(VFMIG_IOVA_WINDOW_BYTES(VFMIG_IOVA_MIN_DMA_MASK_BITS - 1) <=
+	      VFMIG_IOVA_FIXED_BYTES,
+	      "VFMIG_IOVA_MIN_DMA_MASK_BITS is not the smallest window that fits; lower it");
+static_assert(VFMIG_IOVA_DEFAULT_DMA_MASK_BITS >= VFMIG_IOVA_MIN_DMA_MASK_BITS,
+	      "the default window must fit the fixed slots");
 static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
 	      "VFMIG_IOVA_SLOT_BYTES must be >= 8 MiB to host worst-case kernel allocations");
 
 /*
  * Reserve the fixed per-VF IOVA carveout in @vf_pdev's managed DMA-IOMMU
- * domain and return the handle in *@out. Sets @vf_pdev's DMA mask to
- * VFMIG_IOVA_DMA_MASK_BITS and leaves it there; the driver that binds
- * next may raise it. Returns 0 on success (with a pinned reference on
- * @vf_pdev held for the domain's lifetime), -EOPNOTSUPP if the VF is not
- * a DMA-coherent, dma-iommu-managed device or its IOMMU aperture or bus
- * DMA limit stops short of the window, -EIO if the mask cannot be set,
- * -ENOSPC if the window could not be reserved, or -ERANGE if it was
- * reserved anywhere but [VFMIG_IOVA_BASE, VFMIG_IOVA_BASE + PER_VF).
+ * domain and return the handle in *@out. @dma_bits, in
+ * [VFMIG_IOVA_MIN_DMA_MASK_BITS, VFMIG_IOVA_DEFAULT_DMA_MASK_BITS],
+ * selects the window [2^(dma_bits-1), 2^dma_bits). Sets @vf_pdev's DMA
+ * mask to @dma_bits and leaves it there; the driver that binds next may
+ * raise it. Returns 0 on success (with a pinned reference on @vf_pdev
+ * held for the domain's lifetime), -EINVAL if @dma_bits is out of range,
+ * -EOPNOTSUPP if the VF is not a DMA-coherent, dma-iommu-managed device
+ * or its IOMMU aperture or bus DMA limit stops short of the window, -EIO
+ * if the mask cannot be set, -ENOSPC if the window could not be
+ * reserved, or -ERANGE if it was reserved anywhere else.
  */
 int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
+			      unsigned int dma_bits,
 			      struct vfmig_iova_domain **out);
+
+/* The DMA mask bits @dom's window was reserved under. */
+unsigned int vfmig_iova_domain_dma_bits(const struct vfmig_iova_domain *dom);
 
 /*
  * Unlink + free every registry page, release the arena reservation, and

@@ -121,17 +121,19 @@ struct vfmig_iova_kobj {
  * carveout in it and populate it with dma_iova_link(). @arena is the
  * reservation returned by dma_iova_try_alloc(); @arena.addr == @base.
  * @vf_pdev is pinned for the domain's lifetime; @vf_id labels log lines
- * and plays no part in the IOVA layout. The deterministic range
- * [base, base + NR_SLOTS * SLOT_BYTES) is partitioned across the slot
- * windows.
+ * and plays no part in the IOVA layout. @dma_bits picks the window
+ * [@base, @base + @size), both 2^(dma_bits-1), which is partitioned
+ * across the slot windows.
  */
 struct vfmig_iova_domain {
-	struct dma_iova_state arena;	/* reserved [base, base+PER_VF) */
+	struct dma_iova_state arena;	/* reserved [base, base+size) */
 	struct iommu_domain *arena_dom;	/* VF domain @arena was reserved in */
 	struct pci_dev	    *vf_pdev;	/* held via pci_dev_get() */
 	u32		     vf_id;
+	unsigned int	     dma_bits;
 
 	u64		     base;
+	u64		     size;
 
 	struct mutex	     lock;
 	/*
@@ -219,7 +221,7 @@ vfmig_iova_slot_end(const struct vfmig_iova_domain *dom,
 		    enum vfmig_iova_slot slot)
 {
 	if (slot == VFMIG_SLOT_USER_PAGE)
-		return dom->base + VFMIG_IOVA_PER_VF;
+		return dom->base + dom->size;
 	return dom->base + (u64)(slot + 1) * VFMIG_IOVA_SLOT_BYTES;
 }
 
@@ -235,7 +237,7 @@ vfmig_iova_slot_from_iova(const struct vfmig_iova_domain *dom, u64 iova)
 {
 	u64 idx;
 
-	if (iova < dom->base || iova >= dom->base + VFMIG_IOVA_PER_VF)
+	if (iova < dom->base || iova >= dom->base + dom->size)
 		return VFMIG_SLOT_INVALID;
 	idx = (iova - dom->base) / VFMIG_IOVA_SLOT_BYTES;
 	if (idx <= VFMIG_SLOT_INVALID)
@@ -481,9 +483,10 @@ vfmig_iova_destroy_page_locked(struct vfmig_iova_domain *dom,
 /* -------- exported API -------------------------------------------------- */
 
 int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
+			     unsigned int dma_bits,
 			     struct vfmig_iova_domain **out)
 {
-	u64 base, limit, aperture_end;
+	u64 base, size, limit, aperture_end;
 	struct iommu_domain *dma_dom;
 	struct vfmig_iova_domain *dom;
 	unsigned int s;
@@ -491,15 +494,20 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 
 	if (!vf_pdev || !out)
 		return -EINVAL;
+	if (dma_bits < VFMIG_IOVA_MIN_DMA_MASK_BITS ||
+	    dma_bits > VFMIG_IOVA_DEFAULT_DMA_MASK_BITS)
+		return -EINVAL;
 
 	/*
-	 * Every VF reserves the same window: each VF is its own IOMMU
-	 * group with its own managed domain, so identical ranges do not
-	 * collide, and a saved image's IOVAs replay onto any VF of the PF
-	 * rather than only the VF index it was saved from. VFs that do
-	 * share a domain fail the reservation below instead of overlapping.
+	 * Every VF tracked with the same @dma_bits reserves the same
+	 * window: each VF is its own IOMMU group with its own managed
+	 * domain, so identical ranges do not collide, and a saved image's
+	 * IOVAs replay onto any VF of the PF rather than only the VF index
+	 * it was saved from. VFs that do share a domain fail the
+	 * reservation below instead of overlapping.
 	 */
-	base = VFMIG_IOVA_BASE;
+	size = VFMIG_IOVA_WINDOW_BYTES(dma_bits);
+	base = size;
 
 	/*
 	 * The arena lives inside the VF's managed dma-iommu domain: its IOVA
@@ -544,7 +552,9 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	dom->user_index = RB_ROOT;
 	atomic_long_set(&dom->awaiting_bind_hits, 0);
 	dom->vf_id = vf_id;
+	dom->dma_bits = dma_bits;
 	dom->base  = base;
+	dom->size  = size;
 
 	/*
 	 * Per-slot bump cursors: each starts at its slot's window base.
@@ -573,16 +583,13 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	 * allocations, and the driver that binds next raising it keeps the
 	 * window within reach.
 	 */
-	err = dma_set_mask(&vf_pdev->dev,
-			   DMA_BIT_MASK(VFMIG_IOVA_DMA_MASK_BITS));
-	if (!err && dma_get_mask(&vf_pdev->dev) !=
-		    DMA_BIT_MASK(VFMIG_IOVA_DMA_MASK_BITS))
+	err = dma_set_mask(&vf_pdev->dev, DMA_BIT_MASK(dma_bits));
+	if (!err && dma_get_mask(&vf_pdev->dev) != DMA_BIT_MASK(dma_bits))
 		err = -EIO;
 	if (err) {
 		dev_warn(&vf_pdev->dev,
 			 "vfmig_iova: vf %u cannot take a %u-bit DMA mask (mask now 0x%llx): %d\n",
-			 vf_id, VFMIG_IOVA_DMA_MASK_BITS,
-			 dma_get_mask(&vf_pdev->dev), err);
+			 vf_id, dma_bits, dma_get_mask(&vf_pdev->dev), err);
 		goto err_pci_put;
 	}
 
@@ -591,7 +598,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	 * limit. Either one below the window's top would make the
 	 * reservation below fail or land lower; say which.
 	 */
-	limit = base + VFMIG_IOVA_PER_VF - 1;
+	limit = base + size - 1;
 	dma_dom = iommu_get_domain_for_dev(&vf_pdev->dev);
 	aperture_end = dma_dom->geometry.force_aperture ?
 		       (u64)dma_dom->geometry.aperture_end : U64_MAX;
@@ -599,7 +606,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	    (vf_pdev->dev.bus_dma_limit && vf_pdev->dev.bus_dma_limit < limit)) {
 		dev_warn(&vf_pdev->dev,
 			 "vfmig_iova: vf %u IOVA window [0x%llx, 0x%llx) is out of reach: IOMMU aperture ends at 0x%llx, bus DMA limit 0x%llx\n",
-			 vf_id, base, base + VFMIG_IOVA_PER_VF, aperture_end,
+			 vf_id, base, base + size, aperture_end,
 			 (u64)vf_pdev->dev.bus_dma_limit);
 		err = -EOPNOTSUPP;
 		goto err_pci_put;
@@ -612,22 +619,20 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	 * here with a printed reason rather than deep inside a later
 	 * cmd-ring DMA.
 	 */
-	if (!dma_iova_try_alloc(&vf_pdev->dev, &dom->arena, 0,
-				VFMIG_IOVA_PER_VF)) {
+	if (!dma_iova_try_alloc(&vf_pdev->dev, &dom->arena, 0, size)) {
 		dev_warn(&vf_pdev->dev,
 			 "vfmig_iova: vf %u could not reserve IOVA window [0x%llx, 0x%llx) under a %u-bit DMA mask\n",
-			 vf_id, base, base + VFMIG_IOVA_PER_VF,
-			 VFMIG_IOVA_DMA_MASK_BITS);
+			 vf_id, base, base + size, dma_bits);
 		err = -ENOSPC;
 		goto err_pci_put;
 	}
 	if (dom->arena.addr != base ||
-	    dma_iova_size(&dom->arena) != VFMIG_IOVA_PER_VF) {
+	    dma_iova_size(&dom->arena) != size) {
 		dev_warn(&vf_pdev->dev,
 			 "vfmig_iova: vf %u IOVA window reserved at [0x%llx, 0x%llx), not [0x%llx, 0x%llx)\n",
 			 vf_id, (u64)dom->arena.addr,
 			 (u64)dom->arena.addr + dma_iova_size(&dom->arena),
-			 base, base + VFMIG_IOVA_PER_VF);
+			 base, base + size);
 		dma_iova_free(&vf_pdev->dev, &dom->arena);
 		err = -ERANGE;
 		goto err_pci_put;
@@ -636,8 +641,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 
 	dev_info(&vf_pdev->dev,
 		 "vfmig_iova: vf %u IOVA window [0x%llx, 0x%llx) reserved under a %u-bit DMA mask (IOMMU aperture ends at 0x%llx, bus DMA limit 0x%llx)\n",
-		 vf_id, base, base + VFMIG_IOVA_PER_VF,
-		 VFMIG_IOVA_DMA_MASK_BITS, aperture_end,
+		 vf_id, base, base + size, dma_bits, aperture_end,
 		 (u64)vf_pdev->dev.bus_dma_limit);
 
 	dev_info(&vf_pdev->dev,
@@ -646,7 +650,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 		 vfmig_iova_slot_base(dom, VFMIG_SLOT_USER_PAGE),
 		 VFMIG_IOVA_KERNEL_NR_SLOTS, (u64)VFMIG_IOVA_SLOT_BYTES,
 		 (u64)VFMIG_IOVA_KCOHERENT_BYTES,
-		 vfmig_iova_user_page_start(dom), base + VFMIG_IOVA_PER_VF);
+		 vfmig_iova_user_page_start(dom), base + size);
 
 	*out = dom;
 	return 0;
@@ -657,6 +661,11 @@ err_pci_put:
 	mutex_destroy(&dom->lock);
 	kfree(dom);
 	return err;
+}
+
+unsigned int vfmig_iova_domain_dma_bits(const struct vfmig_iova_domain *dom)
+{
+	return dom->dma_bits;
 }
 
 unsigned int vfmig_iova_nr_pages(struct vfmig_iova_domain *dom)
