@@ -79,7 +79,7 @@ struct vfmig_wire_header {
  * VF's SAVE stream. A tracked source's blob is:
  *
  *   [STREAM_HEADER]  1x  { magic, version, num_pages, manifest_crc32,
- *                          num_user_pages }
+ *                          num_user_pages, iova_bits, reserved }
  *   [HOST_PAGE]      Nx  one per deterministic-IOVA registry entry, in
  *                        IOVA-ascending order, carrying page contents
  *   [HOST_USER_PAGE] Mx  one per retagged external (USER_PAGE) entry,
@@ -113,7 +113,7 @@ struct vfmig_wire_header {
  * yield a successful LOAD followed by a dead VHCA.
  */
 #define VFMIG_WIRE_MAGIC		0x564D4947 /* "VMIG" little-endian */
-#define VFMIG_STREAM_VERSION		1
+#define VFMIG_STREAM_VERSION		0
 #define VFMIG_WIRE_TAG_STREAM_HEADER	0x4853
 #define VFMIG_WIRE_TAG_HOST_PAGE	0x4842
 #define VFMIG_WIRE_TAG_HOST_USER_PAGE	0x4855
@@ -126,6 +126,8 @@ struct vfmig_stream_header {
 	__le64 num_pages;
 	__le32 manifest_crc32;
 	__le32 num_user_pages;
+	__le32 iova_bits;	/* source's SET_TRACKED window */
+	__le32 reserved;	/* 0 */
 };
 
 struct vfmig_host_page_record {
@@ -1988,6 +1990,8 @@ static int vfmig_save_build_host_pages_buf(struct mlx5_vfmig_save_ctx *ctx,
 	sh_payload.num_pages	  = cpu_to_le64(sc.count);
 	sh_payload.manifest_crc32 = cpu_to_le32(ec_hup.crc);
 	sh_payload.num_user_pages = cpu_to_le32((u32)sc_hup.count);
+	sh_payload.iova_bits	  = cpu_to_le32(vfmig_iova_domain_dma_bits(dom));
+	sh_payload.reserved	  = 0;
 	memcpy((u8 *)ctx->host_pages_buf + sizeof(sh_hdr),
 	       &sh_payload, sizeof(sh_payload));
 
@@ -2970,6 +2974,7 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 			      ctx->stream_hdr_filled;
 		size_t take = min(need, *left);
 		struct vfmig_stream_header sh;
+		u32 src_bits;
 
 		if (take) {
 			if (copy_from_user(ctx->stream_hdr_buf +
@@ -2999,6 +3004,13 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 				       VFMIG_STREAM_VERSION);
 			return -EOPNOTSUPP;
 		}
+		if (sh.reserved) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: stream header reserved word 0x%x != 0\n",
+				       ctx->vf_id, le32_to_cpu(sh.reserved));
+			return -EPROTO;
+		}
+		src_bits = le32_to_cpu(sh.iova_bits);
 
 		ctx->hp_expected	= le64_to_cpu(sh.num_pages);
 		ctx->hup_expected	= le32_to_cpu(sh.num_user_pages);
@@ -3021,6 +3033,21 @@ static int vfmig_load_step(struct mlx5_vfmig_load_ctx *ctx,
 				       (unsigned long long)ctx->hp_expected,
 				       (unsigned long long)ctx->hup_expected);
 			return -EINVAL;
+		}
+
+		/*
+		 * Every IOVA in the stream, and in the firmware state after
+		 * it, lies in the source's window; the destination must have
+		 * been tracked with the same one.
+		 */
+		if (ctx->iova_dom &&
+		    vfmig_iova_domain_dma_bits(ctx->iova_dom) != src_bits) {
+			mlx5_core_warn(ctx->vfmig->pf_mdev,
+				       "vfmig: vf %u: stream saved with iova_bits %u but destination tracked with iova_bits %u; untrack and SET_TRACKED with iova_bits %u\n",
+				       ctx->vf_id, src_bits,
+				       vfmig_iova_domain_dma_bits(ctx->iova_dom),
+				       src_bits);
+			return -ERANGE;
 		}
 
 		/*

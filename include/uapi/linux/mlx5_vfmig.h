@@ -444,8 +444,10 @@ struct mlx5_vfmig_save_state {
  *   of range or @flags / @reserved are non-zero; -EOPNOTSUPP if the VF is
  *   not migration-enabled; -EBUSY if a save or load session already exists
  *   for this vf_id; -ENODEV if the PF is gone. write() errors surface
- *   -EPROTO/-EINVAL for a malformed stream. Any firmware error from the
- *   deferred LOAD_VHCA_STATE surfaces in the VF probe (dmesg), not here.
+ *   -EPROTO/-EINVAL for a malformed stream, and -ERANGE for a stream
+ *   saved from a VF tracked with a different SET_TRACKED @iova_bits
+ *   than this one. Any firmware error from the deferred LOAD_VHCA_STATE
+ *   surfaces in the VF probe (dmesg), not here.
  */
 struct mlx5_vfmig_load_state {
 	__u32 vf_id;	/* in  */
