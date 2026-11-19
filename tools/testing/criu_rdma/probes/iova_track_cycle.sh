@@ -15,9 +15,9 @@
 #            ((round + j) mod n)th entry of $BITS, so VFs hold different
 #            windows at once and each VF sees every size over the run.
 #            For each VF: the logged window, the kernel slot and USER_PAGE
-#            bounds, and QUERY_VF's tracked bit and iova_bits. Then
-#            untracks every VF and checks the release, tracked=0 and
-#            iova_bits=0.
+#            bounds, QUERY_VF's tracked bit and iova_bits, and that the
+#            PF's sysfs iova_bits lists the size. Then untracks every VF
+#            and checks the release, tracked=0 and iova_bits=0.
 #   report   Per iova_bits: reservations checked, the window, and the
 #            IOMMU aperture end and bus DMA limit the kernel logged.
 #
@@ -138,6 +138,7 @@ track_check() {
 		fail "vf $vf bits $bits: slot bounds not in [$(hex $base), $(hex $end)): ${slots#*vfmig_iova: }"
 	[[ "$(tracked_of "$vf")" == 1 ]] || fail "vf $vf bits $bits: QUERY_VF tracked != 1"
 	[[ "$(bits_of "$vf")" == "$b" ]] || fail "vf $vf bits $bits: QUERY_VF iova_bits $(bits_of "$vf") != $b"
+	[[ " $PF_BITS " == *" $b "* ]] || fail "vf $vf bits $bits: reserved, but $SYSFS lists only '$PF_BITS'"
 	check_clean "$tag" "vf $vf bits $bits"
 	sed -n 's/.*(IOMMU aperture ends at \(0x[0-9a-f]*\), bus DMA limit \(0x[0-9a-f]*\)).*/\1 \2/p' \
 		<<<"$win" | sed "s/^/$b $(hex $base) $(hex $end) /" >>"$STATS"
@@ -232,7 +233,15 @@ sect "Preconditions"
 for b in "${BITS_A[@]}"; do
 	(( b == 0 || (b >= 34 && b <= 39) )) || die "BITS entry $b outside 0 or 34..39"
 done
+SYSFS="/sys/class/mlx5_vfmig/mlx5_vfmig!$PF/iova_bits"
+[[ -r "$SYSFS" ]] || die "no $SYSFS (mlx5_core too old?)"
+PF_BITS="$(cat "$SYSFS")"
+for b in "${BITS_A[@]}"; do
+	[[ " $PF_BITS " == *" $(eff_bits "$b") "* ]] ||
+		die "BITS entry $b not in $SYSFS ('$PF_BITS'); this platform cannot take it"
+done
 note "kernel $(uname -r), PF $PF, $NUMVFS VFs, $ITERS rounds, bits: $BITS"
+note "$SYSFS: $PF_BITS"
 note "cmdline: $(cat /proc/cmdline)"
 note "PCI host-bridge windows at or above 8 GiB (inside a window -> -ENOSPC there):"
 while IFS= read -r l; do

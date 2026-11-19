@@ -105,6 +105,13 @@ builds the helpers that need libibverbs.
   checks every reservation lands at [2^(bits-1), 2^bits), plus the
   out-of-range and re-track refusals. It prints the IOMMU aperture end
   and bus DMA limit the kernel logged for each window size.
+- `probes/iova_leftover.sh` -- tracks a VF with `FIRST=` bits, binds
+  and unbinds it, then checks it re-tracks with the same window and
+  with `SECOND=` bits despite the IOVAs its driver used. On a refusal it
+  retries on a fresh IOMMU domain (group type identity, then DMA) to
+  tell IOVAs leaked in the old domain from anything else.
+  `GROUP_TYPE=DMA-FQ` runs it on a lazy domain, where unmapped IOVAs
+  wait in the flush queue, and reports whether SET_TRACKED waited.
 
 Helpers: `probes/vfmig_fence` raises and lifts the RX fence, optionally
 with `eth`. `probes/rc_pair` drives RC QP pairs between two ib devices
