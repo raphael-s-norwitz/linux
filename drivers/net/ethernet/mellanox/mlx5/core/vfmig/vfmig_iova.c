@@ -128,6 +128,7 @@ struct vfmig_iova_kobj {
  */
 struct vfmig_iova_domain {
 	struct dma_iova_state arena;	/* reserved [base, base+size) */
+	struct dma_iova_state park;	/* see vfmig_iova_park() */
 	struct iommu_domain *arena_dom;	/* VF domain @arena was reserved in */
 	struct pci_dev	    *vf_pdev;	/* held via pci_dev_get() */
 	u32		     vf_id;
@@ -620,6 +621,40 @@ static int vfmig_iova_reserve_window(struct pci_dev *vf_pdev, u32 vf_id,
 	return -ERANGE;
 }
 
+/*
+ * The IOVA allocator starts each search below the IOVA it inserted
+ * last, which after the reservation is the window: whatever @dma_bits
+ * is, the bound driver's own mappings would land just under
+ * 2^(dma_bits-1), inside the (dma_bits - 1) window. Unbind unmaps
+ * those, but an MSI doorbell page (ARM ITS behind an SMMU) stays mapped
+ * for the life of the domain and would keep that window from being
+ * reserved again. Insert a park IOVA under 2^VFMIG_IOVA_PARK_BITS,
+ * below the smallest window and so below all of them, right after the
+ * window, so later allocations start there for any @dma_bits. Best
+ * effort: the doorbell is mapped once per domain, so without the park
+ * a VF loses at most the one window below the first it was bound with.
+ *
+ * The park must be larger than iova_rcache_range() (32 IOVA pages, not
+ * exported): smaller IOVAs are freed into and served from the per-CPU
+ * IOVA caches without touching the tree, so a re-track's park would
+ * come from the cache and insert nothing.
+ */
+#define VFMIG_IOVA_PARK_BITS	(VFMIG_IOVA_MIN_DMA_MASK_BITS - 1)
+#define VFMIG_IOVA_PARK_BYTES	(64 * VFMIG_IOVA_GRANULE)
+
+static void vfmig_iova_park(struct vfmig_iova_domain *dom,
+			    unsigned int dma_bits)
+{
+	struct device *dev = &dom->vf_pdev->dev;
+
+	if (dma_set_mask(dev, DMA_BIT_MASK(VFMIG_IOVA_PARK_BITS)) ||
+	    !dma_iova_try_alloc(dev, &dom->park, 0, VFMIG_IOVA_PARK_BYTES))
+		dev_info(dev,
+			 "vfmig_iova: vf %u could not park an IOVA below its window; mappings that outlive the driver may block a smaller window later\n",
+			 dom->vf_id);
+	dma_set_mask(dev, DMA_BIT_MASK(dma_bits));
+}
+
 /* -------- exported API -------------------------------------------------- */
 
 int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
@@ -778,6 +813,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	if (err)
 		goto err_pci_put;
 	dom->arena_dom = dma_dom;
+	vfmig_iova_park(dom, dma_bits);
 
 	dev_info(&vf_pdev->dev,
 		 "vfmig_iova: vf %u IOVA window [0x%llx, 0x%llx) reserved under a %u-bit DMA mask (IOMMU aperture ends at 0x%llx, bus DMA limit 0x%llx)\n",
@@ -899,8 +935,11 @@ void vfmig_iova_domain_destroy(struct vfmig_iova_domain *dom)
 		kfree(k);
 	}
 	dom->n_kobjs = 0;
-	if (arena_live)
+	if (arena_live) {
 		dma_iova_free(&vf_pdev->dev, &dom->arena);
+		if (dma_use_iova(&dom->park))
+			dma_iova_free(&vf_pdev->dev, &dom->park);
+	}
 	mutex_unlock(&dom->lock);
 
 	if (vf_pdev) {
