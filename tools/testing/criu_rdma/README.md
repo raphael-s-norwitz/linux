@@ -105,8 +105,9 @@ builds the helpers that need libibverbs.
   checks every reservation lands at [2^(bits-1), 2^bits), plus the
   out-of-range and re-track refusals. It prints the IOMMU aperture end
   and bus DMA limit the kernel logged for each window size.
-- `probes/iova_leftover.sh` -- tracks a VF with `FIRST=` bits, binds
-  and unbinds it, then checks it re-tracks with the same window and
+- `probes/iova_leftover.sh` -- on a fresh IOMMU domain, tracks and
+  untracks a VF once (`PRETRACK=0` skips this), tracks it with `FIRST=`
+  bits, binds and unbinds it, then checks it re-tracks with the same window and
   with `SECOND=` bits despite the IOVAs its driver used. On a refusal it
   retries on a fresh IOMMU domain (group type identity, then DMA) to
   tell IOVAs leaked in the old domain from anything else.

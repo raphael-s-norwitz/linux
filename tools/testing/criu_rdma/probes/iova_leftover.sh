@@ -11,7 +11,11 @@
 # flushed when an allocation, here the window's, would otherwise fail,
 # so only mappings still live after the unbind (a leak) can block it.
 #
-# On PF $PF, VF $VF unbound in a DMA domain:
+# On PF $PF, VF $VF unbound in a fresh DMA domain (its IOMMU group
+# switched to identity and back), so nothing an earlier bind mapped is
+# still in it:
+#   0. if PRETRACK=1, track with $FIRST and untrack before any bind,
+#      as a restore does after a refused LOAD
 #   1. track with $FIRST, bind mlx5_core, bring the netdev up if
 #      NETDEV_UP=1, unbind, untrack
 #   2. re-track with $FIRST: must succeed
@@ -37,6 +41,7 @@
 #   SECOND       iova_bits to re-track with (default 38)
 #   NETDEV_UP    1 (default): bring the VF's netdev up while bound, so
 #                its RX buffers are DMA-mapped
+#   PRETRACK     1 (default): run step 0
 #   GROUP_TYPE   the VF's IOMMU group type: DMA (default, strict) or
 #                DMA-FQ (lazy, with a flush queue)
 #   TOOL         mlx5_vfmig CLI (default ../tools/mlx5_vfmig)
@@ -53,6 +58,7 @@ VF="${VF:-0}"
 FIRST="${FIRST:-39}"
 SECOND="${SECOND:-38}"
 NETDEV_UP="${NETDEV_UP:-1}"
+PRETRACK="${PRETRACK:-1}"
 GROUP_TYPE="${GROUP_TYPE:-DMA}"
 TOOL="${TOOL:-$HERE/../tools/mlx5_vfmig}"
 BIND_TIMEOUT="${BIND_TIMEOUT:-90}"
@@ -117,7 +123,7 @@ done
 [[ "$GROUP_TYPE" == DMA || "$GROUP_TYPE" == DMA-FQ ]] || die "GROUP_TYPE must be DMA or DMA-FQ"
 SYSFS="/sys/class/mlx5_vfmig/mlx5_vfmig!$PF/iova_bits"
 note "kernel $(uname -r), PF $PF, vf $VF, $FIRST then $SECOND bits"
-note "NETDEV_UP=$NETDEV_UP, GROUP_TYPE=$GROUP_TYPE"
+note "NETDEV_UP=$NETDEV_UP, PRETRACK=$PRETRACK, GROUP_TYPE=$GROUP_TYPE"
 [[ -r "$SYSFS" ]] && note "PF iova_bits: $(cat "$SYSFS")"
 SEQ=0
 trap teardown EXIT
@@ -127,9 +133,17 @@ echo 0 >"$PF_DEV/sriov_numvfs"
 echo 0 >"$PF_DEV/sriov_drivers_autoprobe"
 echo $((VF + 1)) >"$PF_DEV/sriov_numvfs" || die "could not create $((VF + 1)) VFs"
 BDF="$(basename "$(readlink "$PF_DEV/virtfn$VF")")"
-[[ "$(cat "/sys/bus/pci/devices/$BDF/iommu_group/type")" == "$GROUP_TYPE" ]] ||
-	set_type "$GROUP_TYPE" || die "could not switch $BDF IOMMU group to $GROUP_TYPE"
-note "vf $VF $BDF, IOMMU group type $(cat "/sys/bus/pci/devices/$BDF/iommu_group/type")"
+[[ "$(cat "/sys/bus/pci/devices/$BDF/iommu_group/type")" == identity ]] ||
+	set_type identity || die "could not switch $BDF IOMMU group to identity"
+set_type "$GROUP_TYPE" || die "could not switch $BDF IOMMU group to $GROUP_TYPE"
+note "vf $VF $BDF, fresh IOMMU domain of type $(cat "/sys/bus/pci/devices/$BDF/iommu_group/type")"
+
+if [[ "$PRETRACK" == 1 ]]; then
+	sect "0. Track with $FIRST and untrack, before any bind"
+	track "$FIRST" || die "track vf $VF with $FIRST failed"
+	untrack
+	note "ok"
+fi
 
 sect "1. Track with $FIRST, bind, unbind, untrack"
 track "$FIRST" || die "track vf $VF with $FIRST failed"
