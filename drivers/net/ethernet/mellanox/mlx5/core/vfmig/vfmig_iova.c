@@ -480,6 +480,101 @@ vfmig_iova_destroy_page_locked(struct vfmig_iova_domain *dom,
 	kfree(p);
 }
 
+/*
+ * Whether [@lo, @hi] lies in the union of @bridge's DMA ranges. Outside
+ * them is reserved; adjacent ranges leave no gap.
+ */
+static bool vfmig_iova_in_dma_ranges(struct pci_host_bridge *bridge,
+				     u64 lo, u64 hi)
+{
+	struct resource_entry *win;
+	bool advanced;
+
+	do {
+		advanced = false;
+		resource_list_for_each_entry(win, &bridge->dma_ranges) {
+			u64 start = win->res->start - win->offset;
+			u64 end = win->res->end - win->offset;
+
+			if (start > lo || end < lo)
+				continue;
+			if (end >= hi)
+				return true;
+			lo = end + 1;
+			advanced = true;
+		}
+	} while (advanced);
+	return false;
+}
+
+/*
+ * Find what a dma-iommu domain for @pdev reserves inside [@base,
+ * @base + @size): the same host-bridge memory windows, gaps between the
+ * host bridge's DMA ranges and IOMMU reserved regions that
+ * iova_reserve_iommu_regions() reserves in every such domain. Describe
+ * the first one in @why and return true, or return false if none of
+ * them overlaps.
+ */
+static bool vfmig_iova_window_blocked(struct pci_dev *pdev, u64 base,
+				      u64 size, char *why, size_t len)
+{
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
+	struct iommu_resv_region *region;
+	struct resource_entry *win;
+	u64 last = base + size - 1;
+	LIST_HEAD(resv);
+	bool found = false;
+
+	resource_list_for_each_entry(win, &bridge->windows) {
+		u64 lo = win->res->start - win->offset;
+		u64 hi = win->res->end - win->offset;
+
+		if (resource_type(win->res) != IORESOURCE_MEM ||
+		    lo > last || hi < base)
+			continue;
+		snprintf(why, len, "PCI host-bridge window [0x%llx, 0x%llx]",
+			 lo, hi);
+		return true;
+	}
+
+	if (!list_empty(&bridge->dma_ranges) &&
+	    !vfmig_iova_in_dma_ranges(bridge, base, last)) {
+		snprintf(why, len, "a gap between PCI host-bridge DMA ranges");
+		return true;
+	}
+
+	iommu_get_resv_regions(&pdev->dev, &resv);
+	list_for_each_entry(region, &resv, list) {
+		u64 hi = region->start + region->length - 1;
+
+		if (region->type == IOMMU_RESV_SW_MSI ||
+		    region->start > last || hi < base)
+			continue;
+		snprintf(why, len, "IOMMU reserved region [0x%llx, 0x%llx]",
+			 (u64)region->start, hi);
+		found = true;
+		break;
+	}
+	iommu_put_resv_regions(&pdev->dev, &resv);
+	return found;
+}
+
+/* Say why the window [@base, @base + @size) could not be reserved. */
+static void vfmig_iova_explain_window(struct pci_dev *vf_pdev, u32 vf_id,
+				      u64 base, u64 size)
+{
+	char why[80];
+
+	if (vfmig_iova_window_blocked(vf_pdev, base, size, why, sizeof(why)))
+		dev_warn(&vf_pdev->dev,
+			 "vfmig_iova: vf %u IOVA window [0x%llx, 0x%llx) overlaps %s\n",
+			 vf_id, base, base + size, why);
+	else
+		dev_warn(&vf_pdev->dev,
+			 "vfmig_iova: vf %u IOVA window [0x%llx, 0x%llx) overlaps no platform reservation, so IOVAs still mapped in the VF's DMA domain are in it\n",
+			 vf_id, base, base + size);
+}
+
 /* -------- exported API -------------------------------------------------- */
 
 int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
@@ -623,6 +718,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 		dev_warn(&vf_pdev->dev,
 			 "vfmig_iova: vf %u could not reserve IOVA window [0x%llx, 0x%llx) under a %u-bit DMA mask\n",
 			 vf_id, base, base + size, dma_bits);
+		vfmig_iova_explain_window(vf_pdev, vf_id, base, size);
 		err = -ENOSPC;
 		goto err_pci_put;
 	}
@@ -634,6 +730,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 			 (u64)dom->arena.addr + dma_iova_size(&dom->arena),
 			 base, base + size);
 		dma_iova_free(&vf_pdev->dev, &dom->arena);
+		vfmig_iova_explain_window(vf_pdev, vf_id, base, size);
 		err = -ERANGE;
 		goto err_pci_put;
 	}
