@@ -196,6 +196,18 @@ struct mlx5_vfmig_enable_migratable {
  *   on disable. QUERY_VF reports the window in @iova_bits. A SAVE
  *   replays only onto a VF tracked with the same @iova_bits.
  *
+ *   /sys/class/mlx5_vfmig/mlx5_vfmig!<PF BDF>/iova_bits lists, space
+ *   separated, the values whose window that PF's VFs can take once in
+ *   a DMA domain: the IOMMU aperture and bus DMA limit reach the window
+ *   and no PCI host-bridge window or IOMMU reserved region of the PF
+ *   overlaps it. It is worked out when the PF is probed, so it can be
+ *   read before SR-IOV is enabled. A VF whose IOMMU group defaults to
+ *   identity (iommu=pt) needs its group type set to DMA or DMA-FQ
+ *   first. Not visible from the PF: reserved regions firmware scopes
+ *   to a VF alone (an RMRR or IORT entry naming it, rare for VFs), and
+ *   IOVAs still mapped in a VF's DMA domain, which an unbound VF has
+ *   only if a driver leaked them. SET_TRACKED is the final word.
+ *
  *   Idempotent: a toggle to the state the VF is already in is a no-op
  *   (returns 0, no iommu traffic), as long as an enable with a non-zero
  *   @iova_bits asks for the window the VF already has.

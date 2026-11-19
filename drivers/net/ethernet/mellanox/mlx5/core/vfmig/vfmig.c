@@ -233,6 +233,7 @@ struct mlx5_vfmig_pf {
 	struct cdev		cdev;
 	int			minor;
 	u16			max_vfs;
+	u64			window_bits;	/* see vfmig_iova_window_bits() */
 	unsigned long		*restored;
 	struct mlx5_vfmig_vf_load **pending_load;
 	uuid_t			*vf_uuid;
@@ -3926,6 +3927,28 @@ static const struct file_operations mlx5_vfmig_fops = {
 	.compat_ioctl	= compat_ptr_ioctl,
 };
 
+/* The SET_TRACKED iova_bits values this PF's VFs can take. */
+static ssize_t iova_bits_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	struct mlx5_vfmig_pf *vfmig = dev_get_drvdata(dev);
+	unsigned int bits;
+	int n = 0;
+
+	for (bits = MLX5_VFMIG_IOVA_BITS_MIN;
+	     bits <= MLX5_VFMIG_IOVA_BITS_DEFAULT; bits++)
+		if (vfmig->window_bits & BIT_ULL(bits))
+			n += sysfs_emit_at(buf, n, "%s%u", n ? " " : "", bits);
+	return n + sysfs_emit_at(buf, n, "\n");
+}
+static DEVICE_ATTR_RO(iova_bits);
+
+static struct attribute *mlx5_vfmig_dev_attrs[] = {
+	&dev_attr_iova_bits.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(mlx5_vfmig_dev);
+
 /* -------- probe-time restore hooks (called from mlx5_core main.c) ------- */
 
 /*
@@ -4896,6 +4919,7 @@ int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 	vfmig->pf_mdev = pf_mdev;
 
 	vfmig->max_vfs = pf_mdev->priv.sriov.max_vfs;
+	vfmig->window_bits = vfmig_iova_window_bits(pf_mdev->pdev);
 	if (vfmig->max_vfs) {
 		vfmig->restored = bitmap_zalloc(vfmig->max_vfs, GFP_KERNEL);
 		if (!vfmig->restored) {
@@ -4941,9 +4965,11 @@ int mlx5_vfmig_pf_init(struct mlx5_core_dev *pf_mdev)
 	if (err)
 		goto err_minor;
 
-	dev = device_create(mlx5_vfmig_class, mlx5_core_dma_dev(pf_mdev),
-			    devt, vfmig, "mlx5_vfmig!%s",
-			    dev_name(mlx5_core_dma_dev(pf_mdev)));
+	dev = device_create_with_groups(mlx5_vfmig_class,
+					mlx5_core_dma_dev(pf_mdev), devt,
+					vfmig, mlx5_vfmig_dev_groups,
+					"mlx5_vfmig!%s",
+					dev_name(mlx5_core_dma_dev(pf_mdev)));
 	if (IS_ERR(dev)) {
 		err = PTR_ERR(dev);
 		goto err_cdev;

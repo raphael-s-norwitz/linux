@@ -765,6 +765,40 @@ unsigned int vfmig_iova_domain_dma_bits(const struct vfmig_iova_domain *dom)
 	return dom->dma_bits;
 }
 
+u64 vfmig_iova_window_bits(struct pci_dev *pf_pdev)
+{
+	u64 aperture_end = U64_MAX, limit = pf_pdev->dev.bus_dma_limit;
+	struct iommu_domain *probe;
+	unsigned int bits;
+	char why[80];
+	u64 mask = 0;
+
+	/*
+	 * An unattached paging domain from the PF's IOMMU has the geometry
+	 * its VFs' DMA domains get; a PF without an IOMMU has VFs that
+	 * cannot be tracked at all.
+	 */
+	probe = iommu_paging_domain_alloc(&pf_pdev->dev);
+	if (IS_ERR(probe))
+		return 0;
+	if (probe->geometry.force_aperture)
+		aperture_end = probe->geometry.aperture_end;
+	iommu_domain_free(probe);
+
+	for (bits = VFMIG_IOVA_MIN_DMA_MASK_BITS;
+	     bits <= VFMIG_IOVA_DEFAULT_DMA_MASK_BITS; bits++) {
+		u64 size = VFMIG_IOVA_WINDOW_BYTES(bits);
+
+		if (aperture_end < DMA_BIT_MASK(bits) ||
+		    (limit && limit < DMA_BIT_MASK(bits)) ||
+		    vfmig_iova_window_blocked(pf_pdev, size, size, why,
+					      sizeof(why)))
+			continue;
+		mask |= BIT_ULL(bits);
+	}
+	return mask;
+}
+
 unsigned int vfmig_iova_nr_pages(struct vfmig_iova_domain *dom)
 {
 	unsigned int n;

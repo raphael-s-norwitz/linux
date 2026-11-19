@@ -267,6 +267,17 @@ int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 unsigned int vfmig_iova_domain_dma_bits(const struct vfmig_iova_domain *dom);
 
 /*
+ * The iova_bits values, as a mask with bit b set for b bits, whose
+ * window @pf_pdev's VFs can reserve once in a DMA domain: the IOMMU
+ * aperture and bus DMA limit reach the window and no host-bridge
+ * window or reserved region of the PF overlaps it. Allocates and frees
+ * an IOMMU domain; call once per PF. Reserved regions scoped to a VF
+ * and IOVAs still mapped in a VF's DMA domain are not visible here;
+ * SET_TRACKED has the final say.
+ */
+u64 vfmig_iova_window_bits(struct pci_dev *pf_pdev);
+
+/*
  * Unlink + free every registry page, release the arena reservation, and
  * drop the pinned VF reference. Safe with @dom == NULL.
  */
