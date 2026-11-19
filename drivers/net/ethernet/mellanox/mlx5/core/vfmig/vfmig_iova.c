@@ -13,6 +13,7 @@
 
 #include <linux/align.h>
 #include <linux/atomic.h>
+#include <linux/delay.h>
 #include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/gfp.h>
@@ -575,6 +576,50 @@ static void vfmig_iova_explain_window(struct pci_dev *vf_pdev, u32 vf_id,
 			 vf_id, base, base + size);
 }
 
+/*
+ * dma-iommu frees a DMA-FQ domain's unmapped IOVAs from a timer that
+ * fires at most IOVA_SINGLE_FQ_TIMEOUT (1 s, used when the IOMMU
+ * shadows its page tables) after it was armed; wait a little past it.
+ */
+#define VFMIG_IOVA_FQ_DRAIN_MS	1100
+
+/*
+ * Reserve exactly [@base, @base + @size) as @arena under the DMA mask
+ * already set for @dma_bits. Returns -ENOSPC if nothing was reserved,
+ * -ERANGE if something else was (and is released again); with @report,
+ * says why.
+ */
+static int vfmig_iova_reserve_window(struct pci_dev *vf_pdev, u32 vf_id,
+				     struct dma_iova_state *arena, u64 base,
+				     u64 size, unsigned int dma_bits,
+				     bool report)
+{
+	u64 got;
+
+	if (!dma_iova_try_alloc(&vf_pdev->dev, arena, 0, size)) {
+		if (report) {
+			dev_warn(&vf_pdev->dev,
+				 "vfmig_iova: vf %u could not reserve IOVA window [0x%llx, 0x%llx) under a %u-bit DMA mask\n",
+				 vf_id, base, base + size, dma_bits);
+			vfmig_iova_explain_window(vf_pdev, vf_id, base, size);
+		}
+		return -ENOSPC;
+	}
+	if (arena->addr == base && dma_iova_size(arena) == size)
+		return 0;
+
+	got = arena->addr;
+	if (report)
+		dev_warn(&vf_pdev->dev,
+			 "vfmig_iova: vf %u IOVA window reserved at [0x%llx, 0x%llx), not [0x%llx, 0x%llx)\n",
+			 vf_id, got, got + dma_iova_size(arena), base,
+			 base + size);
+	dma_iova_free(&vf_pdev->dev, arena);
+	if (report)
+		vfmig_iova_explain_window(vf_pdev, vf_id, base, size);
+	return -ERANGE;
+}
+
 /* -------- exported API -------------------------------------------------- */
 
 int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
@@ -582,6 +627,7 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 			     struct vfmig_iova_domain **out)
 {
 	u64 base, size, limit, aperture_end;
+	bool fq;
 	struct iommu_domain *dma_dom;
 	struct vfmig_iova_domain *dom;
 	unsigned int s;
@@ -710,30 +756,27 @@ int vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 	/*
 	 * Reserve before any other DMA traffic on this VF. With the mask,
 	 * aperture and bus limit all reaching the window's top, a failure
-	 * is a platform reservation inside the window; SET_TRACKED fails
-	 * here with a printed reason rather than deep inside a later
-	 * cmd-ring DMA.
+	 * is a platform reservation or a live mapping inside the window;
+	 * SET_TRACKED fails here with a printed reason rather than deep
+	 * inside a later cmd-ring DMA.
+	 *
+	 * IOVAs a driver unmapped from a DMA-FQ domain sit in its flush
+	 * queue, where the allocator's flush-and-retry on failure does not
+	 * reach, until a timer frees them; give that one chance to run.
 	 */
-	if (!dma_iova_try_alloc(&vf_pdev->dev, &dom->arena, 0, size)) {
-		dev_warn(&vf_pdev->dev,
-			 "vfmig_iova: vf %u could not reserve IOVA window [0x%llx, 0x%llx) under a %u-bit DMA mask\n",
-			 vf_id, base, base + size, dma_bits);
-		vfmig_iova_explain_window(vf_pdev, vf_id, base, size);
-		err = -ENOSPC;
-		goto err_pci_put;
+	fq = dma_dom->type == IOMMU_DOMAIN_DMA_FQ;
+	err = vfmig_iova_reserve_window(vf_pdev, vf_id, &dom->arena, base,
+					size, dma_bits, !fq);
+	if (err && fq) {
+		dev_info(&vf_pdev->dev,
+			 "vfmig_iova: vf %u IOVA window [0x%llx, 0x%llx) is in use; retrying once the DMA-FQ domain's flush queue has drained\n",
+			 vf_id, base, base + size);
+		msleep(VFMIG_IOVA_FQ_DRAIN_MS);
+		err = vfmig_iova_reserve_window(vf_pdev, vf_id, &dom->arena,
+						base, size, dma_bits, true);
 	}
-	if (dom->arena.addr != base ||
-	    dma_iova_size(&dom->arena) != size) {
-		dev_warn(&vf_pdev->dev,
-			 "vfmig_iova: vf %u IOVA window reserved at [0x%llx, 0x%llx), not [0x%llx, 0x%llx)\n",
-			 vf_id, (u64)dom->arena.addr,
-			 (u64)dom->arena.addr + dma_iova_size(&dom->arena),
-			 base, base + size);
-		dma_iova_free(&vf_pdev->dev, &dom->arena);
-		vfmig_iova_explain_window(vf_pdev, vf_id, base, size);
-		err = -ERANGE;
+	if (err)
 		goto err_pci_put;
-	}
 	dom->arena_dom = dma_dom;
 
 	dev_info(&vf_pdev->dev,

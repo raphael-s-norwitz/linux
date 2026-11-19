@@ -257,7 +257,9 @@ static_assert(VFMIG_IOVA_SLOT_BYTES >= (8ULL << 20),
  * -EOPNOTSUPP if the VF is not a DMA-coherent, dma-iommu-managed device
  * or its IOMMU aperture or bus DMA limit stops short of the window, -EIO
  * if the mask cannot be set, -ENOSPC if the window could not be
- * reserved, or -ERANGE if it was reserved anywhere else.
+ * reserved, or -ERANGE if it was reserved anywhere else. In a DMA-FQ
+ * domain a blocked window is retried once after the flush queue has
+ * drained, which sleeps about a second.
  */
 int  vfmig_iova_domain_create(struct pci_dev *vf_pdev, u32 vf_id,
 			      unsigned int dma_bits,

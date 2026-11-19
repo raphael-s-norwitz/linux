@@ -208,6 +208,14 @@ struct mlx5_vfmig_enable_migratable {
  *   IOVAs still mapped in a VF's DMA domain, which an unbound VF has
  *   only if a driver leaked them. SET_TRACKED is the final word.
  *
+ *   IOVAs a driver unmapped do not count: they are dropped from the
+ *   VF domain's IOVA caches when the window needs their space. In a
+ *   DMA-FQ (lazy) domain they first wait in the IOMMU flush queue, up
+ *   to a second when the IOMMU shadows its page tables, as a virtual
+ *   IOMMU in caching mode does; an enable whose window is blocked
+ *   there waits for the queue to drain and tries once more, so it can
+ *   take a second or so longer.
+ *
  *   Idempotent: a toggle to the state the VF is already in is a no-op
  *   (returns 0, no iommu traffic), as long as an enable with a non-zero
  *   @iova_bits asks for the window the VF already has.
