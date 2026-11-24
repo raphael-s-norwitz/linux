@@ -412,6 +412,45 @@ void ib_uverbs_comp_handler(struct ib_cq *cq, void *cq_context)
 	kill_fasync(&ev_queue->async_queue, SIGIO, POLL_IN);
 }
 
+/*
+ * Queue @n completion events for @uobj on @ev_file, as @n calls of
+ * ib_uverbs_comp_handler() would. Used to restore events that were queued
+ * unread when the CQ was checkpointed.
+ */
+int ib_uverbs_queue_comp_events(struct ib_uverbs_completion_event_file *ev_file,
+				struct ib_ucq_object *uobj, u64 cq_handle, u32 n)
+{
+	struct ib_uverbs_event *entry, *tmp;
+	LIST_HEAD(events);
+	u32 i;
+
+	for (i = 0; i < n; i++) {
+		entry = kmalloc_obj(*entry, GFP_KERNEL_ACCOUNT);
+		if (!entry)
+			goto err;
+		entry->desc.comp.cq_handle = cq_handle;
+		entry->counter = &uobj->comp_events_reported;
+		list_add_tail(&entry->list, &events);
+	}
+	if (!n)
+		return 0;
+
+	spin_lock_irq(&ev_file->ev_queue.lock);
+	list_for_each_entry(entry, &events, list)
+		list_add_tail(&entry->obj_list, &uobj->comp_list);
+	list_splice_tail(&events, &ev_file->ev_queue.event_list);
+	spin_unlock_irq(&ev_file->ev_queue.lock);
+
+	wake_up_interruptible(&ev_file->ev_queue.poll_wait);
+	kill_fasync(&ev_file->ev_queue.async_queue, SIGIO, POLL_IN);
+	return 0;
+
+err:
+	list_for_each_entry_safe(entry, tmp, &events, list)
+		kfree(entry);
+	return -ENOMEM;
+}
+
 void ib_uverbs_async_handler(struct ib_uverbs_async_event_file *async_file,
 			     __u64 element, __u64 event,
 			     struct list_head *obj_list, u32 *counter)

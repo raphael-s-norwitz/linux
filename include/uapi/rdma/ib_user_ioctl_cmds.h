@@ -213,20 +213,17 @@ enum ib_uverbs_restore_mr_flags {
  * the dispatcher reserves via rdma_alloc_begin_uobject_at_handle()
  * -- so user-visible identity (RES_HANDLE) is preserved out of band.
  *
- * COMP_CHANNEL is declared UA_OPTIONAL for forward compat with a
- * future UVERBS_METHOD_RESTORE_COMP_CHANNEL, but the v0 dispatcher
- * hard-rejects with -EOPNOTSUPP if any caller actually passes one.
- * v0 callers (CRIU plugin) must not pass a CC reference; CQs that
- * were bound to a comp_channel on the source side cannot be
- * restored end-to-end until RESTORE_COMP_CHANNEL lands.
+ * COMP_CHANNEL and EVENT_FD take a completion channel and an async
+ * event file the caller created on the restore context with the
+ * ordinary verbs. Without EVENT_FD the CQ uses the context's default
+ * async event file, and the method fails with -EINVAL if there is none
+ * yet, rather than leave the CQ with no async file.
  *
- * EVENT_FD is also UA_OPTIONAL. The dispatcher routes through
- * ib_uverbs_get_async_event(), which falls back to the ufile's
- * default_async_file when the attr is absent (the v0 path: CRIU
- * plugin does not pass an event_fd because RESTORE_ASYNC_EVENT has
- * not landed yet). When RESTORE_ASYNC_EVENT does land in S8, the
- * attr will resolve to the restored async-event uobject without any
- * UAPI bump.
+ * The *_EVENTS_REPORTED inputs restart the counters the destroy verb
+ * returns at the values CHECKPOINT_QUERY_EVENTS reported. The
+ * COMP_EVENTS_QUEUED input queues that many completion events for the
+ * CQ on COMP_CHANNEL before the CQ goes live, so they come ahead of
+ * any the restored CQ raises.
  */
 enum uverbs_attrs_restore_cq {
 	/*
@@ -262,16 +259,11 @@ enum uverbs_attrs_restore_cq {
 	 * IB_UVERBS_CQ_FLAGS_IGNORE_OVERRUN. Absent -> 0.
 	 */
 	UVERBS_ATTR_RESTORE_CQ_FLAGS,
-	/*
-	 * Optional FD reference into UVERBS_OBJECT_COMP_CHANNEL.
-	 * Forward-compat slot for RESTORE_COMP_CHANNEL; v0 dispatcher
-	 * rejects -EOPNOTSUPP if any caller supplies one.
-	 */
+	/* Optional FD reference into UVERBS_OBJECT_COMP_CHANNEL. */
 	UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL,
 	/*
-	 * Optional FD reference into UVERBS_OBJECT_ASYNC_EVENT.
-	 * Resolves via ib_uverbs_get_async_event(); absent ->
-	 * ufile->default_async_file (the v0 CRIU plugin path).
+	 * Optional FD reference into UVERBS_OBJECT_ASYNC_EVENT. Absent ->
+	 * the context's default async event file, which must exist.
 	 */
 	UVERBS_ATTR_RESTORE_CQ_EVENT_FD,
 	/*
@@ -281,6 +273,11 @@ enum uverbs_attrs_restore_cq {
 	 * UVERBS_ATTR_CREATE_CQ_RESP_CQE on the create-side path.
 	 */
 	UVERBS_ATTR_RESTORE_CQ_RESP_CQE,
+	/* Optional u32 inputs, default 0. */
+	UVERBS_ATTR_RESTORE_CQ_COMP_EVENTS_REPORTED,
+	UVERBS_ATTR_RESTORE_CQ_ASYNC_EVENTS_REPORTED,
+	/* Optional u32 input, default 0. Requires COMP_CHANNEL if non-zero. */
+	UVERBS_ATTR_RESTORE_CQ_COMP_EVENTS_QUEUED,
 };
 
 /*
@@ -381,11 +378,9 @@ enum uverbs_attrs_restore_qp {
 	 */
 	UVERBS_ATTR_RESTORE_QP_CREATE_FLAGS,
 	/*
-	 * Optional FD reference into UVERBS_OBJECT_ASYNC_EVENT for
-	 * QPs whose source-side async event channel was not the
-	 * ufile default. Forward-compat with RESTORE_ASYNC_EVENT (S8).
-	 * Absent -> ufile->default_async_file, which is what the v0
-	 * CRIU plugin path supplies.
+	 * Optional FD reference into UVERBS_OBJECT_ASYNC_EVENT. Absent ->
+	 * the context's default async event file; -EINVAL if there is
+	 * none yet.
 	 */
 	UVERBS_ATTR_RESTORE_QP_EVENT_FD,
 	/*
@@ -397,6 +392,11 @@ enum uverbs_attrs_restore_qp {
 	 * and to fail-fast on cross-arch migration.
 	 */
 	UVERBS_ATTR_RESTORE_QP_RESP_QPN,
+	/*
+	 * Optional u32 input, default 0. Restarts the counter the destroy
+	 * verb returns at the value CHECKPOINT_QUERY_EVENTS reported.
+	 */
+	UVERBS_ATTR_RESTORE_QP_ASYNC_EVENTS_REPORTED,
 };
 
 /* Exactly one of CQ_HANDLE and QP_HANDLE must be given. */

@@ -49,6 +49,28 @@ static int restore_check_ucontext(struct uverbs_attr_bundle *attrs,
 	return 0;
 }
 
+/*
+ * Without an EVENT_FD attr an object falls back to the default async event
+ * file. A restorer that creates objects before the image's default would
+ * silently leave them with no async file, so refuse that.
+ */
+static int restore_check_event_fd(struct uverbs_attr_bundle *attrs, u16 id)
+{
+	if (!uverbs_attr_is_valid(attrs, id) &&
+	    !READ_ONCE(attrs->ufile->default_async_file))
+		return -EINVAL;
+	return 0;
+}
+
+static int restore_get_u32_or_zero(u32 *val, struct uverbs_attr_bundle *attrs,
+				   u16 id)
+{
+	*val = 0;
+	if (!uverbs_attr_is_valid(attrs, id))
+		return 0;
+	return uverbs_copy_from(val, attrs, id);
+}
+
 static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_PD)(
 	struct uverbs_attr_bundle *attrs)
 {
@@ -292,9 +314,11 @@ DECLARE_UVERBS_NAMED_METHOD(
 static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)(
 	struct uverbs_attr_bundle *attrs)
 {
+	struct ib_uverbs_completion_event_file *ev_file = NULL;
+	u32 comp_reported, async_reported, comp_queued;
 	struct ib_ucontext *ctx;
 	struct ib_device *ib_dev;
-	struct ib_uobject *uobj;
+	struct ib_uobject *uobj, *ev_file_uobj;
 	struct ib_ucq_object *obj;
 	struct ib_cq_init_attr attr = {};
 	struct ib_cq *cq;
@@ -316,20 +340,29 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)(
 	if (!ib_dev->ops.restore_cq || !ib_dev->ops.destroy_cq)
 		return -EOPNOTSUPP;
 
-	/*
-	 * v0 limitation: a CQ that was bound to a comp_channel on the
-	 * source cannot be re-bound here -- the comp_channel uobject
-	 * itself is not yet restorable (UVERBS_METHOD_RESTORE_COMP_CHANNEL
-	 * is not implemented). UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL is
-	 * declared UA_OPTIONAL for forward compat with that future work;
-	 * if any v0 caller actually passes one, hard-fail before we
-	 * touch hw state. CRIU plugin policy at v0: only restore CQs
-	 * created without a comp_channel. (EVENT_FD does not need this
-	 * gate -- ib_uverbs_get_async_event() falls back to the ufile
-	 * default when absent, which is what v0 callers want.)
-	 */
-	if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL))
-		return -EOPNOTSUPP;
+	ret = restore_check_event_fd(attrs, UVERBS_ATTR_RESTORE_CQ_EVENT_FD);
+	if (ret)
+		return ret;
+	ret = restore_get_u32_or_zero(&comp_reported, attrs,
+				      UVERBS_ATTR_RESTORE_CQ_COMP_EVENTS_REPORTED);
+	if (ret)
+		return ret;
+	ret = restore_get_u32_or_zero(&async_reported, attrs,
+				      UVERBS_ATTR_RESTORE_CQ_ASYNC_EVENTS_REPORTED);
+	if (ret)
+		return ret;
+	ret = restore_get_u32_or_zero(&comp_queued, attrs,
+				      UVERBS_ATTR_RESTORE_CQ_COMP_EVENTS_QUEUED);
+	if (ret)
+		return ret;
+	ev_file_uobj = uverbs_attr_get_uobject(attrs,
+					       UVERBS_ATTR_RESTORE_CQ_COMP_CHANNEL);
+	if (!IS_ERR(ev_file_uobj))
+		ev_file = container_of(ev_file_uobj,
+				       struct ib_uverbs_completion_event_file,
+				       uobj);
+	if (comp_queued && !ev_file)
+		return -EINVAL;
 
 	ret = uverbs_copy_from(&target_handle, attrs,
 			       UVERBS_ATTR_RESTORE_CQ_HANDLE);
@@ -374,7 +407,22 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)(
 	obj->uevent.event_file =
 		ib_uverbs_get_async_event(attrs,
 					  UVERBS_ATTR_RESTORE_CQ_EVENT_FD);
+	obj->uevent.events_reported = async_reported;
+	obj->comp_events_reported = comp_reported;
 	uobj->user_handle = user_handle;
+	if (ev_file)
+		uverbs_uobject_get(ev_file_uobj);
+
+	/*
+	 * The driver may enable event delivery as soon as restore_cq runs, so
+	 * the queued events go in first to stay ahead of the CQ's live ones.
+	 */
+	if (ev_file) {
+		ret = ib_uverbs_queue_comp_events(ev_file, obj, user_handle,
+						  comp_queued);
+		if (ret)
+			goto err_event_file;
+	}
 
 	cq = rdma_zalloc_drv_obj(ib_dev, ib_cq);
 	if (!cq) {
@@ -386,7 +434,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_CQ)(
 	cq->uobject = obj;
 	cq->comp_handler = ib_uverbs_comp_handler;
 	cq->event_handler = ib_uverbs_cq_event_handler;
-	cq->cq_context = NULL; /* v0: no comp_channel */
+	cq->cq_context = ev_file ? &ev_file->ev_queue : NULL;
 	atomic_set(&cq->usecnt, 0);
 
 	rdma_restrack_new(&cq->res, RDMA_RESTRACK_CQ);
@@ -408,8 +456,8 @@ err_restrack:
 	rdma_restrack_put(&cq->res);
 	kfree(cq);
 err_event_file:
-	if (obj->uevent.event_file)
-		uverbs_uobject_put(&obj->uevent.event_file->uobj);
+	/* Frees the queued events and drops both file references. */
+	ib_uverbs_release_ucq(ev_file, obj);
 	rdma_alloc_abort_uobject(uobj, attrs, false);
 	return ret;
 }
@@ -436,6 +484,12 @@ DECLARE_UVERBS_NAMED_METHOD(
 		       UA_OPTIONAL),
 	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_RESTORE_CQ_RESP_CQE,
 			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_CQ_COMP_EVENTS_REPORTED,
+			   UVERBS_ATTR_TYPE(__u32), UA_OPTIONAL),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_CQ_ASYNC_EVENTS_REPORTED,
+			   UVERBS_ATTR_TYPE(__u32), UA_OPTIONAL),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_CQ_COMP_EVENTS_QUEUED,
+			   UVERBS_ATTR_TYPE(__u32), UA_OPTIONAL),
 	UVERBS_ATTR_UHW());
 
 static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_QP)(
@@ -453,7 +507,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_QP)(
 	struct ib_qp *qp;
 	enum ib_qp_type qp_type;
 	enum ib_qp_state qp_state;
-	u32 target_handle, create_flags = 0;
+	u32 target_handle, create_flags = 0, async_reported;
 	u64 user_handle;
 	int ret;
 
@@ -470,6 +524,14 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_QP)(
 	 */
 	if (!ib_dev->ops.restore_qp || !ib_dev->ops.destroy_qp)
 		return -EOPNOTSUPP;
+
+	ret = restore_check_event_fd(attrs, UVERBS_ATTR_RESTORE_QP_EVENT_FD);
+	if (ret)
+		return ret;
+	ret = restore_get_u32_or_zero(&async_reported, attrs,
+				      UVERBS_ATTR_RESTORE_QP_ASYNC_EVENTS_REPORTED);
+	if (ret)
+		return ret;
 
 	ret = uverbs_copy_from(&target_handle, attrs,
 			       UVERBS_ATTR_RESTORE_QP_HANDLE);
@@ -568,6 +630,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_RESTORE_QP)(
 	obj->uevent.event_file =
 		ib_uverbs_get_async_event(attrs,
 					  UVERBS_ATTR_RESTORE_QP_EVENT_FD);
+	obj->uevent.events_reported = async_reported;
 	uobj->user_handle = user_handle;
 
 	qp = rdma_zalloc_drv_obj_numa(ib_dev, ib_qp);
@@ -677,6 +740,8 @@ DECLARE_UVERBS_NAMED_METHOD(
 		       UA_OPTIONAL),
 	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_RESTORE_QP_RESP_QPN,
 			    UVERBS_ATTR_TYPE(__u32), UA_MANDATORY),
+	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_RESTORE_QP_ASYNC_EVENTS_REPORTED,
+			   UVERBS_ATTR_TYPE(__u32), UA_OPTIONAL),
 	UVERBS_ATTR_UHW());
 
 DECLARE_UVERBS_GLOBAL_METHODS(UVERBS_OBJECT_RESTORE,

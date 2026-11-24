@@ -231,6 +231,8 @@ void ib_uverbs_async_handler(struct ib_uverbs_async_event_file *async_file,
 			     struct list_head *obj_list, u32 *counter);
 
 void ib_uverbs_comp_handler(struct ib_cq *cq, void *cq_context);
+int ib_uverbs_queue_comp_events(struct ib_uverbs_completion_event_file *ev_file,
+				struct ib_ucq_object *uobj, u64 cq_handle, u32 n);
 void ib_uverbs_cq_event_handler(struct ib_event *event, void *context_ptr);
 void ib_uverbs_qp_event_handler(struct ib_event *event, void *context_ptr);
 void ib_uverbs_wq_event_handler(struct ib_event *event, void *context_ptr);
