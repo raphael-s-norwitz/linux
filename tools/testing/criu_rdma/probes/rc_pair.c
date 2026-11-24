@@ -10,10 +10,14 @@
  *                    the source, and poll both CQs for up to 5 s
  *   state <n>        QP states of pair n (RTS=3, ERR=6)
  *   gid A|B <idx>    use GID <idx> for that side's later connects
+ *   async A|B        read that side's async events, waiting up to 1 s
+ *                    for the first: "none" or "<event> qpn=0x..; ..."
  *   quit
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +54,35 @@ static int open_side(struct side *s, const char *name, int gidx)
 	s->gidx = gidx;
 	if (!s->cq || ibv_query_gid(s->ctx, 1, gidx, &s->gid))
 		return fprintf(stderr, "%s: pd/cq/gid: %s\n", name, strerror(errno)), -1;
+	if (fcntl(s->ctx->async_fd, F_SETFL,
+		  fcntl(s->ctx->async_fd, F_GETFL) | O_NONBLOCK))
+		return fprintf(stderr, "%s: async_fd: %s\n", name, strerror(errno)), -1;
 	return 0;
+}
+
+static void do_async(struct side *s, const char *name)
+{
+	struct pollfd p = { .fd = s->ctx->async_fd, .events = POLLIN };
+	struct ibv_async_event ev;
+	char buf[512];
+	int len = 0;
+
+	buf[0] = '\0';
+	if (poll(&p, 1, 1000) > 0) {
+		while (!ibv_get_async_event(s->ctx, &ev)) {
+			if (len < (int)sizeof(buf) - 64) {
+				len += snprintf(buf + len, sizeof(buf) - len, "%s%s",
+						len ? "; " : "", ibv_event_type_str(ev.event_type));
+				if ((ev.event_type >= IBV_EVENT_QP_FATAL &&
+				     ev.event_type <= IBV_EVENT_PATH_MIG_ERR) ||
+				    ev.event_type == IBV_EVENT_QP_LAST_WQE_REACHED)
+					len += snprintf(buf + len, sizeof(buf) - len, " qpn=0x%x",
+							ev.element.qp->qp_num);
+			}
+			ibv_ack_async_event(&ev);
+		}
+	}
+	printf("async %s: %s\n", name, len ? buf : "none");
 }
 
 static int to_rts(struct ibv_qp *qp, struct side *me, struct side *peer, uint32_t dqpn)
@@ -190,6 +222,9 @@ int main(int argc, char **argv)
 				printf("gid %s %d: %s\n", arg, n, strerror(errno));
 			else
 				printf("gid %s %d: ok\n", arg, n);
+		} else if (sscanf(line, "async %2s", arg) == 1 &&
+			   (arg[0] == 'A' || arg[0] == 'B')) {
+			do_async(arg[0] == 'A' ? &sa : &sb, arg[0] == 'A' ? "A" : "B");
 		} else if (!strncmp(line, "quit", 4)) {
 			break;
 		} else {

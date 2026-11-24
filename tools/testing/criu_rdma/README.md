@@ -113,6 +113,11 @@ builds the helpers that need libibverbs.
   tell IOVAs leaked in the old domain from anything else.
   `GROUP_TYPE=DMA-FQ` runs it on a lazy domain, where unmapped IOVAs
   wait in the flush queue, and reports whether SET_TRACKED waited.
+- `probes/fence_rc_timeout.sh` -- raises the RX fence on VF 0, as a
+  migration destination has it until RESUME_IBDEV, and sends RC traffic
+  into it from both sides and in loopback on VF 0. It reports each
+  send's completion status and every async event either side gets, and
+  whether loopback bypasses the fence.
 
 Helpers: `probes/vfmig_fence` raises and lifts the RX fence, optionally
 with `eth`. `probes/rc_pair` drives RC QP pairs between two ib devices
