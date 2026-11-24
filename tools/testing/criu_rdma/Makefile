@@ -11,7 +11,8 @@ CFLAGS	+= -Wall -Wextra
 UAPI	:= ../../../include/uapi/linux/mlx5_vfmig.h
 
 PROGS	:= tools/mlx5_vfmig probes/vfmig_fence
-VERBS_PROGS := probes/rc_pair probes/umr_release_probe probes/q_counter_room
+VERBS_PROGS := probes/rc_pair probes/umr_release_probe probes/q_counter_room \
+	       probes/cq_arm_holder
 
 all: $(PROGS)
 
@@ -30,6 +31,9 @@ probes/umr_release_probe: probes/umr_release_probe.c $(UAPI)
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
 
 probes/q_counter_room: probes/q_counter_room.c
+	$(CC) $(CFLAGS) -o $@ $< -lmlx5 -libverbs
+
+probes/cq_arm_holder: probes/cq_arm_holder.c
 	$(CC) $(CFLAGS) -o $@ $< -lmlx5 -libverbs
 
 clean:

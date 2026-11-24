@@ -118,6 +118,11 @@ builds the helpers that need libibverbs.
   into it from both sides and in loopback on VF 0. It reports each
   send's completion status and every async event either side gets, and
   whether loopback bypasses the fence.
+- `probes/cq_arm_state.sh` -- a CRIU dump and restore of
+  `probes/cq_arm_holder`, which holds CQs armed, solicited-armed, fired
+  and never armed (`CRIU_REPO=...`, `DST_VF=` for the slot). It compares
+  each CQ's firmware state, read from the mlx5 debugfs `state` field, on
+  the source before the dump and on the destination after the restore.
 
 Helpers: `probes/vfmig_fence` raises and lifts the RX fence, optionally
 with `eth`. `probes/rc_pair` drives RC QP pairs between two ib devices
