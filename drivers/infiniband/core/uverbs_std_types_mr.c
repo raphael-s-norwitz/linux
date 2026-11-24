@@ -508,7 +508,8 @@ static int UVERBS_HANDLER(UVERBS_METHOD_REG_MR)(
  * Known limitation (accepted, not fixed): the dma_buf returned here is
  * whatever uverbs core resolved via its own dma_buf_get(fd) at MR
  * registration time (see UVERBS_METHOD_REG_DMABUF_MR / UVERBS_METHOD_
- * REG_MR above). The DMA-BUF-capable provider (e.g. mlx5) performs an
+ * REG_MR above), or at the latest UVERBS_METHOD_MR_BIND_DMABUF. The
+ * DMA-BUF-capable provider (e.g. mlx5) performs an
  * independent, unsynchronized dma_buf_get(fd) resolution of the same raw
  * fd number inside ib_umem_dmabuf_get(), separated from core's
  * resolution by real intervening work (provider UMR/QP setup,
@@ -750,12 +751,22 @@ DECLARE_UVERBS_NAMED_METHOD(
  * Refusing a bound MR here rather than in the driver keeps the "unbound"
  * bookkeeping in one place: the bit is set by UNBIND above and by
  * RESTORE_MR, which are the only two ways an MR reaches that state.
+ *
+ * The buffer bound here replaces the uobject's retained dma_buf, the one
+ * MR_EXPORT_DMABUF_FD hands out. A restored MR has none until this call,
+ * and without it the next checkpoint would take the MR for one with no
+ * dma-buf behind it. The same "Known limitation" as at registration
+ * applies: this dma_buf_get(fd) and the provider's are two resolutions of
+ * the same raw fd number.
  */
 static int UVERBS_HANDLER(UVERBS_METHOD_MR_BIND_DMABUF)(
 	struct uverbs_attr_bundle *attrs)
 {
-	struct ib_mr *mr =
-		uverbs_attr_get_obj(attrs, UVERBS_ATTR_MR_BIND_DMABUF_HANDLE);
+	struct ib_uobject *uobj =
+		uverbs_attr_get_uobject(attrs, UVERBS_ATTR_MR_BIND_DMABUF_HANDLE);
+	struct ib_umr_object *umr_uobj = to_ib_umr_object(uobj);
+	struct ib_mr *mr = uobj->object;
+	struct dma_buf *dmabuf;
 	int fd;
 	int ret;
 
@@ -769,10 +780,19 @@ static int UVERBS_HANDLER(UVERBS_METHOD_MR_BIND_DMABUF)(
 	if (ret)
 		return ret;
 
-	ret = mr->device->ops.bind_dmabuf_mr(mr, fd);
-	if (ret)
-		return ret;
+	dmabuf = dma_buf_get(fd);
+	if (IS_ERR(dmabuf))
+		return PTR_ERR(dmabuf);
 
+	ret = mr->device->ops.bind_dmabuf_mr(mr, fd);
+	if (ret) {
+		dma_buf_put(dmabuf);
+		return ret;
+	}
+
+	if (umr_uobj->dmabuf)
+		dma_buf_put(umr_uobj->dmabuf);
+	umr_uobj->dmabuf = dmabuf;
 	mr->dmabuf_unbound = 0;
 	return 0;
 }
