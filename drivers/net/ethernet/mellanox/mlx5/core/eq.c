@@ -137,7 +137,7 @@ static int mlx5_eq_comp_int(struct notifier_block *nb,
 			++cq->arm_sn;
 			cq->comp(cq, eqe);
 			mlx5_cq_put(cq);
-		} else {
+		} else if (!mlx5_cq_mark_unadopted(eq->dev, cqn)) {
 			dev_dbg_ratelimited(eq->dev->device,
 					    "Completion event for bogus CQ 0x%x\n", cqn);
 		}

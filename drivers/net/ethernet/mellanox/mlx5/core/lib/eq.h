@@ -85,6 +85,8 @@ void mlx5_eq_del_cq(struct mlx5_eq *eq, struct mlx5_core_cq *cq);
 struct mlx5_eq_comp *mlx5_eqn2comp_eq(struct mlx5_core_dev *dev, int eqn);
 struct mlx5_eq *mlx5_get_async_eq(struct mlx5_core_dev *dev);
 void mlx5_cq_tasklet_cb(struct tasklet_struct *t);
+bool mlx5_cq_mark_unadopted(struct mlx5_core_dev *dev, u32 cqn);
+void mlx5_cq_drop_unadopted(struct mlx5_core_dev *dev);
 
 u32 mlx5_eq_poll_irq_disabled(struct mlx5_eq_comp *eq);
 void mlx5_cmd_eq_recover(struct mlx5_core_dev *dev);

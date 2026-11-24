@@ -4258,6 +4258,28 @@ int mlx5_vfmig_vf_import_replayed_fw_pages(struct mlx5_core_dev *vf_dev)
 	return 0;
 }
 
+static int vfmig_record_restored_cq_cb(u8 kind, u64 fw_id, dma_addr_t iova,
+				       size_t len, void *ctx)
+{
+	struct mlx5_core_dev *vf_dev = ctx;
+
+	if (kind != VFMIG_HUOBJ_KIND_CQ)
+		return 0;
+	/* A CQ with several placeholders is stored more than once; harmless. */
+	return xa_err(xa_store_irq(&vf_dev->priv.vfmig_unadopted_cqs, fw_id,
+				   xa_mk_value(0), GFP_KERNEL));
+}
+
+int mlx5_vfmig_vf_record_restored_cqs(struct mlx5_core_dev *vf_dev)
+{
+	struct vfmig_iova_domain *dom = vf_dev->cmd.vfmig_iova_dom;
+
+	if (!dom)
+		return 0;
+	return vfmig_iova_for_each_external(dom, vfmig_record_restored_cq_cb,
+					    vf_dev);
+}
+
 /*
  * Destroy every staged-but-unconsumed pending_load slot and clear the
  * restored latch it set. pf_mdev must be alive (FW resource teardown).

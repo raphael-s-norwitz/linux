@@ -743,6 +743,12 @@ struct mlx5_priv {
 	 */
 	bool	vfmig_restore_claimed;
 	bool	vfmig_restore_released;
+	/*
+	 * cqns of the user CQs LOAD brought back that mlx5_core_adopt_cq()
+	 * has not adopted yet. XA_MARK_0 marks one whose completion EQE
+	 * arrived first; the adoption delivers that event.
+	 */
+	struct xarray	vfmig_unadopted_cqs;
 };
 
 enum mlx5_device_state {

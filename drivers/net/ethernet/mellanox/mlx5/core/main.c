@@ -1245,6 +1245,14 @@ static int mlx5_function_enable(struct mlx5_core_dev *dev, bool boot, u64 timeou
 			goto err_cmd_cleanup;
 		}
 
+		err = mlx5_vfmig_vf_record_restored_cqs(dev);
+		if (err) {
+			mlx5_core_err(dev,
+				      "vfmig: recording restored CQs failed for vhca_id 0x%04x: %d\n",
+				      restored_vhca_id, err);
+			goto err_cmd_cleanup;
+		}
+
 		mlx5_start_health_poll(dev);
 		mlx5_core_info(dev,
 			       "vfmig: VF (vhca_id 0x%04x) restored; ENABLE_HCA/SET_ISSI/boot-pages/INIT_HCA skipped\n",
@@ -2020,6 +2028,7 @@ int mlx5_mdev_init(struct mlx5_core_dev *dev, int profile_idx)
 	mutex_init(&priv->alloc_mutex);
 	mutex_init(&priv->pgdir_mutex);
 	INIT_LIST_HEAD(&priv->pgdir_list);
+	xa_init_flags(&priv->vfmig_unadopted_cqs, XA_FLAGS_LOCK_IRQ);
 
 	priv->numa_node = dev_to_node(mlx5_core_dma_dev(dev));
 	priv->dbg.dbg_root = debugfs_create_dir(dev_name(dev->device),
@@ -2118,6 +2127,7 @@ void mlx5_mdev_uninit(struct mlx5_core_dev *dev)
 	mlx5_cmd_cleanup(dev);
 	mlx5_frag_buf_pools_cleanup(dev);
 	debugfs_remove_recursive(dev->priv.dbg.dbg_root);
+	mlx5_cq_drop_unadopted(dev);
 	mutex_destroy(&priv->pgdir_mutex);
 	mutex_destroy(&priv->alloc_mutex);
 	mutex_destroy(&priv->bfregs.wc_head.lock);

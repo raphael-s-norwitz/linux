@@ -187,6 +187,20 @@ int mlx5_core_create_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
 }
 EXPORT_SYMBOL(mlx5_core_create_cq);
 
+/* Returns whether a completion EQE for @cqn arrived before its adoption. */
+static bool mlx5_cq_take_unadopted(struct mlx5_core_dev *dev, u32 cqn)
+{
+	struct xarray *xa = &dev->priv.vfmig_unadopted_cqs;
+	unsigned long flags;
+	bool fired;
+
+	xa_lock_irqsave(xa, flags);
+	fired = xa_get_mark(xa, cqn, XA_MARK_0);
+	__xa_erase(xa, cqn);
+	xa_unlock_irqrestore(xa, flags);
+	return fired;
+}
+
 /*
  * mlx5_core_adopt_cq: register a kernel-side mlx5_core_cq against an
  * already-FW-resident CQ. The companion to mlx5_core_create_cq for the
@@ -255,6 +269,19 @@ int mlx5_core_adopt_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
 
 	cq->irqn = eq->core.irqn;
 
+	/*
+	 * Firmware raises a completion EQE once per arm, and the CQ was
+	 * armed when SAVE took it, so an EQE that came before the adoption
+	 * is the only one until userspace re-arms.
+	 */
+	if (mlx5_cq_take_unadopted(dev, cqn)) {
+		mlx5_core_dbg(dev,
+			      "vfmig: delivering the completion event CQ 0x%x had before its adoption\n",
+			      cqn);
+		++cq->arm_sn;
+		cq->comp(cq, NULL);
+	}
+
 	return 0;
 
 err_cq_add:
@@ -262,6 +289,53 @@ err_cq_add:
 	return err;
 }
 EXPORT_SYMBOL(mlx5_core_adopt_cq);
+
+/*
+ * Called by the completion EQ handler for a cqn that no CQ is registered
+ * for. If @cqn is a user CQ that LOAD brought back and is not adopted
+ * yet, mark it so that mlx5_core_adopt_cq() delivers the event. Returns
+ * false for any other cqn.
+ */
+bool mlx5_cq_mark_unadopted(struct mlx5_core_dev *dev, u32 cqn)
+{
+	struct xarray *xa = &dev->priv.vfmig_unadopted_cqs;
+	unsigned long flags;
+	bool found;
+
+	if (xa_empty(xa))
+		return false;
+
+	xa_lock_irqsave(xa, flags);
+	found = xa_load(xa, cqn);
+	if (found)
+		__xa_set_mark(xa, cqn, XA_MARK_0);
+	xa_unlock_irqrestore(xa, flags);
+	return found;
+}
+
+/*
+ * Free the record at mdev teardown. A CQ still in it was never restored,
+ * and an event marked on it was lost.
+ */
+void mlx5_cq_drop_unadopted(struct mlx5_core_dev *dev)
+{
+	struct xarray *xa = &dev->priv.vfmig_unadopted_cqs;
+	unsigned int left = 0;
+	unsigned long cqn;
+	void *entry;
+
+	xa_for_each(xa, cqn, entry) {
+		left++;
+		if (xa_get_mark(xa, cqn, XA_MARK_0))
+			mlx5_core_warn(dev,
+				       "vfmig: completion event for CQ 0x%lx lost, the CQ was never restored\n",
+				       cqn);
+	}
+	if (left)
+		mlx5_core_warn(dev, "vfmig: %u CQs from LOAD were never restored\n",
+			       left);
+	xa_destroy(xa);
+}
 
 int mlx5_core_destroy_cq(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq)
 {

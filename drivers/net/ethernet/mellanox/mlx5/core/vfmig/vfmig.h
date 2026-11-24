@@ -106,6 +106,14 @@ int  mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev);
 int  mlx5_vfmig_vf_import_replayed_fw_pages(struct mlx5_core_dev *vf_dev);
 
 /*
+ * Record in priv.vfmig_unadopted_cqs every user CQ the VF's IOVA domain
+ * holds a placeholder for, so that a completion EQE arriving before
+ * mlx5_core_adopt_cq() is kept rather than dropped. Called once LOAD is
+ * applied, before the completion EQs exist. Returns 0 or -ENOMEM.
+ */
+int  mlx5_vfmig_vf_record_restored_cqs(struct mlx5_core_dev *vf_dev);
+
+/*
  * Return the per-VF deterministic IOVA domain for @vf_dev if its VF was
  * vfmig-tracked (SET_TRACKED { enable=1 }) when probe fired, else NULL.
  * Called from the VF's cmd-ring allocation (cmd.c) to decide whether to
@@ -159,6 +167,12 @@ static inline int mlx5_vfmig_vf_apply_pending_load(struct mlx5_core_dev *vf_dev)
 
 static inline int
 mlx5_vfmig_vf_import_replayed_fw_pages(struct mlx5_core_dev *vf_dev)
+{
+	return 0;
+}
+
+static inline int
+mlx5_vfmig_vf_record_restored_cqs(struct mlx5_core_dev *vf_dev)
 {
 	return 0;
 }
