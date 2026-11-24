@@ -123,6 +123,12 @@ builds the helpers that need libibverbs.
   and never armed (`CRIU_REPO=...`, `DST_VF=` for the slot). It compares
   each CQ's firmware state, read from the mlx5 debugfs `state` field, on
   the source before the dump and on the destination after the restore.
+- `probes/cq_early_replay.sh` -- a CRIU dump and restore of
+  `probes/cq_early_holder`, whose armed CQ gets its next completion on
+  the destination after LOAD and before RESTORE_CQ. It checks that
+  `mlx5_core_adopt_cq()` delivers that event, through its dynamic debug
+  line, and that unbinding the VF leaves no CQ unrestored
+  (`CRIU_REPO=...`, `TIMEOUT=` for the QP's ACK timeout exponent).
 - `probes/event_files_probe <ibdev> [sgid_index]` -- checks the event
   file interface of `design/event_files.md` without a migration: fdinfo
   identity, the checkpoint queries, the event counters and the refusals.

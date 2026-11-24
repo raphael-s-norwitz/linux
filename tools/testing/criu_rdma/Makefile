@@ -12,7 +12,7 @@ UAPI	:= ../../../include/uapi/linux/mlx5_vfmig.h
 
 PROGS	:= tools/mlx5_vfmig probes/vfmig_fence
 VERBS_PROGS := probes/rc_pair probes/umr_release_probe probes/q_counter_room \
-	       probes/cq_arm_holder probes/event_files_probe
+	       probes/cq_arm_holder probes/event_files_probe probes/cq_early_holder
 
 all: $(PROGS)
 
@@ -39,6 +39,9 @@ probes/cq_arm_holder: probes/cq_arm_holder.c
 probes/event_files_probe: probes/event_files_probe.c \
 			  ../../../include/uapi/rdma/ib_user_ioctl_cmds.h
 	$(CC) $(CFLAGS) -o $@ $< -libverbs
+
+probes/cq_early_holder: probes/cq_early_holder.c
+	$(CC) $(CFLAGS) -o $@ $< -lmlx5 -libverbs
 
 clean:
 	rm -f $(PROGS) $(VERBS_PROGS)
