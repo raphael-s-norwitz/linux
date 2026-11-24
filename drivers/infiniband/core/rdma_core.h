@@ -158,6 +158,7 @@ void uapi_compute_bundle_size(struct uverbs_api_ioctl_method *method_elm,
 void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile);
 
 extern const struct uapi_definition uverbs_def_obj_async_fd[];
+extern const struct uapi_definition uverbs_def_obj_checkpoint[];
 extern const struct uapi_definition uverbs_def_obj_counters[];
 extern const struct uapi_definition uverbs_def_obj_comp_cntr[];
 extern const struct uapi_definition uverbs_def_obj_cq[];

@@ -300,6 +300,22 @@ struct ib_uverbs_buffer_desc {
 	__aligned_u64 length;
 };
 
+/*
+ * Event state of one CQ or QP, from UVERBS_METHOD_CHECKPOINT_QUERY_EVENTS.
+ * File IDs are the event_file_id of the files' fdinfo; 0 means none.
+ * The *_reported counters are what the destroy verbs return; *_queued
+ * counts the object's events queued on its files and not yet read.
+ */
+struct ib_uverbs_uobj_events {
+	__aligned_u64 user_handle;
+	__u32 async_file_id;
+	__u32 comp_channel_id;		/* CQ only */
+	__u32 async_events_reported;
+	__u32 comp_events_reported;	/* CQ only */
+	__u32 async_events_queued;
+	__u32 comp_events_queued;	/* CQ only */
+};
+
 enum ib_uverbs_comp_cntr_entry {
 	IB_UVERBS_COMP_CNTR_ENTRY_COMP,
 	IB_UVERBS_COMP_CNTR_ENTRY_ERR,

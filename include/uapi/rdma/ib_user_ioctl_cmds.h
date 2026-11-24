@@ -66,7 +66,8 @@ enum uverbs_default_objects {
 	 * holder. The methods themselves install new uobjects of the
 	 * appropriate concrete type (PD / CQ / QP / ...) at
 	 * caller-chosen ufile handles. Gated per-driver via
-	 * ib_device_ops.ucontext_is_restore_mode.
+	 * ib_device_ops.ucontext_is_restore_mode. It also holds the
+	 * CHECKPOINT_* methods, which only read a live context.
 	 */
 	UVERBS_OBJECT_RESTORE,
 };
@@ -97,12 +98,16 @@ enum uverbs_methods_device {
  * driver's ib_device_ops.restore_<type> callback after first checking
  * ib_device_ops.ucontext_is_restore_mode on the caller's ucontext;
  * absence of either callback yields -EOPNOTSUPP / -EPERM respectively.
+ *
+ * The CHECKPOINT_* methods only read, and run on any context.
  */
 enum uverbs_methods_restore {
 	UVERBS_METHOD_RESTORE_PD,
 	UVERBS_METHOD_RESTORE_MR,
 	UVERBS_METHOD_RESTORE_CQ,
 	UVERBS_METHOD_RESTORE_QP,
+	UVERBS_METHOD_CHECKPOINT_QUERY_EVENTS,
+	UVERBS_METHOD_CHECKPOINT_QUERY_DEFAULT_ASYNC,
 };
 
 enum uverbs_attrs_restore_pd {
@@ -392,6 +397,19 @@ enum uverbs_attrs_restore_qp {
 	 * and to fail-fast on cross-arch migration.
 	 */
 	UVERBS_ATTR_RESTORE_QP_RESP_QPN,
+};
+
+/* Exactly one of CQ_HANDLE and QP_HANDLE must be given. */
+enum uverbs_attrs_checkpoint_query_events {
+	UVERBS_ATTR_CHECKPOINT_QUERY_EVENTS_CQ_HANDLE,
+	UVERBS_ATTR_CHECKPOINT_QUERY_EVENTS_QP_HANDLE,
+	/* struct ib_uverbs_uobj_events */
+	UVERBS_ATTR_CHECKPOINT_QUERY_EVENTS_RESP,
+};
+
+enum uverbs_attrs_checkpoint_query_default_async {
+	/* __u32; 0 when the context has no default async event file */
+	UVERBS_ATTR_CHECKPOINT_QUERY_DEFAULT_ASYNC_ID,
 };
 
 enum uverbs_attrs_invoke_write_cmd_attr_ids {

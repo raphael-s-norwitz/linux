@@ -48,7 +48,8 @@ ib_uverbs-y :=			uverbs_main.o uverbs_cmd.o uverbs_marshall.o \
 				uverbs_std_types_srq.o \
 				uverbs_std_types_wq.o \
 				uverbs_std_types_qp.o \
-				uverbs_std_types_restore.o
+				uverbs_std_types_restore.o \
+				uverbs_std_types_checkpoint.o
 
 ib_uverbs_support-y :=		rdma_core.o \
 				ucaps.o \
