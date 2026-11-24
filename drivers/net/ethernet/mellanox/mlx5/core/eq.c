@@ -725,6 +725,11 @@ static int cq_err_event_notifier(struct notifier_block *nb,
 
 	cq = mlx5_eq_cq_get(eq, cqn);
 	if (unlikely(!cq)) {
+		/*
+		 * TODO: on a VF restored by vfmig, an event for a user CQ that
+		 * LOAD brought back but mlx5_core_adopt_cq() has not adopted
+		 * yet is lost here. Record it and deliver it at adoption.
+		 */
 		mlx5_core_warn(eq->dev, "Async event for bogus CQ 0x%x\n", cqn);
 		return NOTIFY_OK;
 	}
