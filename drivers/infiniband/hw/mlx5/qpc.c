@@ -135,8 +135,18 @@ static int rsc_event_notifier(struct notifier_block *nb,
 	}
 
 	common = mlx5_get_rsc(&dev->qp_table, rsn);
-	if (!common)
+	/*
+	 * TODO: on a VF restored by vfmig, an event for a user QP that LOAD
+	 * brought back but RESTORE_QP has not adopted yet is lost here.
+	 * Record it and deliver it at adoption.
+	 */
+	if (!common) {
+		if (mlx5_vf_is_restored(dev->mdev))
+			dev_warn_ratelimited(dev->mdev->device,
+					     "vfmig: event 0x%x for QP 0x%x before its adoption lost\n",
+					     event_type, rsn & 0xffffff);
 		return NOTIFY_OK;
+	}
 
 	if (!is_event_type_allowed((rsn >> MLX5_USER_INDEX_LEN), event_type))
 		goto out;
