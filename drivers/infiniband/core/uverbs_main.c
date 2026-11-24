@@ -305,11 +305,25 @@ static void ib_uverbs_fd_show_fdinfo(struct seq_file *m,
 	mutex_lock(&file->disassociation_lock);
 
 	seq_printf(m, "ctxn:\t%u\n", uctx->res.id);
+	seq_printf(m, "ibdev_index:\t%u\n", uctx->device->index);
+	seq_printf(m, "ibdev:\t%s\n", dev_name(&uctx->device->dev));
 
 	mutex_unlock(&file->disassociation_lock);
 
 out_unlock:
 	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+}
+
+static void ib_uverbs_events_queued_show_fdinfo(struct seq_file *m,
+						struct ib_uverbs_event_queue *ev_queue)
+{
+	size_t queued;
+
+	spin_lock_irq(&ev_queue->lock);
+	queued = list_count_nodes(&ev_queue->event_list);
+	spin_unlock_irq(&ev_queue->lock);
+
+	seq_printf(m, "events_queued:\t%zu\n", queued);
 }
 
 static void ib_uverbs_show_comp_event_fdinfo(struct seq_file *m,
@@ -323,6 +337,9 @@ static void ib_uverbs_show_comp_event_fdinfo(struct seq_file *m,
 		return;
 
 	ib_uverbs_fd_show_fdinfo(m, uctx_file);
+	seq_puts(m, "type:\tcomp_channel\n");
+	seq_printf(m, "event_file_id:\t%u\n", comp_ev_file->ev_queue.id);
+	ib_uverbs_events_queued_show_fdinfo(m, &comp_ev_file->ev_queue);
 }
 
 static void ib_uverbs_show_async_event_fdinfo(struct seq_file *m,
@@ -335,6 +352,11 @@ static void ib_uverbs_show_async_event_fdinfo(struct seq_file *m,
 		return;
 
 	ib_uverbs_fd_show_fdinfo(m, uctx_file);
+	seq_puts(m, "type:\tasync_event\n");
+	seq_printf(m, "event_file_id:\t%u\n", async_file->ev_queue.id);
+	seq_printf(m, "default:\t%d\n",
+		   READ_ONCE(uctx_file->default_async_file) == async_file);
+	ib_uverbs_events_queued_show_fdinfo(m, &async_file->ev_queue);
 }
 
 const struct file_operations uverbs_event_fops = {
@@ -467,13 +489,15 @@ static void ib_uverbs_event_handler(struct ib_event_handler *handler,
 		event->element.port_num, event->event, NULL, NULL);
 }
 
-void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue)
+void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue,
+				struct ib_uverbs_file *ufile)
 {
 	spin_lock_init(&ev_queue->lock);
 	INIT_LIST_HEAD(&ev_queue->event_list);
 	init_waitqueue_head(&ev_queue->poll_wait);
 	ev_queue->is_closed   = 0;
 	ev_queue->async_queue = NULL;
+	ev_queue->id	      = atomic_inc_return(&ufile->event_file_ids);
 }
 
 void ib_uverbs_init_async_event_file(
@@ -482,7 +506,7 @@ void ib_uverbs_init_async_event_file(
 	struct ib_uverbs_file *uverbs_file = async_file->uobj.ufile;
 	struct ib_device *ib_dev = async_file->uobj.context->device;
 
-	ib_uverbs_init_event_queue(&async_file->ev_queue);
+	ib_uverbs_init_event_queue(&async_file->ev_queue, uverbs_file);
 
 	/* The first async_event_file becomes the default one for the file. */
 	mutex_lock(&uverbs_file->ucontext_lock);

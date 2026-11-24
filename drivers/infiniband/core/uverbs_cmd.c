@@ -1015,7 +1015,7 @@ static int ib_uverbs_create_comp_channel(struct uverbs_attr_bundle *attrs)
 
 	ev_file = container_of(uobj, struct ib_uverbs_completion_event_file,
 			       uobj);
-	ib_uverbs_init_event_queue(&ev_file->ev_queue);
+	ib_uverbs_init_event_queue(&ev_file->ev_queue, attrs->ufile);
 	uobj_finalize_uobj_create(uobj, attrs);
 
 	resp.fd = uobj->id;

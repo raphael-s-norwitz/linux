@@ -120,6 +120,8 @@ struct ib_uverbs_event_queue {
 	wait_queue_head_t			poll_wait;
 	struct fasync_struct		       *async_queue;
 	struct list_head			event_list;
+	/* Unique among the event files of one ib_uverbs_file, from 1 */
+	u32					id;
 };
 
 struct ib_uverbs_async_event_file {
@@ -211,7 +213,8 @@ static inline struct ib_umr_object *to_ib_umr_object(struct ib_uobject *uobj)
 
 extern const struct file_operations uverbs_event_fops;
 extern const struct file_operations uverbs_async_event_fops;
-void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue);
+void ib_uverbs_init_event_queue(struct ib_uverbs_event_queue *ev_queue,
+				struct ib_uverbs_file *ufile);
 void ib_uverbs_init_async_event_file(struct ib_uverbs_async_event_file *ev_file);
 void ib_uverbs_free_event_queue(struct ib_uverbs_event_queue *event_queue);
 void ib_uverbs_flow_resources_free(struct ib_uflow_resources *uflow_res);

@@ -166,6 +166,8 @@ struct ib_uverbs_file {
 	 */
 	struct ib_ucontext		       *ucontext;
 	struct ib_uverbs_async_event_file      *default_async_file;
+	/* Last ID given to a completion channel or async event file */
+	atomic_t				event_file_ids;
 	struct list_head			list;
 
 	/*
