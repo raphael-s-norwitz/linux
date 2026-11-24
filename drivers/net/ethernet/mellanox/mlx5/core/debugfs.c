@@ -77,12 +77,14 @@ enum {
 	CQ_PID,
 	CQ_NUM_CQES,
 	CQ_LOG_PG_SZ,
+	CQ_STATE,
 };
 
 static char *cq_fields[] = {
 	[CQ_PID]	= "pid",
 	[CQ_NUM_CQES]	= "num_cqes",
 	[CQ_LOG_PG_SZ]	= "log_page_size",
+	[CQ_STATE]	= "state",
 };
 
 struct dentry *mlx5_debugfs_root;
@@ -483,6 +485,9 @@ static u64 cq_read_field(struct mlx5_core_dev *dev, struct mlx5_core_cq *cq,
 		break;
 	case CQ_LOG_PG_SZ:
 		param = MLX5_GET(cqc, ctx, log_page_size);
+		break;
+	case CQ_STATE:
+		param = MLX5_GET(cqc, ctx, st);
 		break;
 	}
 
