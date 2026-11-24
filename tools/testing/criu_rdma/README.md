@@ -123,6 +123,11 @@ builds the helpers that need libibverbs.
   and never armed (`CRIU_REPO=...`, `DST_VF=` for the slot). It compares
   each CQ's firmware state, read from the mlx5 debugfs `state` field, on
   the source before the dump and on the destination after the restore.
+- `probes/event_files_probe <ibdev> [sgid_index]` -- checks the event
+  file interface of `design/event_files.md` without a migration: fdinfo
+  identity, the checkpoint queries, the event counters and the refusals.
+  The completion event check needs a GID for a self-loop RC SEND. The
+  restore-mode refusals need an rxe device.
 
 Helpers: `probes/vfmig_fence` raises and lifts the RX fence, optionally
 with `eth`. `probes/rc_pair` drives RC QP pairs between two ib devices
