@@ -606,6 +606,7 @@ enum mlx5_ib_vfmig_query_qp_attrs {
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_USER_HANDLE,
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_CREATE_FLAGS,
 	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN,
+	MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_STATE,
 };
 
 /*
@@ -649,6 +650,25 @@ struct mlx5_ib_vfmig_dyn_uar_record {
 struct mlx5_ib_vfmig_qp_sq_psn {
 	__u32	next_send_psn;
 	__u32	last_acked_psn;
+};
+
+/*
+ * Optional RESP_SQ_STATE out of VFMIG_QUERY_QP: the rest of the QP's
+ * requester state, from the same firmware QUERY_QP as RESP_SQ_PSN, so
+ * asking for both costs one command. An RNR NAK rewinds next_send_psn to
+ * the NAKed PSN while the requester waits for the RNR timer, so the PSNs
+ * alone cannot tell such a send from an idle QP; these fields are
+ * reported raw for that. @reserved is zero.
+ */
+struct mlx5_ib_vfmig_qp_sq_state {
+	__u32	ssn;
+	__u16	hw_sq_wqebb_counter;
+	__u16	sw_sq_wqebb_counter;
+	__u8	retry_count;
+	__u8	cur_retry_count;
+	__u8	rnr_retry;
+	__u8	cur_rnr_retry;
+	__u32	reserved;
 };
 
 /*

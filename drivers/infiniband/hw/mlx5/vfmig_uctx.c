@@ -840,11 +840,13 @@ DECLARE_UVERBS_NAMED_METHOD(
  *                      ib_uverbs_create_qp recorded at create.
  *   RESP_CREATE_FLAGS  mqp->flags (the IB_QP_CREATE_* mask at create).
  *
- * One optional out, which costs a firmware QUERY_QP and is read only when
- * asked for:
+ * Two optional outs, read from one firmware QUERY_QP issued only when
+ * either is asked for:
  *   RESP_SQ_PSN        struct mlx5_ib_vfmig_qp_sq_psn, next_send_psn and
  *                      last_acked_psn from the live QPC, so a dump can wait
  *                      until everything the QP sent has been acknowledged.
+ *   RESP_SQ_STATE      struct mlx5_ib_vfmig_qp_sq_state, the other
+ *                      requester fields of the same QPC.
  *
  * Only RC/UD user QPs are supported, matching mlx5_ib_restore_qp's v0
  * type set. UC's mlx5_ib representation also lives in trans_qp but
@@ -861,6 +863,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_QP)(struct uverbs_attr_bund
 	struct mlx5_ib_restore_qp_req blob = {};
 	struct mlx5_ib_qp_base *base;
 	struct mlx5_ib_qp *mqp;
+	bool want_psn, want_state;
 	u64 user_handle;
 	u32 create_flags;
 	int err;
@@ -926,8 +929,13 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_QP)(struct uverbs_attr_bund
 	if (err)
 		return err;
 
-	if (uverbs_attr_is_valid(attrs, MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN)) {
+	want_psn = uverbs_attr_is_valid(attrs,
+					MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN);
+	want_state = uverbs_attr_is_valid(attrs,
+					  MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_STATE);
+	if (want_psn || want_state) {
 		int outlen = MLX5_ST_SZ_BYTES(query_qp_out);
+		struct mlx5_ib_vfmig_qp_sq_state state = {};
 		struct mlx5_ib_vfmig_qp_sq_psn psn;
 		void *qpc;
 		u32 *out;
@@ -941,13 +949,30 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_VFMIG_QUERY_QP)(struct uverbs_attr_bund
 			qpc = MLX5_ADDR_OF(query_qp_out, out, qpc);
 			psn.next_send_psn = MLX5_GET(qpc, qpc, next_send_psn);
 			psn.last_acked_psn = MLX5_GET(qpc, qpc, last_acked_psn);
+			state.ssn = MLX5_GET(qpc, qpc, ssn);
+			state.hw_sq_wqebb_counter =
+				MLX5_GET(qpc, qpc, hw_sq_wqebb_counter);
+			state.sw_sq_wqebb_counter =
+				MLX5_GET(qpc, qpc, sw_sq_wqebb_counter);
+			state.retry_count = MLX5_GET(qpc, qpc, retry_count);
+			state.cur_retry_count = MLX5_GET(qpc, qpc, cur_retry_count);
+			state.rnr_retry = MLX5_GET(qpc, qpc, rnr_retry);
+			state.cur_rnr_retry = MLX5_GET(qpc, qpc, cur_rnr_retry);
 		}
 		kfree(out);
 		if (err)
 			return err;
-		err = uverbs_copy_to(attrs,
-				     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN,
-				     &psn, sizeof(psn));
+		if (want_psn) {
+			err = uverbs_copy_to(attrs,
+					     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN,
+					     &psn, sizeof(psn));
+			if (err)
+				return err;
+		}
+		if (want_state)
+			err = uverbs_copy_to(attrs,
+					     MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_STATE,
+					     &state, sizeof(state));
 	}
 	return err;
 }
@@ -969,6 +994,9 @@ DECLARE_UVERBS_NAMED_METHOD(
 			    UA_MANDATORY),
 	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_PSN,
 			    UVERBS_ATTR_TYPE(struct mlx5_ib_vfmig_qp_sq_psn),
+			    UA_OPTIONAL),
+	UVERBS_ATTR_PTR_OUT(MLX5_IB_ATTR_VFMIG_QUERY_QP_RESP_SQ_STATE,
+			    UVERBS_ATTR_TYPE(struct mlx5_ib_vfmig_qp_sq_state),
 			    UA_OPTIONAL));
 
 DECLARE_UVERBS_GLOBAL_METHODS(
