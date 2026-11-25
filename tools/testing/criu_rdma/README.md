@@ -134,6 +134,11 @@ builds the helpers that need libibverbs.
   identity, the checkpoint queries, the event counters and the refusals.
   The completion event check needs a GID for a self-loop RC SEND. The
   restore-mode refusals need an rxe device.
+- `probes/qp_sq_state_probe <ibdev> <sgid_index>` -- reads
+  VFMIG_QUERY_QP's send queue state from self-loop RC QPs that are
+  fresh, idle, held by RNR NAKs and freed again. It reports which QPC
+  field tells a send held by RNR NAKs from an idle QP, where the PSNs
+  show nothing outstanding. Needs an mlx5 device.
 
 Helpers: `probes/vfmig_fence` raises and lifts the RX fence, optionally
 with `eth`. `probes/rc_pair` drives RC QP pairs between two ib devices
